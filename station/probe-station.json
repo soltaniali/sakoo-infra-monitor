@@ -7,7 +7,6 @@
   "ingress_ip": "172.30.153.101",
   "public_ip": "185.220.226.23",
   "hosts": [
-    "chatpilot.aipsharif.ir",
     "mlopsapipilot.aipsharif.ir",
     "iampilot.aipsharif.ir",
     "panelpilot.aipsharif.ir",

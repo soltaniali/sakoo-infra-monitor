@@ -10,7 +10,6 @@
     "rook-ceph-rgw-core-shared-s3.rook-ceph.svc.cluster.local"
   ],
   "hosts": [
-    "chatpilot.aipsharif.ir",
     "mlopsapipilot.aipsharif.ir",
     "iampilot.aipsharif.ir",
     "panelpilot.aipsharif.ir",

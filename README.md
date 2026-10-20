@@ -43,7 +43,7 @@ its own tunnel (`vpn_iface`); if the VPN is down you get one "probe cannot see S
 PROBE_CONFIG=probe-host.json PROBE_KEY=<from London secrets.env> python3 k8s/probe.py --print   # one round
 PROBE_CONFIG=probe-host.json PROBE_KEY=... python3 k8s/probe.py                                 # loop
 ```
-Tested 2026-10-19 from the laptop: all checks ran and the London receiver raised the right alert (chatpilot 503).
+Tested 2026-10-19 from the laptop: all checks ran and the London receiver raised the right alert.
 
 ## 2b. Probe in the cluster (through GitOps, needs egress to London)
 
