@@ -1,0 +1,16 @@
+# Run:    docker compose up -d --build        Logs: docker compose logs -f
+# One round, printed:  docker compose run --rm probe --print
+services:
+  probe:
+    build: .
+    image: sakoo-probe-station:1
+    container_name: sakoo-probe-station
+    restart: unless-stopped
+    cap_add: [NET_ADMIN]          # create tun devices and routes, inside this container only
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    volumes: ["./secrets:/secrets:ro"]
+    environment:                  # the host's proxy must not be used for checks or reports
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""

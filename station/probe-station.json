@@ -1,0 +1,31 @@
+{
+  "receiver_url": "http://104.194.143.68:8090/report",
+  "interval_s": 60,
+  "timeout_s": 8,
+  "cert_warn_days": 14,
+  "vpn": {"cluster": "tun0", "endpoints": "tun1"},
+  "ingress_ip": "172.30.153.101",
+  "public_ip": "185.220.226.23",
+  "hosts": [
+    "chatpilot.aipsharif.ir",
+    "mlopsapipilot.aipsharif.ir",
+    "iampilot.aipsharif.ir",
+    "panelpilot.aipsharif.ir",
+    "langfusepilot.aipsharif.ir",
+    "gitpilot.aipsharif.ir",
+    "s3pilot.aipsharif.ir"
+  ],
+  "tcp_checks": {
+    "node cpu-worker01 (kubelet)": ["172.30.153.11", 10250],
+    "node cpu-worker02 (kubelet)": ["172.30.153.12", 10250],
+    "node cpu-worker03 (kubelet)": ["172.30.153.13", 10250],
+    "node gpu-worker01 (kubelet)": ["172.30.153.14", 10250],
+    "node gpu-worker02 (kubelet)": ["172.30.153.15", 10250]
+  },
+  "http_checks": {
+    "kubernetes API": {"url": "https://172.30.153.100:6443/livez", "insecure": true}
+  },
+  "kubeconfig": "/secrets/kubeconfig",
+  "event_namespaces": ["aip-mlops-service", "openwebui", "litellm", "langfuse", "studio-team"],
+  "events_window_s": 600
+}

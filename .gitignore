@@ -1,0 +1,13 @@
+# secrets: VPN profiles and passwords, kubeconfig, bot token, probe key
+station/secrets/*
+!station/secrets/.gitignore
+secrets.env
+probe.key
+# runtime state on the receiver
+state.json
+subscribers.json
+tg_offset
+*.log
+# build copy of k8s/probe.py
+station/probe.py
+__pycache__/

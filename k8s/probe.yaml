@@ -1,0 +1,83 @@
+# Sakoo infra probe: one small pod in aip-mlops-service that checks the infra layers every minute
+# and reports to the receiver on the London server (104.194.143.68:8090).
+# Add through the GitOps repo (merge request), never kubectl apply on prod.
+# The ConfigMap is generated from probe.py + probe.json, see kustomization.yaml.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sakoo-infra-probe
+  namespace: aip-mlops-service
+---
+# read-only: node Ready/pressure conditions and GPU allocatable
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sakoo-infra-probe-nodes
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sakoo-infra-probe-nodes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sakoo-infra-probe-nodes
+subjects:
+  - kind: ServiceAccount
+    name: sakoo-infra-probe
+    namespace: aip-mlops-service
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sakoo-infra-probe
+  namespace: aip-mlops-service
+  labels: {app: sakoo-infra-probe}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: sakoo-infra-probe}
+  template:
+    metadata:
+      labels: {app: sakoo-infra-probe}
+    spec:
+      serviceAccountName: sakoo-infra-probe
+      securityContext: {runAsNonRoot: true, runAsUser: 65534, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: probe
+          # any image with python3 >= 3.9; use a Harbor copy of python:3.12-slim (pin the tag, never :latest)
+          image: harbor.aip.sharif.ir/CHANGE-ME/python:3.12-slim
+          command: ["python3", "-u", "/app/probe.py"]
+          env:
+            - {name: PROBE_CONFIG, value: /app/probe.json}
+            - name: PROBE_KEY
+              valueFrom: {secretKeyRef: {name: sakoo-infra-probe, key: PROBE_KEY}}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {cpu: 100m, memory: 64Mi}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: app, mountPath: /app}
+      volumes:
+        - name: app
+          configMap: {name: sakoo-infra-probe}
+---
+# Cilium denies external egress by default. Allow only what the probe needs.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: sakoo-infra-probe-egress
+  namespace: aip-mlops-service
+spec:
+  endpointSelector:
+    matchLabels: {app: sakoo-infra-probe}
+  egress:
+    - toEntities: [cluster, kube-apiserver]           # DNS, Ceph RGW, API server
+    - toCIDR: [104.194.143.68/32]                     # receiver (London)
+      toPorts: [{ports: [{port: "8090", protocol: TCP}]}]
+    - toCIDR: [185.220.226.23/32, 192.168.244.5/32]   # public ingress, Harbor
+      toPorts: [{ports: [{port: "443", protocol: TCP}]}]

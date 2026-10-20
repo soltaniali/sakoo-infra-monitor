@@ -1,0 +1,25 @@
+{
+  "receiver_url": "http://104.194.143.68:8090/report",
+  "interval_s": 60,
+  "timeout_s": 8,
+  "cert_warn_days": 14,
+  "nodes": true,
+  "dns_names": [
+    "kubernetes.default.svc.cluster.local",
+    "kubeai.aip-mlops-service.svc.cluster.local",
+    "rook-ceph-rgw-core-shared-s3.rook-ceph.svc.cluster.local"
+  ],
+  "hosts": [
+    "chatpilot.aipsharif.ir",
+    "mlopsapipilot.aipsharif.ir",
+    "iampilot.aipsharif.ir",
+    "panelpilot.aipsharif.ir",
+    "langfusepilot.aipsharif.ir",
+    "gitpilot.aipsharif.ir"
+  ],
+  "http_checks": {
+    "harbor health": {"url": "https://harbor.aip.sharif.ir/api/v2.0/health", "healthy_text": "healthy"},
+    "s3 (Ceph RGW)": {"url": "http://rook-ceph-rgw-core-shared-s3.rook-ceph.svc:80"},
+    "kubernetes API": {"url": "https://kubernetes.default.svc/livez", "insecure": true}
+  }
+}
