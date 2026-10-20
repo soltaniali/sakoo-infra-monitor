@@ -1,7 +1,7 @@
 # Probe station (VPNs + probe in one container)
 
 Runs the Sakoo infra probe on any machine in Iran that can reach both VPN servers and the London receiver.
-The same image and `compose.yaml` run on Windows (Docker Desktop) and on Linux. Tested 2026-10-20 on Ali's laptop.
+The same image and `compose.yaml` run on Windows (Docker Desktop) and on Linux. Runs on the Iran host 213.233.184.128 (user ali_soltani, since 2026-10-20); first tested on Ali's laptop.
 
 ```
 container: tun0 = cluster VPN (se-user15, 172.30.151-153.0/24)  ─┐
@@ -37,8 +37,10 @@ curl -fsSL https://get.docker.com | sudo sh && sudo usermod -aG docker $USER   #
 # 2. copy this folder (with secrets/) to the host, e.g. scp -r station user@host:~/
 cd ~/station
 sh set-vpn-auth.sh                         # type the VPN password (hidden)
-cp ../k8s/probe.py . 2>/dev/null || true   # probe.py must sit next to the Dockerfile
-docker compose up -d --build
+cp ../k8s/probe.py . 2>/dev/null || true   # probe.py must sit next to compose.yaml (mounted into the container)
+docker compose up -d --build               # no Docker Hub (Iran)? build on another machine, then:
+                                           #   docker save sakoo-probe-station:1 | gzip > img.tgz ; scp ; gunzip -c img.tgz | docker load
+                                           #   docker compose up -d --no-build
 docker compose run --rm probe --print      # one round, printed
 docker compose logs -f                     # running log
 ```
@@ -46,3 +48,6 @@ Then stop the laptop copy (`docker compose down` in this folder on the laptop), 
 
 On the laptop: `docker compose up -d --build` in this folder. It stops when the laptop sleeps, which London reports as
 "probe silent".
+
+Updating the probe: copy the new `k8s/probe.py` to `station/probe.py` on the host, then `docker compose restart`.
+The probe takes its clock from the London receiver, so a host whose NTP is blocked (this one) still works.

@@ -58,6 +58,11 @@ assert sum("PROBE SILENT" in m for m in sent) == 1, sent  # once
 report(True)
 assert "PROBE BACK" in sent[-1], sent
 
+probe.time.time = lambda real=probe.time.time: real() + 30 * 86400   # host clock a month ahead
+probe.sync_clock()
+assert abs(probe.now() - time.time()) < 5, probe.CLOCK          # corrected from the receiver's Date header
+report(True)                                              # accepted despite the wrong host clock
+probe.time.time = time.time
 res = probe.run_checks()                                  # probe check functions on this machine
 assert probe.check_dns("localhost")[0] and not probe.check_dns("no-such-host.invalid")[0]
 srv.shutdown()

@@ -12,6 +12,7 @@ Result format: {check_name: [ok, detail, owner]}, owner = "infra" | "us" | "moni
 """
 import base64
 import calendar
+import email.utils
 import hashlib
 import hmac
 import json
@@ -46,6 +47,25 @@ EVENT_RULES = [
 ]
 
 
+CLOCK = {"offset": 0.0}  # seconds to add to the host clock; hosts in Iran often cannot reach NTP
+
+
+def now():
+    return time.time() + CLOCK["offset"]
+
+
+def sync_clock():
+    """Take the time from the receiver's HTTP Date header, so a drifting host clock cannot break the
+    receiver's freshness check or the event window. Keeps the last offset if the receiver is unreachable."""
+    url = CFG["receiver_url"].rsplit("/", 1)[0] + "/health"
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url, timeout=TIMEOUT) as r:
+            CLOCK["offset"] = email.utils.parsedate_to_datetime(r.headers["Date"]).timestamp() - time.time()
+    except Exception:
+        pass
+
+
 def err(e):
     return "%s: %s" % (type(e).__name__, e) if str(e) else type(e).__name__
 
@@ -75,7 +95,7 @@ def check_host(host, ip=None):
     try:
         ctx = ssl.create_default_context()
         with socket.create_connection((ip or host, 443), timeout=TIMEOUT) as s, ctx.wrap_socket(s, server_hostname=host) as t:
-            days = (ssl.cert_time_to_seconds(t.getpeercert()["notAfter"]) - time.time()) / 86400
+            days = (ssl.cert_time_to_seconds(t.getpeercert()["notAfter"]) - now()) / 86400
             t.sendall(b"GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: sakoo-infra-probe\r\nConnection: close\r\n\r\n" % host.encode())
             line = t.recv(256).split(b"\r\n")[0].split()
         code = int(line[1]) if len(line) > 1 and line[1].isdigit() else None
@@ -175,7 +195,7 @@ def check_events():
             errors.append("%s: HTTP %d" % (ns, code))
             continue
         for e in json.loads(body)["items"]:
-            if time.time() - event_time(e) > window:
+            if now() - event_time(e) > window:
                 continue
             msg = e.get("message", "")
             for name, reason, needles in EVENT_RULES:
@@ -204,6 +224,8 @@ def host_checks(res, ip, label, owner_if_all_fail):
 
 
 def run_checks():
+    if CFG.get("receiver_url"):
+        sync_clock()
     res, vpn = {}, CFG.get("vpn", {})  # {"cluster": "tun0", "endpoints": "tun1"}
     for role, iface in vpn.items():
         res["probe VPN " + role] = check_vpn(iface) + ("monitor",)
@@ -235,7 +257,7 @@ def run_checks():
 
 
 def report(res):
-    body = json.dumps({"probe": socket.gethostname(), "ts": int(time.time()), "results": res}).encode()
+    body = json.dumps({"probe": socket.gethostname(), "ts": int(now()), "results": res}).encode()
     sig = hmac.new(os.environ["PROBE_KEY"].encode(), body, hashlib.sha256).hexdigest()
     req = urllib.request.Request(CFG["receiver_url"], data=body, method="POST",
                                  headers={"Content-Type": "application/json", "X-Signature": sig})
