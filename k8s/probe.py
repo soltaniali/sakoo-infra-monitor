@@ -360,7 +360,12 @@ def main():
     while True:
         t0 = time.time()
         try:
-            report(run_checks())
+            res = run_checks()
+            if os.environ.get("PROBE_RESULTS"):  # the ops dashboard on the same station reads this file
+                tmp = Path(os.environ["PROBE_RESULTS"] + ".tmp")
+                tmp.write_text(json.dumps({"ts": now(), "results": res}))
+                tmp.replace(os.environ["PROBE_RESULTS"])
+            report(res)
         except Exception as e:  # receiver unreachable: it raises "probe silent" on its side
             print(time.strftime("%H:%M:%S"), "report failed:", err(e), file=sys.stderr, flush=True)
         time.sleep(max(1, CFG.get("interval_s", 60) - (time.time() - t0)))

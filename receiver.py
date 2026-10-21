@@ -2,7 +2,8 @@
 """Receives probe reports from inside the cluster and sends Telegram alerts on state changes.
 Runs on the London server. Stdlib only.
 
-  receiver.py           serve on 0.0.0.0:$PORT (default 8090), POST /report, GET /health
+  receiver.py           serve on 0.0.0.0:$PORT (default 8090), POST /report, POST /alert, GET /health
+                        /alert: a ready-made message from the station's ops dashboard (HMAC like /report), sent as is
   receiver.py --test    send a test Telegram message to every subscriber
 Env (secrets.env): TG_TOKEN, TG_CHAT_ID, PROBE_KEY, BOT_PASSWORD_HASH (set-bot-password.sh).
 Optional: PORT, FAIL_AFTER (2), SILENT_AFTER_S (180), DRY_RUN=1 (log instead of sending).
@@ -246,11 +247,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 1_000_000))
         good = hmac.new(os.environ["PROBE_KEY"].encode(), body, hashlib.sha256).hexdigest()
-        if self.path != "/report" or not hmac.compare_digest(good, self.headers.get("X-Signature", "")):
+        if self.path not in ("/report", "/alert") or not hmac.compare_digest(good, self.headers.get("X-Signature", "")):
             return self._reply(403, b"bad signature\n")
         msg = json.loads(body)
         if abs(time.time() - msg["ts"]) > MAX_SKEW:
             return self._reply(403, b"stale report\n")
+        if self.path == "/alert":
+            try:
+                telegram(str(msg["text"])[:3900])
+            except Exception as e:  # nobody reached: the station keeps the alert and retries next round
+                print("alert relay failed:", e, file=sys.stderr, flush=True)
+                return self._reply(502, b"telegram failed\n")
+            return self._reply(200, b"ok\n")
         apply(msg["results"])
         self._reply(200, b"ok\n")
 

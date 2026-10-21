@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sakoo Ops</title>
+<style>
+:root{--bg:#f7f7f5;--fg:#1d1d1b;--mut:#6b6b66;--card:#fff;--line:#e4e4e0;--ok:#2f9e44;--bad:#e03131;--warn:#e8590c;--info:#1971c2;--chip:#efefeb}
+@media (prefers-color-scheme:dark){:root{--bg:#141413;--fg:#ecece8;--mut:#9a9a94;--card:#1e1e1c;--line:#2e2e2b;--chip:#2a2a27}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--card);position:sticky;top:0;z-index:2}
+header b{font-size:16px}
+nav a{display:inline-block;padding:4px 10px;border-radius:6px;text-decoration:none;color:inherit}
+nav a.on{background:var(--fg);color:var(--bg)}
+#who{margin-left:auto}
+main{max-width:1500px;margin:0 auto;padding:16px 16px 60px}
+h1{font-size:19px;margin:4px 0 8px}h2{font-size:15px;margin:22px 0 8px}
+a{color:inherit}
+.mut{color:var(--mut)}.err{color:var(--bad)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px;overflow-x:auto}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:12px}
+.tile{display:block;text-decoration:none;background:var(--card);border:1px solid var(--line);border-left:4px solid var(--line);border-radius:8px;padding:10px 12px}
+.tile.ok{border-left-color:var(--ok)}.tile.bad{border-left-color:var(--bad)}.tile.info{border-left-color:var(--info)}
+.tile .tn{font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em}
+.tile .tv{font-size:26px;font-weight:600;margin:2px 0}.tile .ts{font-size:12px}
+table{width:100%;border-collapse:collapse}
+td,th{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mut);font-weight:500;white-space:nowrap}
+tr.click{cursor:pointer}tr.click:hover td{background:var(--chip)}
+.chip{display:inline-block;padding:1px 7px;border-radius:10px;background:var(--chip);font-size:12px;white-space:nowrap}
+.chip.bad{background:var(--bad);color:#fff}.chip.ok{background:var(--ok);color:#fff}.chip.warn{background:var(--warn);color:#fff}
+pre{white-space:pre-wrap;word-break:break-word;font-size:12.5px;margin:0;max-height:520px;overflow:auto}
+.kv{display:grid;grid-template-columns:150px 1fr;gap:6px 12px}.kv>div:nth-child(odd){color:var(--mut)}
+form.row,.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}
+input,select,button{font:inherit;padding:5px 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg)}
+button{cursor:pointer}button.primary{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+.login{max-width:340px;margin:60px auto;display:grid;gap:10px}.login label{display:grid;gap:4px}
+.small{font-size:12px}
+@media (max-width:700px){.kv{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header><b>Sakoo Ops</b><nav id="tabs"></nav><span id="who" class="mut"></span></header>
+<main id="app"><div class="mut">Loading…</div></main>
+<script src="/ops.js"></script>
+</body>
+</html>

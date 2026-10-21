@@ -12,3 +12,4 @@ tg_offset
 station/probe.py
 __pycache__/
 history.db
+station/data/

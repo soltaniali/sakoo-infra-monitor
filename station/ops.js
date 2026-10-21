@@ -1,0 +1,271 @@
+'use strict';
+// Sakoo Ops page. Every value from the API goes into the DOM as text (never as HTML): logs can contain anything.
+const TZ = 'Asia/Tehran';
+const app = document.getElementById('app');
+let me = null, timer = null;
+
+function h(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === false || v == null) continue;
+    if (k === 'class') e.className = v;
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else if (k in e && k !== 'list') e[k] = v;
+    else e.setAttribute(k, v);
+  }
+  for (const c of kids.flat(Infinity)) if (c != null && c !== false) e.append(c instanceof Node ? c : String(c));
+  return e;
+}
+const fmtT = new Intl.DateTimeFormat('en-GB', {timeZone: TZ, month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false});
+const fmt = t => t ? fmtT.format(new Date(t * 1000)) : '–';
+function ago(t) {
+  if (!t) return '–';
+  const s = Date.now() / 1000 - t;
+  return s < 90 ? Math.round(s) + ' s ago' : s < 5400 ? Math.round(s / 60) + ' min ago' : s < 172800 ? Math.round(s / 3600) + ' h ago' : Math.round(s / 86400) + ' d ago';
+}
+const OWNER = o => o === 'us' ? 'MLOps (us)' : o === 'infra' ? 'Infra team' : o === 'asset' ? 'MLOps asset' : o === 'monitor' ? 'Probe' : 'Team ' + o;
+const SYM = {crashloop: 'Crash loop', oomkilled: 'Out of memory', 'image-pull': 'Image pull', pending: 'Pending', flapping: 'Restarting',
+  'probe-failing': 'Probe failing', down: 'Down', 'model-down': 'Model down', 'new-error': 'New error', endpoint: 'Endpoint check', infra: 'Infra check'};
+const CHG = {release: 'Release', config: 'Config change', 'new-service': 'New service', 'new-host': 'New hostname', 'new-namespace': 'New namespace',
+  removed: 'Removed', 'removed-namespace': 'Namespace removed', 'new-model': 'New model', 'model-changed': 'Model changed', 'model-removed': 'Model removed'};
+const verdictChip = v => v ? h('span', {class: 'chip ' + ({bad: 'bad', 'not ready': 'bad', healthy: 'ok', ready: 'ok', watching: 'warn'}[v] || '')}, v) : '';
+
+async function api(path, opts) {
+  const r = await fetch(path, Object.assign({credentials: 'same-origin'}, opts));
+  if (r.status === 401) { showLogin(); throw new Error('login'); }
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+const post = (path, body) => api(path, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+const qs = o => new URLSearchParams(Object.entries(o).filter(([, v]) => v !== '' && v != null)).toString();
+
+function table(cols, rows, onclick) {
+  if (!rows.length) return h('div', {class: 'mut'}, 'None.');
+  return h('table', {}, h('tr', {}, cols.map(c => h('th', {}, c[0]))),
+    rows.map(r => h('tr', {class: onclick ? 'click' : '', onclick: onclick && (() => onclick(r))}, cols.map(c => h('td', {}, c[1](r))))));
+}
+
+// --- login and navigation ------------------------------------------------------------------------------------------
+function showLogin(msg) {
+  me = null; clearTimeout(timer);
+  document.getElementById('tabs').replaceChildren();
+  document.getElementById('who').replaceChildren();
+  const u = h('input', {autocomplete: 'username', required: true}), p = h('input', {type: 'password', autocomplete: 'current-password', required: true});
+  const err = h('div', {class: 'err'}, msg || '');
+  app.replaceChildren(h('form', {class: 'card login', onsubmit: async ev => {
+    ev.preventDefault();
+    try { await post('/api/login', {user: u.value, password: p.value}); render(); } catch (e) { if (e.message !== 'login') err.textContent = e.message; }
+  }}, h('h1', {}, 'Sakoo Ops'), h('label', {}, 'User', u), h('label', {}, 'Password', p), h('button', {class: 'primary'}, 'Log in'), err));
+  u.focus();
+}
+
+const TABS = [['overview', 'Overview'], ['incidents', 'Incidents'], ['changes', 'Changes'], ['models', 'Models'],
+  ['services', 'Services'], ['logs', 'Logs'], ['infra', 'Infra or us']];
+function nav(page) {
+  document.getElementById('tabs').replaceChildren(...TABS.map(([k, t]) => h('a', {href: '#/' + k, class: page === k || (page === 'incident' && k === 'incidents') ? 'on' : ''}, t)));
+  document.getElementById('who').replaceChildren(me.user + ' · ', h('a', {href: '#', onclick: async ev => { ev.preventDefault(); await post('/api/logout', {}); showLogin(); }}, 'log out'));
+}
+function route() {
+  const [p, q] = (location.hash.slice(2) || 'overview').split('?');
+  return [p, Object.fromEntries(new URLSearchParams(q || ''))];
+}
+async function render() {
+  clearTimeout(timer);
+  if (!me) { try { me = await api('/api/me'); } catch (e) { return; } }
+  const [page, q] = route();
+  nav(page);
+  try { app.replaceChildren(await (VIEWS[page] || VIEWS.overview)(q)); }
+  catch (e) { if (e.message !== 'login') app.replaceChildren(h('div', {class: 'card err'}, 'Error: ' + e.message)); }
+  if (['overview', 'incidents', 'infra'].includes(page)) timer = setTimeout(render, 30000);
+}
+window.addEventListener('hashchange', render);
+
+// --- shared pieces -------------------------------------------------------------------------------------------------
+const incidentCols = [
+  ['#', r => r.id], ['Opened', r => h('span', {title: fmt(r.opened)}, ago(r.opened))], ['What', r => SYM[r.symptom] || r.symptom],
+  ['Where', r => (r.ns === '-' ? '' : r.ns + ' / ') + r.obj], ['Owner', r => OWNER(r.owner)],
+  ['Cause', r => h('span', {class: 'small'}, r.cause)]];
+const incidentTable = rows => table(incidentCols, rows, r => { location.hash = '#/incident?id=' + r.id; });
+function changeTable(rows) {
+  return table([
+    ['Time', r => h('span', {title: fmt(r.ts)}, fmt(r.ts))], ['Change', r => CHG[r.type] || r.type], ['Where', r => r.ns + ' / ' + r.name],
+    ['Before → after', r => h('span', {class: 'small'}, r.before && r.after ? r.before + ' → ' + r.after : (r.after || r.before))],
+    ['Result', r => verdictChip(r.verdict)],
+    ['Who', r => { const i = r.info || {};
+      return i.mr_url ? h('a', {href: i.mr_url, target: '_blank', rel: 'noopener'}, (i.mr_author || i.author) + ': ' + (i.mr_title || i.commit))
+        : i.author ? h('span', {}, i.author + ': ' + i.commit) : i.commits_in_window ? h('span', {class: 'small mut'}, 'commits around then: ' + i.commits_in_window.join(' · ')) : ''; }],
+    ['Notes', r => h('span', {class: 'small mut'}, ((r.info || {}).gaps || []).join(', '))]], rows);
+}
+function podTable(pods, ns) {
+  return table([
+    ['Pod', p => p.name], ['Phase', p => p.phase], ['Ready', p => p.ready ? 'yes' : h('span', {class: 'err'}, 'no')],
+    ['Restarts', p => p.restarts], ['Problem', p => [...p.waiting, ...p.last.map(l => 'last exit: ' + l[0])].join(', ')],
+    ['Node', p => p.node || ''], ['Age', p => ago(p.created)],
+    ['', p => ns && p.bad ? h('a', {href: '#/logs?' + qs({ns, pod: p.name, container: p.bad})}, 'logs') : '']], pods);
+}
+function eventTable(events) {
+  return table([['Time', e => fmt(e.ts)], ['Reason', e => e.reason], ['Object', e => e.kind + ' ' + e.name],
+    ['Message', e => h('span', {class: 'small'}, e.msg + (e.count > 1 ? ' (×' + e.count + ')' : ''))]], events);
+}
+
+// --- views ---------------------------------------------------------------------------------------------------------
+const VIEWS = {};
+VIEWS.overview = async () => {
+  const s = await api('/api/state');
+  const st = s.status || {}, ig = s.integrations || {};
+  const chips = ['litellm', 'gitlab', 'grafana'].map(k => h('span', {class: 'chip ' + (ig[k] ? (ig.errors[k] ? 'warn' : 'ok') : ''),
+    title: ig.errors[k] || (ig[k] ? 'on' : 'off: set its env in secrets/ops.env')}, {litellm: 'log summaries', gitlab: 'who changed it', grafana: 'GPU %'}[k]));
+  return h('div', {},
+    h('div', {class: 'row mut small'}, 'Last round ' + ago(st.last) + (st.took != null ? ' (' + st.took + ' s)' : '') + ' · ' +
+      (st.namespaces || 0) + ' namespaces read · full read ' + ago(st.slow_last) + ' · probe report ' + ago(s.probe_ts), ' ', chips,
+      ig.errors.alerts ? h('span', {class: 'err'}, ' · Telegram relay: ' + ig.errors.alerts) : ''),
+    st.errors && st.errors.length ? h('div', {class: 'card small err'}, 'Read errors: ' + st.errors.join(' · ')) : '',
+    h('div', {class: 'tiles'}, s.tiles.map(t => h('a', {class: 'tile ' + t.status, href: t.link},
+      h('div', {class: 'tn'}, t.n + ' · ' + t.title), h('div', {class: 'tv'}, t.value), h('div', {class: 'ts mut'}, t.sub)))),
+    h('h2', {}, 'Open incidents · ' + s.incidents.length), h('div', {class: 'card'}, incidentTable(s.incidents)),
+    h('h2', {}, 'Changes in the last 24 h · ' + s.changes.length), h('div', {class: 'card'}, changeTable(s.changes)));
+};
+
+VIEWS.incidents = async q => {
+  const state = q.state || 'open', kind = q.kind || '';
+  const rows = await api('/api/incidents?' + qs({state, kind}));
+  const sel = (key, val, opts) => h('select', {onchange: e => { location.hash = '#/incidents?' + qs(Object.assign({state, kind}, {[key]: e.target.value})); }},
+    opts.map(([v, t]) => h('option', {value: v, selected: v === val}, t)));
+  return h('div', {}, h('div', {class: 'row'}, sel('state', state, [['open', 'Open'], ['closed', 'Closed']]),
+    sel('kind', kind, [['', 'All'], ['bug', 'Bugs (1)'], ['down', 'Down (2)']]), h('span', {class: 'mut'}, rows.length + ' incidents')),
+    h('div', {class: 'card'}, incidentTable(rows)));
+};
+
+VIEWS.incident = async q => {
+  const i = await api('/api/incident?id=' + encodeURIComponent(q.id));
+  const ev = i.evidence || {};
+  const sum = h('div', {}, i.summary ? h('pre', {}, i.summary) : '');
+  const copied = h('span', {class: 'mut small'});
+  const handoff = h('textarea', {readOnly: true, rows: 7, style: 'width:100%;font:12px monospace'}, i.handoff);
+  const kv = [['Status', i.state === 'open' ? h('span', {class: 'chip bad'}, 'open') : h('span', {class: 'chip ok'}, 'closed ' + fmt(i.closed))],
+    ['Opened', fmt(i.opened) + ' (' + ago(i.opened) + '), last seen ' + ago(i.last_seen)], ['Owner', OWNER(i.owner)],
+    ['What we see', i.detail], ['Likely cause', h('b', {}, i.cause)], ['Suggested fix', h('b', {}, i.fix)], ['Playbook', i.playbook]];
+  if (i.change) kv.push(['Linked change', (CHG[i.change.type] || i.change.type) + ' ' + i.change.name + ': ' + i.change.before + ' → ' + i.change.after + ' at ' + fmt(i.change.ts)]);
+  if (ev.meta && ev.meta.person) kv.push(['Asset owner', ev.meta.person + ' · importance ' + ev.meta.value]);
+  return h('div', {},
+    h('p', {}, h('a', {href: '#/incidents'}, '← incidents')),
+    h('h1', {}, '#' + i.id + ' ' + (SYM[i.symptom] || i.symptom) + ' · ' + (i.ns === '-' ? '' : i.ns + ' / ') + i.obj),
+    h('div', {class: 'card kv'}, kv.flatMap(([k, v]) => [h('div', {}, k), h('div', {}, v)])),
+    h('h2', {}, 'Summary'), h('div', {class: 'card'}, sum, me.integrations.litellm ? h('button', {onclick: async e => {
+      e.target.disabled = true; e.target.textContent = 'Asking the LLM…';
+      try { sum.replaceChildren(h('pre', {}, (await post('/api/summarize', {incident: i.id})).summary)); } catch (x) { sum.replaceChildren(h('span', {class: 'err'}, x.message)); }
+      e.target.disabled = false; e.target.textContent = 'Summarize again';
+    }}, i.summary ? 'Summarize again' : 'Summarize with Sakoo LLM') : h('span', {class: 'mut small'}, 'LLM summaries are off (set LITELLM_* in secrets/ops.env).')),
+    h('h2', {}, 'Message for the owner'), h('div', {class: 'card'}, handoff, h('div', {class: 'row'}, h('button', {onclick: async () => {
+      handoff.select();
+      try { await navigator.clipboard.writeText(i.handoff); copied.textContent = 'copied'; } catch (x) { document.execCommand('copy'); copied.textContent = 'copied'; }
+    }}, 'Copy'), copied)),
+    ev.sample ? [h('h2', {}, 'Error sample'), h('div', {class: 'card'}, h('pre', {}, ev.sample))] : '',
+    ev.logs != null ? [h('h2', {}, 'Log · ' + (ev.log_from || '')), h('div', {class: 'card'}, h('pre', {}, ev.logs || '(empty)'))] : '',
+    h('h2', {}, 'Pods'), h('div', {class: 'card'}, podTable(ev.pods || [], i.ns !== '-' && i.ns)),
+    h('h2', {}, 'Warning events'), h('div', {class: 'card'}, eventTable(ev.events || [])),
+    h('h2', {}, 'Changes in this namespace (2 h before)'), h('div', {class: 'card'}, changeTable(ev.changes || [])),
+    h('h2', {}, 'Probe checks failing at that time'), h('div', {class: 'card'}, table([['Check', r => r[0]], ['Owner', r => OWNER(r[2])], ['Detail', r => r[1]]], ev.probe_failing || [])),
+    ev.error ? h('div', {class: 'err'}, 'Evidence error: ' + ev.error) : '');
+};
+
+VIEWS.changes = async q => {
+  const days = q.days || '1', type = q.type || '';
+  const rows = await api('/api/changes?' + qs({days, type}));
+  const go = o => { location.hash = '#/changes?' + qs(Object.assign({days, type}, o)); };
+  return h('div', {}, h('div', {class: 'row'},
+    h('select', {onchange: e => go({days: e.target.value})}, [['1', 'Last 24 h'], ['7', 'Last 7 days'], ['30', 'Last 30 days']].map(([v, t]) => h('option', {value: v, selected: v === days}, t))),
+    h('select', {onchange: e => go({type: e.target.value})}, [['', 'All changes'], ['release', 'Features / releases (3)'], ['new-service', 'New services (4)'],
+      ['new-model', 'Models (5)'], ['removed', 'Removed']].map(([v, t]) => h('option', {value: v, selected: v === type}, t))),
+    h('span', {class: 'mut'}, rows.length + ' changes')), h('div', {class: 'card'}, changeTable(rows)),
+    h('p', {class: 'mut small'}, 'Result: a release is "watching" for 15 min, then "healthy" or "bad" (an incident opened on it). ' +
+      'Changes in user-* namespaces are listed but not sent to Telegram.'));
+};
+
+VIEWS.models = async () => {
+  const ms = await api('/api/models');
+  const cols = [['Model', m => m.name], ['Ready', m => h('span', {class: m.min && m.ready < m.min ? 'err' : ''}, m.ready + '/' + m.min)],
+    ['Engine', m => m.engine], ['Resource profile', m => m.profile], ['Pods', m => m.pods.map(p => p.name + (p.restarts ? ' (' + p.restarts + ' restarts)' : '') + (p.node ? ' on ' + p.node : '')).join(', ')],
+    ['Source', m => h('span', {class: 'small mut'}, m.url)], ['Age', m => ago(m.created)],
+    ['Open incidents', m => m.open ? h('a', {href: '#/incidents'}, m.open) : '0']];
+  if (me.integrations.grafana) cols.splice(4, 0, ['GPU %', m => m.gpu == null ? '–' : m.gpu + ' %']);
+  if (me.integrations.litellm) cols.splice(4, 0, ['In litellm', m => m.litellm == null ? '?' : m.litellm ? 'yes' : h('span', {class: 'err'}, 'no')]);
+  return h('div', {}, h('h1', {}, 'KubeAI models · ' + ms.length), h('div', {class: 'card'}, table(cols, ms)),
+    !me.integrations.grafana ? h('p', {class: 'mut small'}, 'GPU % is off: set GRAFANA_URL and GRAFANA_TOKEN in secrets/ops.env.') : '');
+};
+
+async function nsSelect(current, onpick) {
+  const all = await api('/api/namespaces');
+  return h('select', {onchange: e => onpick(e.target.value)}, h('option', {value: ''}, 'namespace…'),
+    all.map(n => h('option', {value: n.ns, selected: n.ns === current}, n.ns + (n.open ? ' (' + n.open + ' open)' : ''))));
+}
+
+VIEWS.services = async q => {
+  const ns = q.ns || 'aip-mlops-service';
+  const s = await api('/api/services?' + qs({ns}));
+  return h('div', {}, h('div', {class: 'row'}, await nsSelect(ns, v => { location.hash = '#/services?' + qs({ns: v}); }),
+    h('span', {class: 'mut'}, 'read ' + ago(s.read))),
+    h('h2', {}, 'Workloads · ' + s.workloads.length), h('div', {class: 'card'}, table([
+      ['Kind', w => w.kind], ['Name', w => w.name],
+      ['Ready', w => w.kind === 'Model' ? w.ready + '/' + w.min : h('span', {class: w.ready < w.desired ? 'err' : ''}, w.ready + '/' + w.desired)],
+      ['Image / source', w => h('span', {class: 'small'}, w.images ? w.images.join(', ') : w.url)], ['Restarts', w => w.restarts],
+      ['Gaps', w => h('span', {class: 'small mut'}, (w.gaps || []).join(', '))], ['Age', w => ago(w.created)]], s.workloads)),
+    s.ingresses.length ? [h('h2', {}, 'Hostnames'), h('div', {class: 'card'}, table([['Ingress', i => i.name], ['Hosts', i => i.hosts.join(', ')], ['TLS', i => i.tls ? 'yes' : 'no']], s.ingresses))] : '',
+    h('h2', {}, 'Pods · ' + s.pods.length), h('div', {class: 'card'}, podTable(s.pods, ns)),
+    h('h2', {}, 'Warning events (last hour)'), h('div', {class: 'card'}, eventTable(s.events)));
+};
+
+VIEWS.logs = async q => {
+  const ns = q.ns || 'aip-mlops-service';
+  const s = await api('/api/services?' + qs({ns}));
+  const pods = s.pods.map(p => p.name);
+  const pod = q.pod && pods.includes(q.pod) ? q.pod : pods[0] || '';
+  const p = s.pods.find(x => x.name === pod);
+  const container = p && p.containers.includes(q.container) ? q.container : (p ? p.bad || p.containers[0] : '');
+  const tail = h('input', {type: 'number', min: 1, max: 3000, value: q.tail || 300, style: 'width:90px'});
+  const prev = h('input', {type: 'checkbox', checked: q.previous === '1'});
+  const only = h('input', {type: 'checkbox', checked: q.errors === '1'});
+  const out = h('pre', {}, ''), sum = h('div', {});
+  const go = o => { location.hash = '#/logs?' + qs(Object.assign({ns, pod, container}, o)); };
+  async function load() {
+    out.textContent = 'Loading…';
+    try {
+      const r = await api('/api/logs?' + qs({ns, pod, container, tail: tail.value, previous: prev.checked ? '1' : ''}));
+      const lines = r.text.split('\n');
+      const re = /\b(error|critical|fatal|traceback|panic|exception)\b/i;
+      out.textContent = (only.checked ? lines.filter(l => re.test(l)) : lines).join('\n') || '(empty)';
+    } catch (e) { out.textContent = 'Error: ' + e.message; }
+  }
+  const view = h('div', {},
+    h('div', {class: 'row'}, await nsSelect(ns, v => { location.hash = '#/logs?' + qs({ns: v}); }),
+      h('select', {onchange: e => go({pod: e.target.value, container: ''})}, pods.map(n => h('option', {value: n, selected: n === pod}, n))),
+      h('select', {onchange: e => go({container: e.target.value})}, (p ? p.containers : []).map(c => h('option', {value: c, selected: c === container}, c))),
+      h('label', {}, 'lines ', tail), h('label', {}, prev, ' previous container'), h('label', {}, only, ' errors only'),
+      h('button', {class: 'primary', onclick: load}, 'Load'),
+      me.integrations.litellm ? h('button', {onclick: async e => {
+        e.target.disabled = true; sum.replaceChildren(h('span', {class: 'mut'}, 'Asking the LLM…'));
+        try { sum.replaceChildren(h('div', {class: 'card'}, h('pre', {}, (await post('/api/summarize', {ns, pod, container, previous: prev.checked})).summary))); }
+        catch (x) { sum.replaceChildren(h('span', {class: 'err'}, x.message)); }
+        e.target.disabled = false;
+      }}, 'Summarize') : ''),
+    sum, h('div', {class: 'card'}, out));
+  if (pod) load(); else out.textContent = 'No pods in this namespace.';
+  return view;
+};
+
+VIEWS.infra = async () => {
+  const r = await api('/api/infra');
+  const groups = [['infra', 'Infra team owns these'], ['us', 'Ours: endpoints'], ['asset', 'Ours: MLOps assets'], ['monitor', 'The probe itself']];
+  return h('div', {}, h('h1', {}, 'Infra or us?'),
+    h('p', {class: 'mut'}, 'Probe report ' + ago(r.ts) + '. Rule: platform down or out of capacity = infra; platform up but our service fails = us.'),
+    groups.map(([o, title]) => {
+      const rows = r.results.filter(x => x.owner === o).sort((a, b) => a.ok - b.ok || a.name.localeCompare(b.name));
+      if (!rows.length) return '';
+      return [h('h2', {}, title + ' · ' + rows.filter(x => !x.ok).length + ' down / ' + rows.length),
+        h('div', {class: 'card'}, table([['', x => h('span', {class: 'chip ' + (x.ok ? 'ok' : 'bad')}, x.ok ? 'up' : 'down')], ['Check', x => x.name],
+          ['Owner', x => x.meta && x.meta.person ? x.meta.person : ''], ['Detail', x => h('span', {class: 'small'}, x.detail)]], rows))];
+    }));
+};
+
+render();
