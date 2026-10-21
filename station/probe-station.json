@@ -82,13 +82,15 @@
       "name": "ceph-create-user-api",
       "person": "Dariush",
       "value": "Critical",
-      "url": "https://mlopsapipilot.aipsharif.ir/storage"
+      "url": "https://mlopsapipilot.aipsharif.ir/storage/health",
+      "expect": "healthy"
     },
     {
       "name": "data-ingestion-api",
       "person": "Abolfazl",
       "value": "Critical",
-      "url": "https://mlopsapipilot.aipsharif.ir/data"
+      "url": "https://mlopsapipilot.aipsharif.ir/data/health",
+      "expect": "\"ok\""
     },
     {
       "name": "elasticsearch running",
@@ -104,7 +106,8 @@
       "name": "inference-service",
       "person": "Sajjad",
       "value": "Critical",
-      "url": "https://mlopspilot.aipsharif.ir/"
+      "url": "https://mlopspilot.aipsharif.ir/health",
+      "expect": "healthy"
     },
     {
       "name": "kubeai",
@@ -121,7 +124,8 @@
       "name": "mlops-core",
       "person": "Armin",
       "value": "Critical",
-      "url": "https://mlopsapipilot.aipsharif.ir/core"
+      "url": "https://mlopsapipilot.aipsharif.ir/core/debug.ping",
+      "expect": "PONG"
     },
     {
       "name": "mlops-core-fileserver",
@@ -174,7 +178,8 @@
       "name": "model-registry-api",
       "person": "Mohammad",
       "value": "Critical",
-      "url": "https://mlopsapipilot.aipsharif.ir/models"
+      "url": "https://mlopsapipilot.aipsharif.ir/models/health",
+      "expect": "healthy"
     },
     {
       "name": "open-webui",
@@ -194,19 +199,22 @@
       "name": "training-api",
       "person": "Dariush",
       "value": "Critical",
-      "url": "https://mlopsapipilot.aipsharif.ir/train"
+      "url": "https://mlopsapipilot.aipsharif.ir/train/ping",
+      "expect": "pong"
     },
     {
       "name": "user-custom-serve",
       "person": "Sajjad",
       "value": "No",
-      "url": "https://mlopsapipilot.aipsharif.ir/serve"
+      "url": "https://mlopsapipilot.aipsharif.ir/serve/openapi.json",
+      "expect": "openapi"
     },
     {
       "name": "user-management-api",
       "person": "Armin",
       "value": "Critical",
-      "url": "https://mlopsapipilot.aipsharif.ir/users"
+      "url": "https://mlopsapipilot.aipsharif.ir/users/openapi.json",
+      "expect": "openapi"
     }
   ]
 }

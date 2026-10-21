@@ -252,8 +252,11 @@ def check_assets():
                 if host not in fallback:
                     fallback[host] = fetch("https://%s/sakoo-probe-no-such-path" % host, CFG.get("ingress_ip"))[1]
                 status, sample = fetch(url, CFG.get("ingress_ip"))
-                tested = "%s → HTTP %d, answered by the app" % (url, status)
-                if status >= 500 or status == 0:
+                want = a.get("expect")  # health endpoint: must be 200 and contain this text
+                tested = "%s → HTTP %d%s" % (url, status, (", " + want) if want else ", answered by the app")
+                if want and (status != 200 or want.encode() not in sample):
+                    problems.append("%s answered HTTP %d without %r: %r" % (url, status, want, sample[:80]))
+                elif status >= 500 or status == 0:
                     problems.append("%s answered HTTP %d" % (url, status))
                 elif urllib.parse.urlsplit(url).path not in ("", "/") and sample == fallback[host]:
                     problems.append("%s has no route (traefik serves the fallback page)" % url)

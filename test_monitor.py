@@ -77,7 +77,13 @@ probe.get = lambda url, **kw: (200, json.dumps(eps).encode())
 pages = {"https://h/sakoo-probe-no-such-path": (200, b"<html>dashboard"), "https://h/a": (404, b'{"detail":"Not Found"}'),
          "https://h/c": (200, b"<html>dashboard"), "https://h/d": (502, b"Bad Gateway")}
 probe.fetch = lambda url, ip=None: pages[url]
+probe.CFG["assets"].append({"name": "e", "url": "https://h/e/health", "expect": "healthy"})
+probe.CFG["assets"].append({"name": "f", "url": "https://h/f/health", "expect": "healthy"})
+eps["items"] += [{"metadata": {"name": n}, "subsets": [{"addresses": [{}]}]} for n in ("e", "f")]
+pages.update({"https://h/e/health": (200, b'{"status":"healthy"}'), "https://h/f/health": (200, b'{"status":"degraded"}')})
 r = probe.check_assets()
+assert r["e (?, ?)"][0] and "healthy" in r["e (?, ?)"][1], r      # health endpoint OK
+assert not r["f (?, ?)"][0], r                                     # 200 but not healthy
 assert r["a (P, Critical)"][0] and r["a (P, Critical)"][2] == "asset", r                                 # app's own 404 = alive
 assert not r["b (Q, Low)"][0] and "no ready pod" in r["b (Q, Low)"][1], r
 assert not r["c (?, ?)"][0] and "no route" in r["c (?, ?)"][1], r  # route gone: traefik fallback page
