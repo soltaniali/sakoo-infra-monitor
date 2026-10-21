@@ -91,52 +91,13 @@ def check_password(pw):
     return hmac.compare_digest(got, good)
 
 
-SECTIONS = [("infra", "🛠 INFRA (infra team)"), ("us", "🧩 OURS (MLOps endpoints)"),
-            ("asset", "📦 MLOPS ASSETS"), ("monitor", "📡 PROBE (the monitor itself)")]
-IMPORTANCE = ["Critical", "Low", "No", "?"]
-
-
-def asset_table(rows):
-    """Assets as aligned monospace rows, grouped by importance: name, owner, what was tested. Down rows: reason below."""
-    e = html.escape
-    w = max(len(n) for n, _ in rows)
-    pw = max(len(c.get("meta", {}).get("person", "")) for _, c in rows)
-    lines = []
-    for imp in IMPORTANCE + sorted({c.get("meta", {}).get("value", "?") for _, c in rows} - set(IMPORTANCE)):
-        group = [(n, c) for n, c in rows if c.get("meta", {}).get("value", "?") == imp]
-        if not group:
-            continue
-        lines.append("<b>%s</b>" % e({"No": "Not rated", "?": "Unknown"}.get(imp, imp)))
-        body = []
-        for n, c in sorted(group, key=lambda r: (not r[1]["fails"], r[0])):  # down first
-            m = c.get("meta", {})
-            body.append("%s %s  %s  %s" % ("❌" if c["fails"] else "✅", n.ljust(w), m.get("person", "?").ljust(pw),
-                                           "" if c["fails"] else m.get("test", "")))
-            if c["fails"]:
-                body.append("   ↳ " + c.get("detail", ""))
-        lines.append("<pre>%s</pre>" % e("\n".join(body)))
-    return lines
-
-
 def status_text():
     """Every check from the latest report, grouped by owner, down first. Telegram HTML."""
-    e = html.escape
     state = load()
     age = time.time() - state["last_report"]
     current = {n: c for n, c in state["checks"].items() if c.get("seen", 0) >= state["last_report"] - 1}
-    out = ["<b>Sakoo status</b> · last report %d s ago%s" % (age, " · ⚠️ probe silent" if state.get("silent") else "")]
-    for owner, title in SECTIONS:
-        rows = sorted((n, c) for n, c in current.items() if c.get("owner") == owner)
-        if not rows:
-            continue
-        down = [(n, c) for n, c in rows if c["fails"]]
-        out.append("\n<b>%s</b> · %d up, %d down" % (e(title), len(rows) - len(down), len(down)))
-        if owner == "asset":
-            out += asset_table(rows)
-            continue
-        out += ["❌ %s: %s" % (e(n), e(c.get("detail", ""))) for n, c in down]
-        out += ["✅ %s" % e(n) for n, c in rows if not c["fails"]]
-    return "\n".join(out)
+    head = "<b>Sakoo status</b> · last report %d s ago%s" % (age, " · ⚠️ probe silent" if state.get("silent") else "")
+    return "\n".join([head] + dashboard.status_lines(current))
 
 
 HELP = ("Sakoo infra monitor.\n/login <password>: get alerts\n/logout: stop alerts\n/status: what is failing now\n/dashboard: history of ups and downs\n"

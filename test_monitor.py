@@ -181,6 +181,6 @@ dashboard.record("training-api", "asset", True, "ok", T - 100)
 pa = dashboard.page("t=%s&range=1h" % tok, {"api", "training-api"}, {"training-api": {"person": "Dariush", "value": "Critical", "test": "/train/ping 200"}})
 assert "<b>training-api</b>" in pa and "Dariush · Critical" in pa and "/train/ping 200" in pa and ">Critical</div>" in pa, pa[-1500:]
 snap = dashboard.page("t=%s&at=%d" % (tok, T - 3000), {"api"})
-assert "Snapshot at" in snap and "dot down" in snap and "0 up, 1 down" in snap, snap[-800:]
+assert "Snapshot at" in snap and "❌ api: timed out &lt;x&gt;" in snap and "0 up, 1 down" in snap, snap[-800:]   # same list as /status
 assert "<b" not in dashboard.page("t=%s&range=bogus" % tok, {"api"})[:0]   # unknown range falls back to 24h
 print("ok")

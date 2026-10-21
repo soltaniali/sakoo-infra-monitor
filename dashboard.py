@@ -110,6 +110,7 @@ color:var(--mut);font-size:11px;margin:2px 58px 0 290px}table{width:100%;border-
 padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--mut);font-weight:500}
 .sub{font-size:11.5px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .imp{font-size:12px;color:var(--mut);margin:10px 0 2px;text-transform:uppercase;letter-spacing:.04em}
+.status{white-space:pre-wrap;line-height:1.6}.status pre{margin:0;font-size:13px;line-height:1.5}
 .jump a{margin-right:12px}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}.up{background:var(--up)}.down{background:var(--down)}
 @media (max-width:700px){.row{grid-template-columns:1fr}.axis{margin:2px 0}.row .p{text-align:left}}
 """
@@ -134,6 +135,51 @@ def grouped(rows, meta):
     imps = IMPORTANCE + sorted({meta.get(n, {}).get("value", "?") for n, _ in rows} - set(IMPORTANCE))
     return [(IMP_LABEL.get(i, i), [r for r in rows if meta.get(r[0], {}).get("value", "?") == i]) for i in imps
             if any(meta.get(r[0], {}).get("value", "?") == i for r in rows)]
+
+
+STATUS_SECTIONS = [("infra", "🛠 INFRA (infra team)"), ("us", "🧩 OURS (MLOps endpoints)"),
+                   ("asset", "📦 MLOPS ASSETS"), ("monitor", "📡 PROBE (the monitor itself)")]
+
+
+def asset_table(rows):
+    """Assets as aligned monospace rows, grouped by importance: name, owner, what was tested. Down rows: reason below."""
+    e = html.escape
+    w = max(len(n) for n, _ in rows)
+    pw = max(len(c.get("meta", {}).get("person", "")) for _, c in rows)
+    lines = []
+    for imp in IMPORTANCE + sorted({c.get("meta", {}).get("value", "?") for _, c in rows} - set(IMPORTANCE)):
+        group = [(n, c) for n, c in rows if c.get("meta", {}).get("value", "?") == imp]
+        if not group:
+            continue
+        lines.append("<b>%s</b>" % e(IMP_LABEL.get(imp, imp)))
+        body = []
+        for n, c in sorted(group, key=lambda r: (not r[1]["fails"], r[0])):  # down first
+            m = c.get("meta", {})
+            body.append("%s %s  %s  %s" % ("❌" if c["fails"] else "✅", n.ljust(w), m.get("person", "?").ljust(pw),
+                                           "" if c["fails"] else m.get("test", "")))
+            if c["fails"]:
+                body.append("   ↳ " + c.get("detail", ""))
+        lines.append("<pre>%s</pre>" % e("\n".join(body)))
+    return lines
+
+
+def status_lines(checks):
+    """The bot's /status list (Telegram HTML), also shown as the page's snapshot.
+    checks: {name: {"owner", "fails", "detail", "meta"}}."""
+    e = html.escape
+    out = []
+    for owner, title in STATUS_SECTIONS:
+        rows = sorted((n, c) for n, c in checks.items() if c.get("owner") == owner)
+        if not rows:
+            continue
+        down = [(n, c) for n, c in rows if c["fails"]]
+        out.append("\n<b>%s</b> · %d up, %d down" % (e(title), len(rows) - len(down), len(down)))
+        if owner == "asset":
+            out += asset_table(rows)
+            continue
+        out += ["❌ %s: %s" % (e(n), e(c.get("detail", ""))) for n, c in down]
+        out += ["✅ %s" % e(n) for n, c in rows if not c["fails"]]
+    return out
 
 
 def page(query, current, meta=None):
@@ -161,21 +207,9 @@ def page(query, current, meta=None):
         t = float(at)
         snap = intervals(t - 1, t)
         out.append("<h2>Snapshot at %s</h2><p><a href='%s'>← back to timeline</a></p>" % (fmt(t), qs()))
-        for owner, title in SECTIONS:
-            rows = sorted((n, s[-1]) for n, (o, s) in snap.items() if o == owner and n in current)
-            if not rows:
-                continue
-            down = [r for r in rows if not r[1][2]]
-            out.append("<h2>%s · %d up, %d down</h2><div class=card><table>" % (e(title), len(rows) - len(down), len(down)))
-            for head, grp in grouped(rows, meta):
-                if head:
-                    out.append("<tr><td colspan=2 class=imp>%s</td></tr>" % e(head))
-                for n, (_, _, ok, d) in sorted(grp, key=lambda r: (r[1][2], r[0])):
-                    m = meta.get(n)
-                    who = " <span class=mut>· %s</span>" % e(m.get("person", "?")) if m else ""
-                    out.append("<tr><td><span class='dot %s'></span>%s%s</td><td class=mut>%s</td></tr>"
-                               % ("up" if ok else "down", e(n), who, e(d)))
-            out.append("</table></div>")
+        checks = {n: {"owner": o, "fails": not s[-1][2], "detail": s[-1][3], "meta": meta.get(n, {})}
+                  for n, (o, s) in snap.items() if n in current}
+        out.append("<div class='card status'>%s</div>" % "\n".join(status_lines(checks)).strip())
         return "".join(out + ["</main></body></html>"])
 
     # incidents: every down interval in the range, newest first
