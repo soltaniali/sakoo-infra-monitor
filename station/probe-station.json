@@ -38,7 +38,10 @@
     "superuserapipilot.aipsharif.ir",
     "superuserpilot.aipsharif.ir",
     "swaggerdocspilot.aipsharif.ir",
-    "zenmlpilot.aipsharif.ir"
+    "zenmlpilot.aipsharif.ir",
+    "rmgpilot.aipsharif.ir",
+    "harborpilot.aipsharif.ir",
+    "studiopilot.aipsharif.ir"
   ],
   "tcp_checks": {
     "node cpu-worker01 (kubelet)": [

@@ -97,10 +97,21 @@ def check_host(host, ip=None):
         with socket.create_connection((ip or host, 443), timeout=TIMEOUT) as s, ctx.wrap_socket(s, server_hostname=host) as t:
             days = (ssl.cert_time_to_seconds(t.getpeercert()["notAfter"]) - now()) / 86400
             t.sendall(b"GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: sakoo-infra-probe\r\nConnection: close\r\n\r\n" % host.encode())
-            line = t.recv(256).split(b"\r\n")[0].split()
+            data = b""
+            while len(data) < 1024 and b"\r\n\r\n" not in data:
+                chunk = t.recv(1024)
+                if not chunk:
+                    break
+                data += chunk
+            if b"\r\n\r\n" in data and len(data.partition(b"\r\n\r\n")[2]) < 20:
+                data += t.recv(256)  # body may arrive in its own packet
+        head, _, body = data.partition(b"\r\n\r\n")
+        line = head.split(b"\r\n")[0].split()
         code = int(line[1]) if len(line) > 1 and line[1].isdigit() else None
         if days < CERT_WARN_DAYS:
             return False, "certificate expires in %.0f days" % days, code
+        if code == 404 and body.startswith(b"404 page not found"):  # traefik's own page: no route for this host
+            return False, "traefik has no route for this host (404 page not found)", code
         return True, "HTTP %s, cert %.0f days left" % (code, days), code
     except (OSError, ssl.SSLError) as e:
         return False, err(e), None
@@ -342,7 +353,8 @@ def report(res):
 
 def main():
     if "--print" in sys.argv:
-        for name, (ok, detail, owner) in run_checks().items():
+        for name, r in run_checks().items():
+            ok, detail, owner = r[:3]
             print("%-4s %-45s %-7s %s" % ("OK" if ok else "FAIL", name, owner, detail))
         return
     while True:
