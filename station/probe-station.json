@@ -91,13 +91,14 @@
       "url": "https://mlopsapipilot.aipsharif.ir/data"
     },
     {
-      "name": "elasticsearch",
+      "name": "elasticsearch running",
       "person": "Infra",
       "value": "Critical",
       "services": [
         "elasticsearch-es-http",
         "elasticsearch-es-transport"
-      ]
+      ],
+      "owner": "infra"
     },
     {
       "name": "inference-service",
@@ -128,37 +129,41 @@
       "value": "Critical"
     },
     {
-      "name": "milvus etcd",
+      "name": "milvus etcd running",
       "person": "Infra",
       "value": "Low",
       "services": [
         "mlops-milvus-etcd"
-      ]
+      ],
+      "owner": "infra"
     },
     {
-      "name": "milvus",
+      "name": "milvus running",
       "person": "Infra",
       "value": "Low",
       "services": [
         "mlops-milvus-milvus"
-      ]
+      ],
+      "owner": "infra"
     },
     {
-      "name": "mongodb",
+      "name": "mongodb running",
       "person": "Infra",
       "value": "Critical",
       "services": [
         "mlops-mongodb-svc"
-      ]
+      ],
+      "owner": "infra"
     },
     {
-      "name": "postgres",
+      "name": "postgres running",
       "person": "Infra",
       "value": "Critical",
       "services": [
         "mlops-pgdb-rw",
         "mlops-pgdb-r"
-      ]
+      ],
+      "owner": "infra"
     },
     {
       "name": "mlops-web",
@@ -177,12 +182,13 @@
       "value": "No"
     },
     {
-      "name": "redis",
+      "name": "redis running",
       "person": "Infra",
       "value": "?",
       "services": [
         "redis-standalone"
-      ]
+      ],
+      "owner": "infra"
     },
     {
       "name": "training-api",
