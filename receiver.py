@@ -27,7 +27,7 @@ STATE, SUBS, OFFSET = DIR / "state.json", DIR / "subscribers.json", DIR / "tg_of
 FAIL_AFTER = int(os.environ.get("FAIL_AFTER", 2))
 SILENT_AFTER = int(os.environ.get("SILENT_AFTER_S", 180))
 MAX_SKEW = 300  # reject reports older/newer than 5 min (replays)
-LABEL = {"infra": "🔴 INFRA DOWN", "us": "🟠 MLOPS ISSUE", "monitor": "⚠️ PROBE CANNOT SEE SAKOO"}
+LABEL = {"infra": "🔴 INFRA DOWN", "us": "🟠 MLOPS ISSUE", "asset": "🟠 MLOPS ASSET DOWN", "monitor": "⚠️ PROBE CANNOT SEE SAKOO"}
 MAX_TRIES, BLOCK_S = 5, 900  # wrong /login passwords per chat before a 15 min block
 lock, sub_lock = threading.Lock(), threading.Lock()
 login_fails = {}  # chat id -> [wrong tries, blocked until]
@@ -88,7 +88,8 @@ def check_password(pw):
     return hmac.compare_digest(got, good)
 
 
-SECTIONS = [("infra", "🛠 INFRA (infra team)"), ("us", "🧩 OURS (MLOps)"), ("monitor", "📡 PROBE (the monitor itself)")]
+SECTIONS = [("infra", "🛠 INFRA (infra team)"), ("us", "🧩 OURS (MLOps endpoints)"),
+            ("asset", "📦 MLOPS ASSETS (asset list: name, owner, importance)"), ("monitor", "📡 PROBE (the monitor itself)")]
 
 
 def status_text():
@@ -109,7 +110,7 @@ def status_text():
 
 
 HELP = ("Sakoo infra monitor.\n/login <password>: get alerts\n/logout: stop alerts\n/status: what is failing now\n"
-        "Alert types: 🔴 infra team, 🟠 ours (MLOps), ⚠️ the probe itself.")
+        "Alert types: 🔴 infra team, 🟠 ours (MLOps endpoints and assets), ⚠️ the probe itself.")
 
 
 def handle(update):

@@ -3,7 +3,10 @@
   "interval_s": 60,
   "timeout_s": 8,
   "cert_warn_days": 14,
-  "vpn": {"cluster": "tun0", "endpoints": "tun1"},
+  "vpn": {
+    "cluster": "tun0",
+    "endpoints": "tun1"
+  },
   "ingress_ip": "172.30.153.101",
   "public_ip": "185.220.226.23",
   "hosts": [
@@ -15,16 +18,189 @@
     "s3pilot.aipsharif.ir"
   ],
   "tcp_checks": {
-    "node cpu-worker01 (kubelet)": ["172.30.153.11", 10250],
-    "node cpu-worker02 (kubelet)": ["172.30.153.12", 10250],
-    "node cpu-worker03 (kubelet)": ["172.30.153.13", 10250],
-    "node gpu-worker01 (kubelet)": ["172.30.153.14", 10250],
-    "node gpu-worker02 (kubelet)": ["172.30.153.15", 10250]
+    "node cpu-worker01 (kubelet)": [
+      "172.30.153.11",
+      10250
+    ],
+    "node cpu-worker02 (kubelet)": [
+      "172.30.153.12",
+      10250
+    ],
+    "node cpu-worker03 (kubelet)": [
+      "172.30.153.13",
+      10250
+    ],
+    "node gpu-worker01 (kubelet)": [
+      "172.30.153.14",
+      10250
+    ],
+    "node gpu-worker02 (kubelet)": [
+      "172.30.153.15",
+      10250
+    ]
   },
   "http_checks": {
-    "kubernetes API": {"url": "https://172.30.153.100:6443/livez", "insecure": true}
+    "kubernetes API": {
+      "url": "https://172.30.153.100:6443/livez",
+      "insecure": true
+    }
   },
   "kubeconfig": "/secrets/kubeconfig",
-  "event_namespaces": ["aip-mlops-service", "openwebui", "litellm", "langfuse", "studio-team"],
-  "events_window_s": 600
+  "event_namespaces": [
+    "aip-mlops-service",
+    "openwebui",
+    "litellm",
+    "langfuse",
+    "studio-team"
+  ],
+  "events_window_s": 600,
+  "assets_namespace": "aip-mlops-service",
+  "assets": [
+    {
+      "name": "acl-service",
+      "person": "Abolfazl",
+      "value": "No"
+    },
+    {
+      "name": "agent-resizer",
+      "person": "Armin",
+      "value": "Low",
+      "url": "https://mlopsapipilot.aipsharif.ir/agent-resources"
+    },
+    {
+      "name": "agent-service",
+      "person": "Dariush",
+      "value": "Critical"
+    },
+    {
+      "name": "aip-bridge-service",
+      "person": "Taha",
+      "value": "Low",
+      "url": "https://mlopsapipilot.aipsharif.ir/"
+    },
+    {
+      "name": "ceph-create-user-api",
+      "person": "Dariush",
+      "value": "Critical",
+      "url": "https://mlopsapipilot.aipsharif.ir/storage"
+    },
+    {
+      "name": "data-ingestion-api",
+      "person": "Abolfazl",
+      "value": "Critical",
+      "url": "https://mlopsapipilot.aipsharif.ir/data"
+    },
+    {
+      "name": "elasticsearch",
+      "person": "Infra",
+      "value": "Critical",
+      "services": [
+        "elasticsearch-es-http",
+        "elasticsearch-es-transport"
+      ]
+    },
+    {
+      "name": "inference-service",
+      "person": "Sajjad",
+      "value": "Critical",
+      "url": "https://mlopspilot.aipsharif.ir/"
+    },
+    {
+      "name": "kubeai",
+      "person": "Sajjad",
+      "value": "Critical"
+    },
+    {
+      "name": "mlasset-registry-api",
+      "person": "Abolfazl",
+      "value": "No",
+      "url": "https://mlopsapipilot.aipsharif.ir/mlasset"
+    },
+    {
+      "name": "mlops-core",
+      "person": "Armin",
+      "value": "Critical",
+      "url": "https://mlopsapipilot.aipsharif.ir/core"
+    },
+    {
+      "name": "mlops-core-fileserver",
+      "person": "Armin",
+      "value": "Critical"
+    },
+    {
+      "name": "milvus etcd",
+      "person": "Infra",
+      "value": "Low",
+      "services": [
+        "mlops-milvus-etcd"
+      ]
+    },
+    {
+      "name": "milvus",
+      "person": "Infra",
+      "value": "Low",
+      "services": [
+        "mlops-milvus-milvus"
+      ]
+    },
+    {
+      "name": "mongodb",
+      "person": "Infra",
+      "value": "Critical",
+      "services": [
+        "mlops-mongodb-svc"
+      ]
+    },
+    {
+      "name": "postgres",
+      "person": "Infra",
+      "value": "Critical",
+      "services": [
+        "mlops-pgdb-rw",
+        "mlops-pgdb-r"
+      ]
+    },
+    {
+      "name": "mlops-web",
+      "person": "Mohammad",
+      "value": "Low"
+    },
+    {
+      "name": "model-registry-api",
+      "person": "Mohammad",
+      "value": "Critical",
+      "url": "https://mlopsapipilot.aipsharif.ir/models"
+    },
+    {
+      "name": "open-webui",
+      "person": "Sajjad",
+      "value": "No"
+    },
+    {
+      "name": "redis",
+      "person": "Infra",
+      "value": "?",
+      "services": [
+        "redis-standalone"
+      ]
+    },
+    {
+      "name": "training-api",
+      "person": "Dariush",
+      "value": "Critical",
+      "url": "https://mlopsapipilot.aipsharif.ir/train"
+    },
+    {
+      "name": "user-custom-serve",
+      "person": "Sajjad",
+      "value": "No",
+      "url": "https://mlopsapipilot.aipsharif.ir/serve"
+    },
+    {
+      "name": "user-management-api",
+      "person": "Armin",
+      "value": "Critical",
+      "url": "https://mlopsapipilot.aipsharif.ir/users"
+    }
+  ]
 }

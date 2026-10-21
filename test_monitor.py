@@ -65,6 +65,24 @@ report(True)                                              # accepted despite the
 probe.time.time = time.time
 res = probe.run_checks()                                  # probe check functions on this machine
 assert probe.check_dns("localhost")[0] and not probe.check_dns("no-such-host.invalid")[0]
+
+# --- asset checks: ready pods behind the Service, URL answers, route not replaced by traefik's fallback page
+probe.CFG.update(assets=[{"name": "a", "person": "P", "value": "Critical", "url": "https://h/a"},
+                         {"name": "b", "person": "Q", "value": "Low"},
+                         {"name": "c", "url": "https://h/c"}, {"name": "d", "url": "https://h/d"}])
+probe.kube = lambda: ("https://api", None)
+eps = {"items": [{"metadata": {"name": n}, "subsets": [{"addresses": [{}] * k}] if k else []}
+                 for n, k in (("a", 1), ("b", 0), ("c", 1), ("d", 1))]}
+probe.get = lambda url, **kw: (200, json.dumps(eps).encode())
+pages = {"https://h/sakoo-probe-no-such-path": (200, b"<html>dashboard"), "https://h/a": (404, b'{"detail":"Not Found"}'),
+         "https://h/c": (200, b"<html>dashboard"), "https://h/d": (502, b"Bad Gateway")}
+probe.fetch = lambda url, ip=None: pages[url]
+r = probe.check_assets()
+assert r["a (P, Critical)"][0] and r["a (P, Critical)"][2] == "asset", r                                 # app's own 404 = alive
+assert not r["b (Q, Low)"][0] and "no ready pod" in r["b (Q, Low)"][1], r
+assert not r["c (?, ?)"][0] and "no route" in r["c (?, ?)"][1], r  # route gone: traefik fallback page
+assert not r["d (?, ?)"][0] and "502" in r["d (?, ?)"][1], r
+
 srv.shutdown()
 
 # --- bot: /login with password, rate limit, broadcast to subscribers, /status, /logout

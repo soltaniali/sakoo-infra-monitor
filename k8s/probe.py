@@ -211,6 +211,59 @@ def check_events():
     return res
 
 
+def fetch(url, ip=None):
+    """(status, first 300 bytes of the body) over TLS to ip (or the URL's host), SNI = URL host. Raises on network errors."""
+    u = urllib.parse.urlsplit(url)
+    with socket.create_connection((ip or u.hostname, u.port or 443), timeout=TIMEOUT) as s:
+        with ssl.create_default_context().wrap_socket(s, server_hostname=u.hostname) as t:
+            t.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: sakoo-infra-probe\r\nConnection: close\r\n\r\n"
+                       % (u.path or "/", u.hostname)).encode())
+            data = b""
+            while len(data) < 2000:
+                chunk = t.recv(2000)
+                if not chunk:
+                    break
+                data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    line = head.split(b"\r\n")[0].split()
+    return (int(line[1]) if len(line) > 1 and line[1].isdigit() else 0), body[:300]
+
+
+def check_assets():
+    """MLOps assets (the asset list): each must have a ready pod behind its Kubernetes Service, and, if it has an
+    external URL, its app must answer through traefik (status < 500, and not traefik's fallback page)."""
+    ns, assets = CFG.get("assets_namespace", "aip-mlops-service"), CFG.get("assets", [])
+    server, ctx = kube()
+    code, body = get("%s/api/v1/namespaces/%s/endpoints" % (server, ns), ctx=ctx)
+    if code != 200:
+        return {"asset list": (False, "cannot read endpoints in %s: HTTP %d" % (ns, code), "monitor")}
+    ready = {e["metadata"]["name"]: sum(len(x.get("addresses", [])) for x in e.get("subsets", []))
+             for e in json.loads(body)["items"]}
+    fallback = {}  # host -> body of a path no app serves, to recognise a route that has disappeared
+    res = {}
+    for a in assets:
+        label = "%s (%s, %s)" % (a["name"], a.get("person", "?"), a.get("value", "?"))
+        problems = ["%s: no ready pod" % svc if svc in ready else "%s: no such Service" % svc
+                    for svc in a.get("services", [a["name"]]) if not ready.get(svc)]
+        url = a.get("url")
+        if url and not problems:
+            host = urllib.parse.urlsplit(url).hostname
+            try:
+                if host not in fallback:
+                    fallback[host] = fetch("https://%s/sakoo-probe-no-such-path" % host, CFG.get("ingress_ip"))[1]
+                status, sample = fetch(url, CFG.get("ingress_ip"))
+                if status >= 500 or status == 0:
+                    problems.append("%s answered HTTP %d" % (url, status))
+                elif urllib.parse.urlsplit(url).path not in ("", "/") and sample == fallback[host]:
+                    problems.append("%s has no route (traefik serves the fallback page)" % url)
+            except (OSError, ssl.SSLError) as e:
+                problems.append("%s: %s" % (url, err(e)))
+        n = sum(ready.get(svc, 0) for svc in a.get("services", [a["name"]]))
+        res[label] = (not problems, "; ".join(problems) or "%d ready pod(s)%s" % (n, ", URL answers" if url else ""),
+                      a.get("owner", "asset"))
+    return res
+
+
 def host_checks(res, ip, label, owner_if_all_fail):
     """Check every host over one path; one alert if all fail, else per-host results. Returns True if any answered."""
     hosts = {h: check_host(h, ip) for h in CFG.get("hosts", [])}
@@ -247,6 +300,11 @@ def run_checks():
             res[name] = check_http(c["url"], c.get("healthy_text"), c.get("insecure", False)) + (c.get("owner", "infra"),)
         if CFG.get("kubeconfig") and res.get("kubernetes API", (True,))[0]:  # API down is already its own alert
             res.update(check_events())
+            if CFG.get("assets"):
+                try:
+                    res.update(check_assets())
+                except Exception as e:
+                    res["asset list"] = (False, err(e), "monitor")
         if CFG.get("nodes"):
             res.update(check_nodes())
 
