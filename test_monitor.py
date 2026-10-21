@@ -89,6 +89,20 @@ assert not r["b"][0] and "no ready pod" in r["b"][1], r
 assert not r["c"][0] and "no route" in r["c"][1], r  # route gone: traefik fallback page
 assert not r["d"][0] and "502" in r["d"][1], r
 
+import tempfile as _t                                      # VPN check: interface up but OpenVPN reconnecting = down
+log = Path(_t.mkdtemp()) / "vpn.log"
+LOG = ["x Initialization Sequence Completed", "x [srv] Inactivity timeout (--ping-restart), restarting",
+       "2026-11-20 01:00:43 TCP: connect to [AF_INET]5.202.5.212:7071 failed: Operation timed out",
+       "x SIGUSR1[connection failed(soft)] received, process restarting"]
+log.write_text("\n".join(LOG) + "\n")
+probe.Path = Path
+real_read = Path.read_text
+Path.read_text = lambda self, *a, **k: "unknown" if str(self).endswith("operstate") else real_read(self, *a, **k)
+ok, why = probe.check_vpn("tun9", str(log))
+assert not ok and "5.202.5.212" in why, why
+log.write_text("\n".join(LOG + ["x Initialization Sequence Completed"]) + "\n")
+assert probe.check_vpn("tun9", str(log))[0]
+Path.read_text = real_read
 srv.shutdown()
 
 # --- bot: /login with password, rate limit, broadcast to subscribers, /status, /logout

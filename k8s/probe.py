@@ -124,12 +124,23 @@ def check_http(url, healthy_text=None, insecure=False):
     return True, "HTTP %d" % code
 
 
-def check_vpn(iface):
+def check_vpn(iface, log=None):
+    """Up = the interface exists AND OpenVPN's log shows it connected after its last restart. The interface alone is
+    not enough: OpenVPN keeps tun devices (persist-tun) while it reconnects, and a dead tunnel must not look like
+    every Sakoo check failing."""
     try:
         state = Path("/sys/class/net/%s/operstate" % iface).read_text().strip()
     except OSError:
         return False, "interface %s does not exist (VPN not running?)" % iface
-    return state in ("up", "unknown"), "%s is %s" % (iface, state)  # tun devices report "unknown" when up
+    if log and Path(log).exists():
+        lines = Path(log).read_text(errors="replace").splitlines()[-400:]
+        last_up = max((i for i, l in enumerate(lines) if "Initialization Sequence Completed" in l), default=-1)
+        last_down = max((i for i, l in enumerate(lines) if "restarting" in l or "connection failed" in l), default=-1)
+        if last_down > last_up:
+            recent = lines[last_up + 1:last_down + 1]  # most useful reason first: connect error, auth, inactivity
+            why = next((l for key in ("connect to", "AUTH", "Inactivity", "TLS Error") for l in reversed(recent) if key in l), lines[last_down])
+            return False, "%s reconnecting: %s" % (iface, why[20:160])
+    return state in ("up", "unknown"), "%s connected" % iface  # tun devices report "unknown" when up
 
 
 def check_nodes():
@@ -288,7 +299,7 @@ def run_checks():
         sync_clock()
     res, vpn = {}, CFG.get("vpn", {})  # {"cluster": "tun0", "endpoints": "tun1"}
     for role, iface in vpn.items():
-        res["probe VPN " + role] = check_vpn(iface) + ("monitor",)
+        res["probe VPN " + role] = check_vpn(iface, "/tmp/vpn-%s.log" % role) + ("monitor",)
     cluster_ok = res.get("probe VPN cluster", (True,))[0]
     public_ok = res.get("probe VPN endpoints", (True,))[0]
 
