@@ -125,7 +125,7 @@ def label(n, m, e):
     if not m:
         return "<div class=n title='%s'>%s</div>" % (e(n), e(n))
     return ("<div class=n title='%s'><b>%s</b> <span class=mut>· %s · %s</span><div class=sub>%s</div></div>"
-            % (e(n), e(n), e(m.get("person", "?")), e(m.get("value", "?")), e(m.get("test", ""))))
+            % (e(n), e(n), e(m.get("person", "?")), e(IMP_LABEL.get(m.get("value", "?"), m.get("value"))), e(m.get("test", ""))))
 
 
 def grouped(rows, meta):
@@ -230,11 +230,14 @@ def page(query, current, meta=None):
     span = end - start
     ticks = "".join("<span>%s</span>" % fmt(start + span * i / 6, rng in ("3d", "7d")) for i in range(7))
     for owner, title in SECTIONS:
-        rows = sorted((n, segs) for n, (o, segs) in data.items() if o == owner and n in current)
+        # same order as /status: down first, then by name; only assets are grouped by importance
+        rows = sorted(((n, segs) for n, (o, segs) in data.items() if o == owner and n in current),
+                      key=lambda r: (r[1][-1][2], r[0]))
         if not rows:
             continue
+        m_own = meta if owner == "asset" else {}
         out.append("<h2 id='%s'>%s</h2><div class=card>" % (owner, e(title)))
-        for head, grp in grouped(rows, meta):
+        for head, grp in grouped(rows, m_own):
             if head:
                 out.append("<div class=imp>%s</div>" % e(head))
             for n, segs in grp:
@@ -248,7 +251,7 @@ def page(query, current, meta=None):
                                 % (qs(at=int(t0) + 1), x, w, "up" if ok else "down", e(tip)))
                 out.append("<div class=row>%s<svg viewBox='0 0 1000 16' preserveAspectRatio='none'>"
                            "<rect width='1000' height='16' fill='var(--none)'/>%s</svg><div class=p>%s</div></div>"
-                           % (label(n, meta.get(n), e), "".join(bars), ("%.1f%%" % (100 * up / known)) if known else "–"))
+                           % (label(n, m_own.get(n), e), "".join(bars), ("%.1f%%" % (100 * up / known)) if known else "–"))
         out.append("<div class=axis>%s</div></div>" % ticks)
     out.append("<p class=mut>Grey = no data yet. Click a bar or an incident for the snapshot of all checks at that moment.</p>")
     return "".join(out + ["</main></body></html>"])
