@@ -242,10 +242,10 @@ def check_assets():
     fallback = {}  # host -> body of a path no app serves, to recognise a route that has disappeared
     res = {}
     for a in assets:
-        label = "%s (%s, %s)" % (a["name"], a.get("person", "?"), a.get("value", "?"))
+        label = a["name"]
         problems = ["%s: no ready pod" % svc if svc in ready else "%s: no such Service" % svc
                     for svc in a.get("services", [a["name"]]) if not ready.get(svc)]
-        url, tested = a.get("url"), "internal only (no external URL)"
+        url, tested = a.get("url"), "pods"
         if url and not problems:
             host = urllib.parse.urlsplit(url).hostname
             try:
@@ -253,7 +253,9 @@ def check_assets():
                     fallback[host] = fetch("https://%s/sakoo-probe-no-such-path" % host, CFG.get("ingress_ip"))[1]
                 status, sample = fetch(url, CFG.get("ingress_ip"))
                 want = a.get("expect")  # health endpoint: must be 200 and contain this text
-                tested = "%s → HTTP %d%s" % (url, status, (", " + want) if want else ", answered by the app")
+                u = urllib.parse.urlsplit(url)  # short form: path on mlopsapipilot, else host/path
+                short = (u.path or "/") if u.hostname.startswith("mlopsapipilot.") else u.hostname.split(".")[0] + (u.path or "/")
+                tested = "%s %d" % (short, status)
                 if want and (status != 200 or want.encode() not in sample):
                     problems.append("%s answered HTTP %d without %r: %r" % (url, status, want, sample[:80]))
                 elif status >= 500 or status == 0:
@@ -263,8 +265,9 @@ def check_assets():
             except (OSError, ssl.SSLError) as e:
                 problems.append("%s: %s" % (url, err(e)))
         n = sum(ready.get(svc, 0) for svc in a.get("services", [a["name"]]))
-        res[label] = (not problems, "; ".join(problems) or "%d ready pod(s) · %s" % (n, tested),
-                      a.get("owner", "asset"))
+        meta = {"person": a.get("person", "?"), "value": a.get("value", "?"), "test": tested, "pods": n}
+        res[label] = (not problems, "; ".join(problems) or "%d ready pod(s), %s" % (n, tested),
+                      a.get("owner", "asset"), meta)
     return res
 
 

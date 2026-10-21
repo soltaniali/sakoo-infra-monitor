@@ -10,6 +10,7 @@ Alerts: a check failing FAIL_AFTER reports in a row; its recovery; no report for
 Bot: anyone who sends "/login <password>" gets every alert; /logout, /status, /help. Subscribers: subscribers.json.
 """
 import hashlib
+import html
 import hmac
 import json
 import os
@@ -89,24 +90,50 @@ def check_password(pw):
 
 
 SECTIONS = [("infra", "🛠 INFRA (infra team)"), ("us", "🧩 OURS (MLOps endpoints)"),
-            ("asset", "📦 MLOPS ASSETS (asset list: name, owner, importance)"), ("monitor", "📡 PROBE (the monitor itself)")]
+            ("asset", "📦 MLOPS ASSETS"), ("monitor", "📡 PROBE (the monitor itself)")]
+IMPORTANCE = ["Critical", "Low", "No", "?"]
+
+
+def asset_table(rows):
+    """Assets as aligned monospace rows, grouped by importance: name, owner, what was tested. Down rows: reason below."""
+    e = html.escape
+    w = max(len(n) for n, _ in rows)
+    pw = max(len(c.get("meta", {}).get("person", "")) for _, c in rows)
+    lines = []
+    for imp in IMPORTANCE + sorted({c.get("meta", {}).get("value", "?") for _, c in rows} - set(IMPORTANCE)):
+        group = [(n, c) for n, c in rows if c.get("meta", {}).get("value", "?") == imp]
+        if not group:
+            continue
+        lines.append("<b>%s</b>" % e({"No": "Not rated", "?": "Unknown"}.get(imp, imp)))
+        body = []
+        for n, c in sorted(group, key=lambda r: (not r[1]["fails"], r[0])):  # down first
+            m = c.get("meta", {})
+            body.append("%s %s  %s  %s" % ("❌" if c["fails"] else "✅", n.ljust(w), m.get("person", "?").ljust(pw),
+                                           "" if c["fails"] else m.get("test", "")))
+            if c["fails"]:
+                body.append("   ↳ " + c.get("detail", ""))
+        lines.append("<pre>%s</pre>" % e("\n".join(body)))
+    return lines
 
 
 def status_text():
-    """Every check from the latest report, grouped by owner, down first. Down checks show why."""
+    """Every check from the latest report, grouped by owner, down first. Telegram HTML."""
+    e = html.escape
     state = load()
     age = time.time() - state["last_report"]
     current = {n: c for n, c in state["checks"].items() if c.get("seen", 0) >= state["last_report"] - 1}
-    out = ["Sakoo status, last report %d s ago%s" % (age, " (⚠️ probe silent)" if state.get("silent") else "")]
+    out = ["<b>Sakoo status</b> · last report %d s ago%s" % (age, " · ⚠️ probe silent" if state.get("silent") else "")]
     for owner, title in SECTIONS:
         rows = sorted((n, c) for n, c in current.items() if c.get("owner") == owner)
         if not rows:
             continue
         down = [(n, c) for n, c in rows if c["fails"]]
-        out.append("\n%s: %d up, %d down" % (title, len(rows) - len(down), len(down)))
-        out += ["❌ %s: %s" % (n, c.get("detail", "")) for n, c in down]
-        detail_up = owner == "asset"  # assets: also show what was tested (pods, URL, status)
-        out += ["✅ %s%s" % (n, " — " + c.get("detail", "") if detail_up else "") for n, c in rows if not c["fails"]]
+        out.append("\n<b>%s</b> · %d up, %d down" % (e(title), len(rows) - len(down), len(down)))
+        if owner == "asset":
+            out += asset_table(rows)
+            continue
+        out += ["❌ %s: %s" % (e(n), e(c.get("detail", ""))) for n, c in down]
+        out += ["✅ %s" % e(n) for n, c in rows if not c["fails"]]
     return "\n".join(out)
 
 
@@ -149,7 +176,9 @@ def handle(update):
             save_subscribers(subs)
         return reply("Logged out. No more alerts.")
     if cmd == "/status":
-        return reply(status_text() if chat in subscribers() else "Log in first: /login <password>")
+        if chat not in subscribers():
+            return reply("Log in first: /login <password>")
+        return tg("sendMessage", chat_id=chat, text=status_text(), parse_mode="HTML")
     reply(HELP)
 
 
@@ -192,9 +221,11 @@ def apply(results):
         if state["silent"]:
             msgs.append("✅ PROBE BACK: reports arrive again")
         state.update(last_report=time.time(), silent=False)  # set before "seen", so /status can tell current checks
-        for name, (ok, detail, owner) in results.items():
+        for name, r in results.items():
+            ok, detail, owner = r[:3]
+            meta = r[3] if len(r) > 3 else {}
             s = state["checks"].setdefault(name, {"fails": 0, "alerted": False})
-            s.update(detail=detail, owner=owner, seen=time.time())  # for /status
+            s.update(detail=detail, owner=owner, meta=meta, seen=time.time())  # for /status
             if ok:
                 if s["alerted"]:
                     msgs.append("✅ RECOVERED [%s] %s: %s" % (owner, name, detail))
@@ -202,7 +233,8 @@ def apply(results):
             else:
                 s["fails"] += 1
                 if s["fails"] >= FAIL_AFTER and not s["alerted"]:
-                    msgs.append("%s %s: %s (%d reports in a row)" % (LABEL.get(owner, owner), name, detail, s["fails"]))
+                    who = " (%s, %s)" % (meta.get("person", "?"), meta.get("value", "?")) if meta else ""
+                    msgs.append("%s %s%s: %s (%d reports in a row)" % (LABEL.get(owner, owner), name, who, detail, s["fails"]))
                     s["alerted"] = True
         send(msgs, state)
         return msgs

@@ -82,12 +82,12 @@ probe.CFG["assets"].append({"name": "f", "url": "https://h/f/health", "expect": 
 eps["items"] += [{"metadata": {"name": n}, "subsets": [{"addresses": [{}]}]} for n in ("e", "f")]
 pages.update({"https://h/e/health": (200, b'{"status":"healthy"}'), "https://h/f/health": (200, b'{"status":"degraded"}')})
 r = probe.check_assets()
-assert r["e (?, ?)"][0] and "healthy" in r["e (?, ?)"][1], r      # health endpoint OK
-assert not r["f (?, ?)"][0], r                                     # 200 but not healthy
-assert r["a (P, Critical)"][0] and r["a (P, Critical)"][2] == "asset", r                                 # app's own 404 = alive
-assert not r["b (Q, Low)"][0] and "no ready pod" in r["b (Q, Low)"][1], r
-assert not r["c (?, ?)"][0] and "no route" in r["c (?, ?)"][1], r  # route gone: traefik fallback page
-assert not r["d (?, ?)"][0] and "502" in r["d (?, ?)"][1], r
+assert r["e"][0] and r["e"][3]["test"] == "h/e/health 200", r     # health endpoint OK
+assert not r["f"][0], r                                     # 200 but not healthy
+assert r["a"][0] and r["a"][2] == "asset", r                                 # app's own 404 = alive
+assert not r["b"][0] and "no ready pod" in r["b"][1], r
+assert not r["c"][0] and "no route" in r["c"][1], r  # route gone: traefik fallback page
+assert not r["d"][0] and "502" in r["d"][1], r
 
 srv.shutdown()
 
@@ -140,6 +140,12 @@ assert [p["chat_id"] for m, p in calls if m == "sendMessage"] == ["42", "666"]
 assert receiver.subscribers() == {"42": "u42"}
 st = msg(42, "/status")
 assert "INFRA" in st and "OURS" in st and "❌ host x" in st and "✅ harbor health" in st, st
+assert calls[-1][1].get("parse_mode") == "HTML"
+receiver.apply({"svc-a": [True, "1 ready pod(s), /a 200", "asset", {"person": "Armin", "value": "Critical", "test": "/a 200"}],
+                "svc-b": [False, "no ready pod <x>", "asset", {"person": "Dariush", "value": "Critical", "test": "pods"}]})
+st = receiver.status_text()
+assert "<b>Critical</b>" in st and "svc-a  Armin" in st and "↳ no ready pod &lt;x&gt;" in st, st   # aligned, escaped
+assert st.index("❌ svc-b") < st.index("✅ svc-a"), st                                            # down first
 assert "Logged out" in msg(42, "/logout") and receiver.subscribers() == {}
 receiver.telegram("nobody listens")                       # no subscribers: no crash
 print("ok")
