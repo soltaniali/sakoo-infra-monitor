@@ -108,13 +108,38 @@ border-radius:6px;text-decoration:none;background:var(--card)}.tabs a.on{backgro
 svg{width:100%;height:16px;display:block}svg a rect:hover{opacity:.75}.axis{display:flex;justify-content:space-between;
 color:var(--mut);font-size:11px;margin:2px 58px 0 290px}table{width:100%;border-collapse:collapse}td,th{text-align:left;
 padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--mut);font-weight:500}
-.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}.up{background:var(--up)}.down{background:var(--down)}
+.sub{font-size:11.5px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.imp{font-size:12px;color:var(--mut);margin:10px 0 2px;text-transform:uppercase;letter-spacing:.04em}
+.jump a{margin-right:12px}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}.up{background:var(--up)}.down{background:var(--down)}
 @media (max-width:700px){.row{grid-template-columns:1fr}.axis{margin:2px 0}.row .p{text-align:left}}
 """
 
 
-def page(query, current):
-    """current: names of the checks in the latest report (renamed or removed checks are hidden)."""
+IMPORTANCE = ["Critical", "Low", "No", "?"]
+IMP_LABEL = {"No": "Not rated", "?": "Unknown"}
+
+
+def label(n, m, e):
+    """Row label; assets also show owner, importance and what was tested."""
+    if not m:
+        return "<div class=n title='%s'>%s</div>" % (e(n), e(n))
+    return ("<div class=n title='%s'><b>%s</b> <span class=mut>· %s · %s</span><div class=sub>%s</div></div>"
+            % (e(n), e(n), e(m.get("person", "?")), e(m.get("value", "?")), e(m.get("test", ""))))
+
+
+def grouped(rows, meta):
+    """Rows with asset meta grouped by importance: [(heading or None, rows)]."""
+    if not any(n in meta for n, _ in rows):
+        return [(None, rows)]
+    imps = IMPORTANCE + sorted({meta.get(n, {}).get("value", "?") for n, _ in rows} - set(IMPORTANCE))
+    return [(IMP_LABEL.get(i, i), [r for r in rows if meta.get(r[0], {}).get("value", "?") == i]) for i in imps
+            if any(meta.get(r[0], {}).get("value", "?") == i for r in rows)]
+
+
+def page(query, current, meta=None):
+    """current: names of the checks in the latest report (renamed or removed checks are hidden).
+    meta: {name: {"person", "value", "test"}} for MLOps assets, from the latest report."""
+    meta = meta or {}
     q = urllib.parse.parse_qs(query)
     tok = q.get("t", [""])[0]
     rng = q.get("range", ["24h"])[0]
@@ -128,6 +153,7 @@ def page(query, current):
            "<title>Sakoo uptime</title><style>%s</style></head><body><main>" % CSS,
            "<h1>Sakoo uptime</h1><div class=mut>Tehran time · updated %s · link valid until %s</div>"
            % (fmt(end), fmt(int(tok.split(".")[0])) if "." in tok else "?"),
+           "<div class='jump mut'>Jump to: %s</div>" % " ".join("<a href='#%s'>%s</a>" % (o, e(t)) for o, t in SECTIONS),
            "<div class=tabs>" + "".join("<a class='%s' href='%s'>%s</a>" % ("on" if r == rng and not at else "", qs(range=r), r)
                                          for r in RANGES) + "</div>"]
 
@@ -141,8 +167,14 @@ def page(query, current):
                 continue
             down = [r for r in rows if not r[1][2]]
             out.append("<h2>%s · %d up, %d down</h2><div class=card><table>" % (e(title), len(rows) - len(down), len(down)))
-            for n, (_, _, ok, d) in sorted(rows, key=lambda r: (r[1][2], r[0])):
-                out.append("<tr><td><span class='dot %s'></span>%s</td><td class=mut>%s</td></tr>" % ("up" if ok else "down", e(n), e(d)))
+            for head, grp in grouped(rows, meta):
+                if head:
+                    out.append("<tr><td colspan=2 class=imp>%s</td></tr>" % e(head))
+                for n, (_, _, ok, d) in sorted(grp, key=lambda r: (r[1][2], r[0])):
+                    m = meta.get(n)
+                    who = " <span class=mut>· %s</span>" % e(m.get("person", "?")) if m else ""
+                    out.append("<tr><td><span class='dot %s'></span>%s%s</td><td class=mut>%s</td></tr>"
+                               % ("up" if ok else "down", e(n), who, e(d)))
             out.append("</table></div>")
         return "".join(out + ["</main></body></html>"])
 
@@ -167,19 +199,22 @@ def page(query, current):
         rows = sorted((n, segs) for n, (o, segs) in data.items() if o == owner and n in current)
         if not rows:
             continue
-        out.append("<h2>%s</h2><div class=card>" % e(title))
-        for n, segs in rows:
-            up = sum(t1 - t0 for t0, t1, ok, _ in segs if ok)
-            known = sum(t1 - t0 for t0, t1, _, _ in segs)
-            bars = []
-            for t0, t1, ok, d in segs:
-                x, w = (t0 - start) / span * 1000, max((t1 - t0) / span * 1000, 1.5)
-                tip = "%s %s → %s (%s)%s" % ("UP" if ok else "DOWN", fmt(t0), fmt(t1), dur(t1 - t0), "" if ok else ": " + d[:200])
-                bars.append("<a href='%s'><rect x='%.1f' y='0' width='%.1f' height='16' fill='var(--%s)'><title>%s</title></rect></a>"
-                            % (qs(at=int(t0) + 1), x, w, "up" if ok else "down", e(tip)))
-            out.append("<div class=row><div class=n title='%s'>%s</div><svg viewBox='0 0 1000 16' preserveAspectRatio='none'>"
-                       "<rect width='1000' height='16' fill='var(--none)'/>%s</svg><div class=p>%s</div></div>"
-                       % (e(n), e(n), "".join(bars), ("%.1f%%" % (100 * up / known)) if known else "–"))
+        out.append("<h2 id='%s'>%s</h2><div class=card>" % (owner, e(title)))
+        for head, grp in grouped(rows, meta):
+            if head:
+                out.append("<div class=imp>%s</div>" % e(head))
+            for n, segs in grp:
+                up = sum(t1 - t0 for t0, t1, ok, _ in segs if ok)
+                known = sum(t1 - t0 for t0, t1, _, _ in segs)
+                bars = []
+                for t0, t1, ok, d in segs:
+                    x, w = (t0 - start) / span * 1000, max((t1 - t0) / span * 1000, 1.5)
+                    tip = "%s %s → %s (%s)%s" % ("UP" if ok else "DOWN", fmt(t0), fmt(t1), dur(t1 - t0), "" if ok else ": " + d[:200])
+                    bars.append("<a href='%s'><rect x='%.1f' y='0' width='%.1f' height='16' fill='var(--%s)'><title>%s</title></rect></a>"
+                                % (qs(at=int(t0) + 1), x, w, "up" if ok else "down", e(tip)))
+                out.append("<div class=row>%s<svg viewBox='0 0 1000 16' preserveAspectRatio='none'>"
+                           "<rect width='1000' height='16' fill='var(--none)'/>%s</svg><div class=p>%s</div></div>"
+                           % (label(n, meta.get(n), e), "".join(bars), ("%.1f%%" % (100 * up / known)) if known else "–"))
         out.append("<div class=axis>%s</div></div>" % ticks)
     out.append("<p class=mut>Grey = no data yet. Click a bar or an incident for the snapshot of all checks at that moment.</p>")
     return "".join(out + ["</main></body></html>"])

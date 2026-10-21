@@ -273,7 +273,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._reply(403, b"Link expired or invalid. Ask the bot: /dashboard\n")
             state = load()
             current = {n for n, c in state["checks"].items() if c.get("seen", 0) >= state["last_report"] - 1}
-            body = dashboard.page(query, current | {"probe reports"}).encode()
+            meta = {n: c["meta"] for n, c in state["checks"].items() if n in current and c.get("meta")}
+            body = dashboard.page(query, current | {"probe reports"}, meta).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
