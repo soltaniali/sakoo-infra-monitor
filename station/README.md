@@ -1,7 +1,7 @@
 # Probe station (VPNs + probe in one container)
 
 Runs the Sakoo infra probe on any machine in Iran that can reach both VPN servers and the London receiver.
-The same image and `compose.yaml` run on Windows (Docker Desktop) and on Linux. Runs on the Iran host 213.233.184.128 (user ali_soltani, since 2026-10-20); first tested on Ali's laptop.
+The same image and `compose.yaml` run on Windows (Docker Desktop) and on Linux. Runs on the Iran host 85.198.48.95 (`AIP-IRAN`, user mlops, ~/station, since 2026-10-21). Earlier: 213.233.184.128 (removed), first tested on Ali's laptop.
 
 ```
 container: tun0 = cluster VPN (se-user15, 172.30.151-153.0/24)  ─┐
