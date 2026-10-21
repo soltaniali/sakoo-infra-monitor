@@ -28,6 +28,6 @@ export PROBE_CONFIG=/app/probe-station.json
 if [ "${1:-}" = "--print" ]; then exec python3 -u probe.py --print; fi
 # ops dashboard + collector (diagnose only, GET-only to Kubernetes) in this container, so it shares the VPN tunnels
 if [ -f /app/ops_web.py ]; then
-  ( while true; do python3 -u /app/ops_web.py; echo "[ops] exited, restart in 10 s"; sleep 10; done ) &
+  ( set +e; while true; do python3 -u /app/ops_web.py; echo "[ops] exited ($?), restart in 10 s"; sleep 10; done ) &   # set -e would end the loop
 fi
 exec python3 -u probe.py
