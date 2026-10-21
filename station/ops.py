@@ -524,7 +524,8 @@ class Collector:
             hist = self.restart_hist.setdefault((ns, p["name"]), [])
             hist.append((t, p["restarts"]))
             hist[:] = [x for x in hist if t - x[0] <= FLAP_WINDOW]
-            if "CrashLoopBackOff" in w:
+            crashed_lately = p["restarts"] >= 5 and any(f and t - f < 600 for _, f, _ in p["last"])  # between two crashes
+            if "CrashLoopBackOff" in w or (crashed_lately and not p["ready"]):
                 add("crashloop", wl, "pod %s in CrashLoopBackOff, %d restarts" % (p["name"], p["restarts"]), pod=p["name"])
             elif w & {"ImagePullBackOff", "ErrImagePull"}:
                 msg = next((e["msg"] for e in reversed(pev) if e["reason"] in ("Failed", "BackOff")), "")
@@ -542,7 +543,7 @@ class Collector:
             elif hist[-1][1] - hist[0][1] >= FLAP_RESTARTS:
                 add("flapping", wl, "pod %s restarted %d times in %d min" % (p["name"], hist[-1][1] - hist[0][1], FLAP_WINDOW // 60), pod=p["name"])
             elif (p["phase"] == "Running" and not p["ready"] and t - (p["started"] or t) > DOWN_GRACE
-                  and any(e["reason"] == "Unhealthy" for e in pev)):
+                  and hist[-1][1] == hist[0][1] and any(e["reason"] == "Unhealthy" for e in pev)):
                 msg = next(e["msg"] for e in reversed(pev) if e["reason"] == "Unhealthy")
                 add("probe-failing", wl, "pod %s not ready: %s" % (p["name"], msg), pod=p["name"], event=msg)
         for k in [k for k in self.restart_hist if k[0] == ns and k[1] not in live]:
