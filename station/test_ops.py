@@ -201,6 +201,38 @@ tiles = {t["n"]: t for t in st["tiles"]}
 assert tiles[1]["value"] == 1 and tiles[2]["value"] == 2 and tiles[6]["value"] == "3/3" and tiles[8]["value"] == "1 · 1", tiles
 assert col.incident(tr["id"])["handoff"].startswith("[Sakoo] crashloop in aip-mlops-service/training-api"), col.incident(tr["id"])
 
+# --- integrations with fake GitLab / Grafana answers: who made the release, GPU % of a model pod (Viewer token: no datasource list)
+def fake_http(method, url, headers=None, body=None, timeout=30):
+    if url.endswith("/api/datasources"):
+        raise urllib.error.HTTPError(url, 403, "forbidden", {}, None)
+    if url.endswith("/api/frontend/settings"):
+        return {"datasources": {"Prometheus": {"type": "prometheus", "uid": "prom1"}}}
+    if "/proxy/uid/prom1/api/v1/query" in url:
+        return {"data": {"result": [{"metric": {"exported_pod": "model-m1-x"}, "value": [0, "42.5"]}]}}
+    if "/repository/commits?" in url:
+        return [{"id": "c1", "author_name": "Sara", "title": "bump", "web_url": "w1"}, {"id": "c2", "author_name": "Reza", "title": "training-api 1.1"}]
+    if url.endswith("/commits/c1/diff?per_page=100"):
+        return [{"new_path": "other/x.yaml", "diff": "-image: a:1\n+image: a:2"}]
+    if url.endswith("/commits/c2/diff?per_page=100"):
+        return [{"new_path": "mlops/training.yaml", "diff": "+    image: harborpilot/x/training-api:1.1"}]
+    if url.endswith("/commits/c2/merge_requests"):
+        return [{"web_url": "https://git/mr/7", "title": "Release training-api 1.1", "author": {"name": "Reza"}}]
+    raise AssertionError(url)
+
+
+ops.http_json = fake_http
+os.environ.update(GRAFANA_URL="https://g", GRAFANA_TOKEN="t", GITLAB_URL="https://git", GITLAB_TOKEN="t", GITLAB_PROJECTS="prod/prod-cluster")
+K[NS]["pods"].append(pod("model-m1-x", "m1", labels={"model": "m1"}, owner="m1"))
+col.run_round()
+m1 = next(m for m in col.models() if m["name"] == "m1")
+assert m1["gpu"] == 42.5, (m1, col.integ_err)
+rel = col.one("SELECT id FROM changes WHERE name='training-api' AND type='release'")["id"]
+col.gitlab_enrich(rel)
+info = json.loads(col.one("SELECT info FROM changes WHERE id=?", (rel,))["info"])
+assert info["author"] == "Reza" and info["mr_url"] == "https://git/mr/7", info
+for k in ("GRAFANA_URL", "GITLAB_URL"):
+    os.environ.pop(k)
+
 # --- web: login, sessions, rate limit, input checks, security headers
 ops_web.COL = col
 ops_web.USERS.write_text(json.dumps({"ali": ops_web.hash_pw("correct horse 1")}))

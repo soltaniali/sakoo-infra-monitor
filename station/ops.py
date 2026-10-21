@@ -23,6 +23,7 @@ import re
 import sqlite3
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -292,8 +293,15 @@ class Collector:
         """{pod name: GPU utilization %} from Grafana's Prometheus (DCGM exporter)."""
         def fetch():
             g, auth = os.environ["GRAFANA_URL"].rstrip("/"), {"Authorization": "Bearer " + os.environ["GRAFANA_TOKEN"]}
-            uid = os.environ.get("GRAFANA_DATASOURCE_UID") or next(
-                d["uid"] for d in http_json("GET", g + "/api/datasources", auth) if d.get("type") == "prometheus")
+            uid = os.environ.get("GRAFANA_DATASOURCE_UID")
+            if not uid:
+                try:
+                    ds = http_json("GET", g + "/api/datasources", auth)
+                except urllib.error.HTTPError as e:
+                    if e.code != 403:
+                        raise
+                    ds = list(http_json("GET", g + "/api/frontend/settings", auth)["datasources"].values())  # Viewer tokens
+                uid = next(d["uid"] for d in ds if d.get("type") == "prometheus")
             q = urllib.parse.quote("DCGM_FI_DEV_GPU_UTIL")
             res = http_json("GET", "%s/api/datasources/proxy/uid/%s/api/v1/query?query=%s" % (g, uid, q), auth)["data"]["result"]
             out = {}

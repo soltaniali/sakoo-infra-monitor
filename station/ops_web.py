@@ -6,6 +6,7 @@
   ops_web.py deluser NAME
   ops_web.py --once          one collector round, print the overview tiles, exit
   ops_web.py status          what the running dashboard has stored: open incidents, changes, inventory (read-only)
+  ops_web.py check           test the configured integrations (GitLab, Grafana, litellm) once
 Users: $OPS_DATA/ops-users.json (scrypt hashes). HTTPS when /secrets/ops-tls.crt and /secrets/ops-tls.key exist.
 OPS_ALLOW_CIDRS="a.b.c.d/24,...": only these client addresses may connect (when the port is published to a network).
 The API only reads: the collector sends GET requests to Kubernetes, and nothing here can change the cluster.
@@ -266,12 +267,36 @@ def status_cli():
         print("OPEN #%d %-13s %s/%s · owner %s%s\n     %s" % (r[0], r[1], r[2], r[3], r[4], " · alerted" if r[5] else "", r[6][:160]))
 
 
+def check_cli():
+    """Test each configured integration once; prints OK or the error, never a token."""
+    on, col = ops.Collector.integrations(), ops.Collector()
+    for k, v in on.items():
+        if not v:
+            print("%-8s off (not set in secrets/ops.env)" % k)
+    if on["gitlab"]:
+        g, auth = os.environ["GITLAB_URL"].rstrip("/") + "/api/v4", {"PRIVATE-TOKEN": os.environ["GITLAB_TOKEN"]}
+        for proj in [p.strip() for p in os.environ["GITLAB_PROJECTS"].split(",") if p.strip()]:
+            try:
+                p = ops.http_json("GET", "%s/projects/%s" % (g, urllib.parse.quote(proj, safe="")), auth)
+                print("gitlab   OK  %s (last activity %s)" % (p["path_with_namespace"], p.get("last_activity_at", "?")[:16]))
+            except Exception as e:
+                print("gitlab   FAIL %s: %s" % (proj, ops.probe.err(e)))
+    if on["grafana"]:
+        gpu = col.gpu_util()
+        print("grafana  OK  GPU %% for %d pods" % len(gpu) if gpu else "grafana  FAIL %s" % col.integ_err.get("grafana", "no DCGM_FI_DEV_GPU_UTIL data"))
+    if on["litellm"]:
+        names = col.litellm_models()
+        print("litellm  OK  %d models" % len(names) if names is not None else "litellm  FAIL %s" % col.integ_err.get("litellm"))
+
+
 def main():
     global COL, USE_TLS
     if sys.argv[1:2] in (["adduser"], ["deluser"]):
         return users_cli(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "")
     if sys.argv[1:2] == ["status"]:
         return status_cli()
+    if sys.argv[1:2] == ["check"]:
+        return check_cli()
     COL = ops.Collector()
     if "--once" in sys.argv:
         COL.run_round()

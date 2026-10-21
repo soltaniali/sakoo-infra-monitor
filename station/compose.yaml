@@ -20,7 +20,10 @@ services:
       - ./ops_web.py:/app/ops_web.py:ro
       - ./ops.html:/app/ops.html:ro
       - ./ops.js:/app/ops.js:ro
-    env_file:                     # optional integrations (litellm, GitLab, Grafana), see README
+    extra_hosts:                  # internal names, not in public DNS; reached through the cluster VPN (tun0)
+      - "gitprod.aip.sharif.ir:172.30.153.10"
+      - "monitoringprod.aip.sharif.ir:172.30.153.10"
+    env_file:                     # optional integrations (litellm, GitLab, Grafana): set-ops-tokens.sh, see README
       - path: ./secrets/ops.env
         required: false
     environment:                  # the host's proxy must not be used for checks or reports
