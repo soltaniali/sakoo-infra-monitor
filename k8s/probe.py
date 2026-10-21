@@ -245,13 +245,14 @@ def check_assets():
         label = "%s (%s, %s)" % (a["name"], a.get("person", "?"), a.get("value", "?"))
         problems = ["%s: no ready pod" % svc if svc in ready else "%s: no such Service" % svc
                     for svc in a.get("services", [a["name"]]) if not ready.get(svc)]
-        url = a.get("url")
+        url, tested = a.get("url"), "internal only (no external URL)"
         if url and not problems:
             host = urllib.parse.urlsplit(url).hostname
             try:
                 if host not in fallback:
                     fallback[host] = fetch("https://%s/sakoo-probe-no-such-path" % host, CFG.get("ingress_ip"))[1]
                 status, sample = fetch(url, CFG.get("ingress_ip"))
+                tested = "%s → HTTP %d, answered by the app" % (url, status)
                 if status >= 500 or status == 0:
                     problems.append("%s answered HTTP %d" % (url, status))
                 elif urllib.parse.urlsplit(url).path not in ("", "/") and sample == fallback[host]:
@@ -259,7 +260,7 @@ def check_assets():
             except (OSError, ssl.SSLError) as e:
                 problems.append("%s: %s" % (url, err(e)))
         n = sum(ready.get(svc, 0) for svc in a.get("services", [a["name"]]))
-        res[label] = (not problems, "; ".join(problems) or "%d ready pod(s)%s" % (n, ", URL answers" if url else ""),
+        res[label] = (not problems, "; ".join(problems) or "%d ready pod(s) · %s" % (n, tested),
                       a.get("owner", "asset"))
     return res
 

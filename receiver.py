@@ -105,7 +105,8 @@ def status_text():
         down = [(n, c) for n, c in rows if c["fails"]]
         out.append("\n%s: %d up, %d down" % (title, len(rows) - len(down), len(down)))
         out += ["❌ %s: %s" % (n, c.get("detail", "")) for n, c in down]
-        out += ["✅ %s" % n for n, c in rows if not c["fails"]]
+        detail_up = owner == "asset"  # assets: also show what was tested (pods, URL, status)
+        out += ["✅ %s%s" % (n, " — " + c.get("detail", "") if detail_up else "") for n, c in rows if not c["fails"]]
     return "\n".join(out)
 
 
