@@ -23,6 +23,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import dashboard
+
 DIR = Path(__file__).resolve().parent
 STATE, SUBS, OFFSET = DIR / "state.json", DIR / "subscribers.json", DIR / "tg_offset"
 FAIL_AFTER = int(os.environ.get("FAIL_AFTER", 2))
@@ -137,7 +139,7 @@ def status_text():
     return "\n".join(out)
 
 
-HELP = ("Sakoo infra monitor.\n/login <password>: get alerts\n/logout: stop alerts\n/status: what is failing now\n"
+HELP = ("Sakoo infra monitor.\n/login <password>: get alerts\n/logout: stop alerts\n/status: what is failing now\n/dashboard: history of ups and downs\n"
         "Alert types: 🔴 infra team, 🟠 ours (MLOps endpoints and assets), ⚠️ the probe itself.")
 
 
@@ -175,6 +177,11 @@ def handle(update):
             subs.pop(chat, None)
             save_subscribers(subs)
         return reply("Logged out. No more alerts.")
+    if cmd == "/dashboard":
+        if chat not in subscribers():
+            return reply("Log in first: /login <password>")
+        url = "%s/dashboard?t=%s" % (os.environ.get("DASH_URL", "http://104.194.143.68:8090"), dashboard.make_token())
+        return reply("📊 Uptime history (link valid 24 h, do not share):\n" + url)
     if cmd == "/status":
         if chat not in subscribers():
             return reply("Log in first: /login <password>")
@@ -220,12 +227,17 @@ def apply(results):
         state, msgs = load(), []
         if state["silent"]:
             msgs.append("✅ PROBE BACK: reports arrive again")
+            dashboard.record("probe reports", "monitor", True, "reports arrive again")
         state.update(last_report=time.time(), silent=False)  # set before "seen", so /status can tell current checks
+        changes = []
         for name, r in results.items():
             ok, detail, owner = r[:3]
             meta = r[3] if len(r) > 3 else {}
             s = state["checks"].setdefault(name, {"fails": 0, "alerted": False})
             s.update(detail=detail, owner=owner, meta=meta, seen=time.time())  # for /status
+            if s.get("last_ok") != bool(ok):  # history for the dashboard: one row per change
+                changes.append((name, owner, ok, detail))
+                s["last_ok"] = bool(ok)
             if ok:
                 if s["alerted"]:
                     msgs.append("✅ RECOVERED [%s] %s: %s" % (owner, name, detail))
@@ -236,6 +248,7 @@ def apply(results):
                     who = " (%s, %s)" % (meta.get("person", "?"), meta.get("value", "?")) if meta else ""
                     msgs.append("%s %s%s: %s (%d reports in a row)" % (LABEL.get(owner, owner), name, who, detail, s["fails"]))
                     s["alerted"] = True
+        dashboard.record_many(changes)
         send(msgs, state)
         return msgs
 
@@ -247,13 +260,26 @@ def watchdog_tick():
         quiet = time.time() - state["last_report"]
         if quiet > SILENT_AFTER and not state["silent"]:
             state["silent"] = True
+            dashboard.record("probe reports", "monitor", False, "no report for %d min" % (quiet // 60))
             send(["🔴 PROBE SILENT: no report for %d min. Either the probe (its machine, VPN or internet) is down, "
                   "or Sakoo is unreachable from it. Check the probe first." % (quiet // 60)], state)
 
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self._reply(200 if self.path == "/health" else 404, b"ok\n" if self.path == "/health" else b"")
+        path, _, query = self.path.partition("?")
+        if path == "/dashboard":
+            if not dashboard.token_ok(urllib.parse.parse_qs(query).get("t", [""])[0]):
+                return self._reply(403, b"Link expired or invalid. Ask the bot: /dashboard\n")
+            state = load()
+            current = {n for n, c in state["checks"].items() if c.get("seen", 0) >= state["last_report"] - 1}
+            body = dashboard.page(query, current | {"probe reports"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return self.wfile.write(body)
+        self._reply(200 if path == "/health" else 404, b"ok\n" if path == "/health" else b"")
 
     def do_POST(self):
         body = self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 1_000_000))

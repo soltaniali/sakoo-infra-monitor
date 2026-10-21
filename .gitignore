@@ -11,3 +11,4 @@ tg_offset
 # build copy of k8s/probe.py
 station/probe.py
 __pycache__/
+history.db

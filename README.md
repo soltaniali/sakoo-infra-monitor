@@ -56,6 +56,13 @@ Tested 2026-10-19 from the laptop: all checks ran and the London receiver raised
 Check it: `kubectl logs -n aip-mlops-service deploy/sakoo-infra-probe` should stay empty (only failures are logged),
 and Telegram stays quiet until something breaks.
 
+## Uptime history dashboard
+
+`receiver.py` stores every up/down change in `history.db` (SQLite, one row per change) and serves a page at
+`/dashboard`: timeline bars per check (1h / 6h / 24h / 3d / 7d), every incident with start, duration and reason, and a
+**snapshot** of all checks at any moment (click a bar or an incident). Times are Tehran time.
+Access: send `/dashboard` to the bot (logged-in users only); it replies with a private link valid for 24 h.
+
 ## Test
 
 `python3 test_monitor.py` runs probe → receiver over HTTP: alert after 2 failures, no repeats, recovery,

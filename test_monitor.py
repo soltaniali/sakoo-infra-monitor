@@ -14,6 +14,7 @@ here = Path(__file__).resolve().parent
 tmp = Path(tempfile.mkdtemp())
 shutil.copy(here / "k8s" / "probe.py", tmp)
 shutil.copy(here / "receiver.py", tmp)
+shutil.copy(here / "dashboard.py", tmp)
 (tmp / "probe.json").write_text(json.dumps({"receiver_url": "http://127.0.0.1:18090/report", "nodes": False}))
 os.environ.update(PROBE_CONFIG=str(tmp / "probe.json"), PROBE_KEY="k1", TG_TOKEN="x", TG_CHAT_ID="1")
 sys.path.insert(0, str(tmp))
@@ -162,4 +163,21 @@ assert "<b>Critical</b>" in st and "svc-a  Armin" in st and "↳ no ready pod &l
 assert st.index("❌ svc-b") < st.index("✅ svc-a"), st                                            # down first
 assert "Logged out" in msg(42, "/logout") and receiver.subscribers() == {}
 receiver.telegram("nobody listens")                       # no subscribers: no crash
+
+# --- dashboard: history of changes, incidents, snapshot, signed links
+import dashboard  # noqa: E402
+dashboard.DB.unlink(missing_ok=True)
+T = time.time()
+dashboard.record("api", "infra", True, "HTTP 200", T - 7200)
+dashboard.record("api", "infra", False, "timed out <x>", T - 3600)
+dashboard.record("api", "infra", True, "HTTP 200", T - 1800)
+segs = dashboard.intervals(T - 5400, T)["api"][1]
+assert [s[2] for s in segs] == [1, 0, 1] and abs(segs[1][1] - segs[1][0] - 1800) < 1, segs   # up, down 30 min, up
+tok = dashboard.make_token()
+assert dashboard.token_ok(tok) and not dashboard.token_ok("1.abc") and not dashboard.token_ok(dashboard.make_token(T - 2 * 86400))
+pg = dashboard.page("t=%s&range=6h" % tok, {"api"})
+assert "Incidents in the last 6h · 1" in pg and "timed out &lt;x&gt;" in pg and "<svg" in pg, pg[:500]
+snap = dashboard.page("t=%s&at=%d" % (tok, T - 3000), {"api"})
+assert "Snapshot at" in snap and "dot down" in snap and "0 up, 1 down" in snap, snap[-800:]
+assert "<b" not in dashboard.page("t=%s&range=bogus" % tok, {"api"})[:0]   # unknown range falls back to 24h
 print("ok")
