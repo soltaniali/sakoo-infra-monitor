@@ -1,6 +1,6 @@
 # Run:    docker compose up -d --build        Logs: docker compose logs -f
 # One round, printed:  docker compose run --rm probe --print
-# Ops dashboard (same container): http://127.0.0.1:8443 on this host; from your PC: ssh -L 8443:127.0.0.1:8443 <host>
+# Ops dashboard (same container): https://85.198.48.95:8443 (self-signed certificate, team login)
 services:
   probe:
     build: .
@@ -9,7 +9,7 @@ services:
     restart: unless-stopped
     cap_add: [NET_ADMIN]          # create tun devices and routes, inside this container only
     devices: ["/dev/net/tun:/dev/net/tun"]
-    ports: ["127.0.0.1:8443:8443"]   # ops dashboard, this host only; see README before publishing it to a network
+    ports: ["8443:8443"]   # ops dashboard: HTTPS (secrets/ops-tls.*) + login; limit clients with OPS_ALLOW_CIDRS in secrets/ops.env
     volumes:                      # code + config from the host: update = copy + restart
       - ./secrets:/secrets:ro
       - ./data:/data              # ops.db, ops-users.json, probe-results.json
@@ -31,4 +31,4 @@ services:
       PROBE_CONFIG: /app/probe-station.json
       PROBE_RESULTS: /data/probe-results.json
       OPS_DATA: /data
-      OPS_URL: http://localhost:8443/   # link in Telegram alerts (through the SSH tunnel)
+      OPS_URL: https://85.198.48.95:8443/   # link in Telegram alerts

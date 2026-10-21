@@ -71,8 +71,17 @@ def name(q, key, required=True):
     return v
 
 
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):  # scanners and plain-HTTP clients on the TLS port: not our bug
+        if not isinstance(sys.exc_info()[1], (ssl.SSLError, ConnectionError, TimeoutError)):
+            super().handle_error(request, client_address)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version, sys_version = "sakoo-ops", ""
+    timeout = 30  # a client that stops sending cannot hold a thread
 
     def send(self, code, body, ctype="application/json", extra=()):
         if not isinstance(body, bytes):
@@ -270,7 +279,7 @@ def main():
         return
     threading.Thread(target=COL.run_forever, daemon=True).start()
     port = int(os.environ.get("OPS_PORT", 8443))
-    srv = ThreadingHTTPServer((os.environ.get("OPS_BIND", "0.0.0.0"), port), Handler)
+    srv = Server((os.environ.get("OPS_BIND", "0.0.0.0"), port), Handler)
     if TLS[0].exists() and TLS[1].exists():
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(*TLS)
