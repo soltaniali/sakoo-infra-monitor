@@ -164,14 +164,15 @@ def sum_pod(p):
     waiting = [c["state"]["waiting"].get("reason", "") for c in css if "waiting" in c.get("state", {})]
     last = [[c["lastState"]["terminated"].get("reason", ""), ts(c["lastState"]["terminated"].get("finishedAt")), c["name"]]
             for c in css if "terminated" in c.get("lastState", {})]
-    bad = next((c["name"] for c in css if "waiting" in c.get("state", {}) or c.get("restartCount")), None)
-    containers = [c["name"] for c in spec.get("containers", [])]
+    init_running = [c["name"] for c in st.get("initContainerStatuses", []) if "running" in c.get("state", {})]
+    bad = (init_running or [None])[0] or next((c["name"] for c in css if "waiting" in c.get("state", {}) or c.get("restartCount")), None)
+    containers = [c["name"] for c in spec.get("initContainers", []) + spec.get("containers", [])]
     sched = next((c.get("message", "") for c in st.get("conditions", []) if c["type"] == "PodScheduled" and c["status"] == "False"), "")
     return {"name": p["metadata"]["name"], "workload": workload_of(p), "phase": st.get("phase"),
             "ready": any(c["type"] == "Ready" and c["status"] == "True" for c in st.get("conditions", [])),
             "restarts": sum(c.get("restartCount", 0) for c in st.get("containerStatuses", [])),
             "node": spec.get("nodeName"), "created": ts(p["metadata"].get("creationTimestamp")), "started": ts(st.get("startTime")),
-            "waiting": waiting, "last": last, "sched": sched, "containers": containers, "bad": bad if bad in containers else (containers or [None])[0],
+            "waiting": waiting, "last": last, "sched": sched, "init_running": init_running, "containers": containers, "bad": bad if bad in containers else (containers or [None])[0],
             "mem": {c["name"]: c.get("resources", {}).get("limits", {}).get("memory") for c in spec.get("containers", [])}}
 
 
@@ -535,6 +536,7 @@ class Collector:
             elif p["phase"] == "Pending" and t - (p["created"] or t) > PENDING_GRACE:
                 e = next((e for e in reversed(pev) if e["reason"] in ("FailedScheduling", "FailedMount", "FailedAttachVolume")), None)
                 e = e or ({"reason": "FailedScheduling", "msg": p["sched"]} if p["sched"] else None)  # events expire after 1 h
+                e = e or ({"reason": "Init", "msg": "init container %s has not finished" % p["init_running"][0]} if p["init_running"] else None)
                 add("pending", wl, "pod %s Pending for %d min%s" % (p["name"], (t - p["created"]) // 60, ": " + e["msg"] if e else ""),
                     pod=p["name"], event=e["msg"] if e else "", reason=e["reason"] if e else "")
             elif hist[-1][1] - hist[0][1] >= FLAP_RESTARTS:
@@ -653,6 +655,9 @@ class Collector:
                 fix = "ask the infra team for capacity, or lower the request (smaller resourceProfile or fewer replicas)"
             elif "persistentvolumeclaim" in low:
                 cause, fix = "the volume claim is missing or not bound", "create the PVC or fix its StorageClass"
+            elif ctx.get("reason") == "Init":
+                cause = ctx["event"]
+                fix = "read that init container's log (Logs page); it usually waits for a dependency (database, S3, another service)"
             elif ctx.get("reason") in ("FailedMount", "FailedAttachVolume"):
                 cause, fix, owner = "the volume cannot be mounted (Ceph)", "send the event below to the infra team", "infra"
         elif symptom == "image-pull":

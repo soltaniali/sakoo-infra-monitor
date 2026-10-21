@@ -141,6 +141,14 @@ col.run_round()
 [big] = inc(obj="big")
 assert big["owner"] == "infra" and "no free nvidia.com/gpu" in big["cause"], big
 K["llm-team"]["pods"].pop()
+stuck = pod("agent-abc-1", "agent", phase="Pending", ready=False, waiting="PodInitializing")  # an init container that never ends
+stuck["spec"]["initContainers"] = [{"name": "wait-db"}]
+stuck["status"]["initContainerStatuses"] = [{"name": "wait-db", "state": {"running": {}}, "restartCount": 0}]
+K["user-y"]["pods"].append(stuck)
+col.run_round()
+[ag2] = inc(obj="agent")
+assert "init container wait-db has not finished" in ag2["cause"] and json.loads(ag2["evidence"])["log_from"].startswith("agent-abc-1 / wait-db"), ag2
+K["user-y"]["pods"].pop()
 
 # 4. everything fixed: incidents close after 2 clean rounds, closing alerts for the alerted ones
 col.alerts.clear()
