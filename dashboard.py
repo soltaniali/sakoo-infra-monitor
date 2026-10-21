@@ -99,17 +99,18 @@ CSS = """
 :root{--bg:#f7f7f5;--fg:#1d1d1b;--mut:#6b6b66;--card:#fff;--line:#e4e4e0;--up:#2f9e44;--down:#e03131;--none:#d9d9d4}
 @media (prefers-color-scheme:dark){:root{--bg:#141413;--fg:#ecece8;--mut:#9a9a94;--card:#1e1e1c;--line:#2e2e2b;--none:#3a3a37}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif}
-main{max-width:1180px;margin:0 auto;padding:20px 16px 60px}h1{font-size:20px;margin:0 0 4px}h2{font-size:15px;margin:26px 0 8px}
+main{max-width:1680px;margin:0 auto;padding:20px 16px 60px}h1{font-size:20px;margin:0 0 4px}h2{font-size:15px;margin:26px 0 8px}
 .mut{color:var(--mut)}a{color:inherit}.tabs a{display:inline-block;padding:4px 10px;margin:8px 6px 0 0;border:1px solid var(--line);
 border-radius:6px;text-decoration:none;background:var(--card)}.tabs a.on{background:var(--fg);color:var(--bg)}
 .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
-.row{display:grid;grid-template-columns:minmax(150px,280px) 1fr 48px;gap:10px;align-items:center;padding:3px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(390px,100%),1fr));gap:0 16px;align-items:start}
+.row{display:grid;grid-template-columns:190px 1fr 46px;gap:8px;align-items:center;padding:1px 0;font-size:13px}
 .row .n{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.row .p{text-align:right;color:var(--mut);font-size:12px}
-svg{width:100%;height:16px;display:block}svg a rect:hover{opacity:.75}.axis{display:flex;justify-content:space-between;
-color:var(--mut);font-size:11px;margin:2px 58px 0 290px}table{width:100%;border-collapse:collapse}td,th{text-align:left;
+svg{width:100%;height:12px;display:block}svg a rect:hover{opacity:.75}.axis{display:flex;justify-content:space-between;
+color:var(--mut);font-size:11px;margin:2px 54px 0 198px}table{width:100%;border-collapse:collapse}td,th{text-align:left;
 padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--mut);font-weight:500}
 .sub{font-size:11.5px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.imp{font-size:12px;color:var(--mut);margin:10px 0 2px;text-transform:uppercase;letter-spacing:.04em}
+.imp{font-size:11px;color:var(--mut);margin:6px 0 1px;text-transform:uppercase;letter-spacing:.04em}
 .status{white-space:pre-wrap;line-height:1.6}.status pre{margin:0;font-size:13px;line-height:1.5}
 .jump a{margin-right:12px}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}.up{background:var(--up)}.down{background:var(--down)}
 @media (max-width:700px){.row{grid-template-columns:1fr}.axis{margin:2px 0}.row .p{text-align:left}}
@@ -121,11 +122,12 @@ IMP_LABEL = {"No": "Not rated", "?": "Unknown"}
 
 
 def label(n, m, e):
-    """Row label; assets also show owner, importance and what was tested."""
+    """One-line row label: hosts without "host " and the domain; assets with their owner. Hover shows everything."""
+    short = n[5:].removesuffix(".aipsharif.ir") if n.startswith("host ") else n
     if not m:
-        return "<div class=n title='%s'>%s</div>" % (e(n), e(n))
-    return ("<div class=n title='%s'><b>%s</b> <span class=mut>· %s · %s</span><div class=sub>%s</div></div>"
-            % (e(n), e(n), e(m.get("person", "?")), e(IMP_LABEL.get(m.get("value", "?"), m.get("value"))), e(m.get("test", ""))))
+        return "<div class=n title='%s'>%s</div>" % (e(n), e(short))
+    tip = "%s · %s · %s · %s" % (n, m.get("person", "?"), IMP_LABEL.get(m.get("value", "?"), m.get("value")), m.get("test", ""))
+    return "<div class=n title='%s'>%s <span class=mut>· %s</span></div>" % (e(tip), e(short), e(m.get("person", "?")))
 
 
 def grouped(rows, meta):
@@ -212,23 +214,10 @@ def page(query, current, meta=None):
         out.append("<div class='card status'>%s</div>" % "\n".join(status_lines(checks)).strip())
         return "".join(out + ["</main></body></html>"])
 
-    # incidents: every down interval in the range, newest first
-    inc = [(t0, t1, n, owner, d) for n, (owner, segs) in data.items() if n in current for t0, t1, ok, d in segs if not ok]
-    inc.sort(reverse=True)
-    out.append("<h2>Incidents in the last %s · %d</h2>" % (rng, len(inc)))
-    if inc:
-        out.append("<div class=card><table><tr><th>Start</th><th>Duration</th><th>Check</th><th>Owner</th><th>Reason</th><th></th></tr>")
-        for t0, t1, n, owner, d in inc[:200]:
-            ongoing = t1 >= end - 1
-            out.append("<tr><td>%s</td><td>%s%s</td><td>%s</td><td class=mut>%s</td><td class=mut>%s</td><td><a href='%s'>snapshot</a></td></tr>"
-                       % (fmt(t0), dur(t1 - t0), " · ongoing" if ongoing else "", e(n), e(OWNER.get(owner, owner)), e(d[:160]), qs(at=int(t0) + 1)))
-        out.append("</table></div>")
-    else:
-        out.append("<div class='card mut'>No incidents.</div>")
-
-    # timeline
+    # timeline: one card per section, side by side on a wide screen so every check fits on one page
     span = end - start
-    ticks = "".join("<span>%s</span>" % fmt(start + span * i / 6, rng in ("3d", "7d")) for i in range(7))
+    ticks = "".join("<span>%s</span>" % fmt(start + span * i / 2, rng in ("3d", "7d")) for i in range(3))
+    out.append("<div class=grid>")
     for owner, title in SECTIONS:
         # same order as /status: down first, then by name; only assets are grouped by importance
         rows = sorted(((n, segs) for n, (o, segs) in data.items() if o == owner and n in current),
@@ -236,7 +225,8 @@ def page(query, current, meta=None):
         if not rows:
             continue
         m_own = meta if owner == "asset" else {}
-        out.append("<h2 id='%s'>%s</h2><div class=card>" % (owner, e(title)))
+        down = sum(not segs[-1][2] for _, segs in rows)
+        out.append("<section id='%s'><h2>%s · %d up, %d down</h2><div class=card>" % (owner, e(title), len(rows) - down, down))
         for head, grp in grouped(rows, m_own):
             if head:
                 out.append("<div class=imp>%s</div>" % e(head))
@@ -252,6 +242,21 @@ def page(query, current, meta=None):
                 out.append("<div class=row>%s<svg viewBox='0 0 1000 16' preserveAspectRatio='none'>"
                            "<rect width='1000' height='16' fill='var(--none)'/>%s</svg><div class=p>%s</div></div>"
                            % (label(n, m_own.get(n), e), "".join(bars), ("%.1f%%" % (100 * up / known)) if known else "–"))
-        out.append("<div class=axis>%s</div></div>" % ticks)
+        out.append("<div class=axis>%s</div></div></section>" % ticks)
+    out.append("</div>")
+    # incidents: every down interval in the range, newest first
+    inc = [(t0, t1, n, owner, d) for n, (owner, segs) in data.items() if n in current for t0, t1, ok, d in segs if not ok]
+    inc.sort(reverse=True)
+    out.append("<h2>Incidents in the last %s · %d</h2>" % (rng, len(inc)))
+    if inc:
+        out.append("<div class=card><table><tr><th>Start</th><th>Duration</th><th>Check</th><th>Owner</th><th>Reason</th><th></th></tr>")
+        for t0, t1, n, owner, d in inc[:200]:
+            ongoing = t1 >= end - 1
+            out.append("<tr><td>%s</td><td>%s%s</td><td>%s</td><td class=mut>%s</td><td class=mut>%s</td><td><a href='%s'>snapshot</a></td></tr>"
+                       % (fmt(t0), dur(t1 - t0), " · ongoing" if ongoing else "", e(n), e(OWNER.get(owner, owner)), e(d[:160]), qs(at=int(t0) + 1)))
+        out.append("</table></div>")
+    else:
+        out.append("<div class='card mut'>No incidents.</div>")
+
     out.append("<p class=mut>Grey = no data yet. Click a bar or an incident for the snapshot of all checks at that moment.</p>")
     return "".join(out + ["</main></body></html>"])

@@ -179,7 +179,7 @@ pg = dashboard.page("t=%s&range=6h" % tok, {"api"})
 assert "Incidents in the last 6h · 1" in pg and "timed out &lt;x&gt;" in pg and "<svg" in pg, pg[:500]
 dashboard.record("training-api", "asset", True, "ok", T - 100)
 pa = dashboard.page("t=%s&range=1h" % tok, {"api", "training-api"}, {"training-api": {"person": "Dariush", "value": "Critical", "test": "/train/ping 200"}})
-assert "<b>training-api</b>" in pa and "Dariush · Critical" in pa and "/train/ping 200" in pa and ">Critical</div>" in pa, pa[-1500:]
+assert "training-api <span class=mut>· Dariush</span>" in pa and "Dariush · Critical" in pa and "/train/ping 200" in pa and ">Critical</div>" in pa, pa[-1500:]
 dashboard.record("postgres running", "infra", True, "ok", T - 100)        # infra check with meta: flat, no importance groups
 pi = dashboard.page("t=%s&range=1h" % tok, {"postgres running"}, {"postgres running": {"person": "Infra", "value": "Critical", "test": "pods"}})
 assert "postgres running" in pi and ">Critical</div>" not in pi and "Infra · Critical" not in pi, pi[-1500:]
