@@ -53,7 +53,7 @@ def event(obj, reason, msg):
             "metadata": {"creationTimestamp": iso(time.time() - 30)}}
 
 
-empty = lambda: {"pods": [], "deploy": [], "sts": [], "events": [], "ing": [], "models": []}
+empty = lambda: {"pods": [], "deploy": [], "sts": [], "events": [], "ing": [], "models": [], "ds": [], "cj": [], "cm": []}
 K = {NS: empty(), "llm-team": empty(), "user-x": empty(), "user-y": empty()}
 LOGS = {}
 K[NS].update(deploy=[deploy("training-api", "training-api:1.0")], pods=[pod("training-api-abc-1", "training-api")],
@@ -61,7 +61,8 @@ K[NS].update(deploy=[deploy("training-api", "training-api:1.0")], pods=[pod("tra
 K["llm-team"].update(deploy=[deploy("vllm", "vllm:2")], pods=[pod("vllm-abc-1", "vllm")])
 K["user-x"].update(deploy=[deploy("notebook", "nb:1")], pods=[pod("notebook-abc-1", "notebook")])
 K["user-y"].update(deploy=[deploy("y-agent-clearml-agent", "agent:1")], pods=[pod("y-agent-clearml-agent-abc-1", "y-agent-clearml-agent")])
-RES = {"pods": "pods", "deployments": "deploy", "statefulsets": "sts", "events": "events", "ingresses": "ing", "models": "models"}
+RES = {"pods": "pods", "deployments": "deploy", "statefulsets": "sts", "events": "events", "ingresses": "ing", "models": "models",
+       "daemonsets": "ds", "cronjobs": "cj", "configmaps": "cm"}
 calls = []
 
 
@@ -85,6 +86,8 @@ ops.kget = fake_kget
 ops.SLOW_EVERY = 1   # read every namespace every round
 col = ops.Collector()
 q = lambda sql, a=(): col.rows(sql, a)
+sent_text = lambda: "\n".join(r["text"] for r in col.rows("SELECT text FROM outbox WHERE sent IS NULL"))
+clear_out = lambda: col.exec("UPDATE outbox SET sent=1")
 inc = lambda **w: [r for r in q("SELECT * FROM incidents") if all(r[k] == v for k, v in w.items())]
 
 # 1. first round = baseline: no changes, no incidents, forbidden namespace skipped
@@ -121,7 +124,7 @@ assert ag["owner"] == "us" and ag["alerted"] == 1, ag                       # pe
 [m2] = inc(obj="m2", symptom="pending")
 assert m2["owner"] == "infra" and "no free nvidia.com/gpu" in m2["cause"], m2
 assert not inc(obj="m2", symptom="model-down") and not inc(obj="m3"), q("SELECT obj, symptom FROM incidents")  # pod explains it; m3 in grace
-alerts = "\n".join(col.alerts)
+alerts = sent_text()
 assert "OPEN #%d crashloop" % tr["id"] in alerts and "RELEASE aip-mlops-service/training-api" in alerts, alerts
 assert "notebook" not in alerts and "NEW MODEL aip-mlops-service/m3" in alerts, alerts
 assert len(inc(obj="training-api")) == 1                                    # still one incident, not one per round
@@ -151,7 +154,7 @@ assert "init container wait-db has not finished" in ag2["cause"] and json.loads(
 K["user-y"]["pods"].pop()
 
 # 4. everything fixed: incidents close after 2 clean rounds, closing alerts for the alerted ones
-col.alerts.clear()
+clear_out()
 K[NS]["pods"] = [pod("training-api-abc-3", "training-api")]
 K[NS]["events"], K[NS]["models"] = [], [model("m1"), model("m2"), model("m3")]
 for ns, wl in (("llm-team", "vllm"), ("user-x", "notebook"), ("user-y", "y-agent-clearml-agent")):
@@ -161,7 +164,7 @@ col.run_round()
 assert inc(obj="training-api", state="open"), q("SELECT obj, state, clean FROM incidents")  # 1 clean round: still open
 col.run_round()
 assert inc(state="open") == [], q("SELECT obj, state, clean FROM incidents")
-assert "CLOSED #%d crashloop" % tr["id"] in "\n".join(col.alerts) and "notebook" not in "\n".join(col.alerts), col.alerts
+assert "CLOSED #%d crashloop" % tr["id"] in sent_text() and "notebook" not in sent_text(), sent_text()
 assert any(c["type"] == "removed" and c["name"] == "router" for c in q("SELECT * FROM changes"))
 
 # 5. release verdict after 15 min: bad (an incident opened on it); new model: ready
@@ -171,7 +174,7 @@ ch = {c["name"]: c for c in q("SELECT * FROM changes")}
 assert ch["training-api"]["verdict"] == "bad" and ch["m3"]["verdict"] == "ready", ch
 
 # 6. probe results: infra check = infra, our asset = us (with pods as evidence), no Telegram (London alerts those)
-col.alerts.clear()
+clear_out()
 Path(os.environ["PROBE_RESULTS"]).write_text(json.dumps({"ts": time.time(), "results": {
     "k8s GPU capacity": [False, "2 events", "infra"], "probe VPN cluster": [True, "tun0 connected", "monitor"],
     "training-api": [False, "no ready pod", "asset", {"person": "Dariush", "value": "Critical"}]}}))
@@ -179,7 +182,7 @@ col.run_round()
 [gi] = inc(symptom="infra", state="open")
 [ta] = inc(symptom="endpoint", state="open")
 assert gi["owner"] == "infra" and ta["owner"] == "us" and ta["ns"] == NS and "Dariush" in ta["fix"], (gi, ta)
-assert json.loads(ta["evidence"])["pods"] and not col.alerts, col.alerts
+assert json.loads(ta["evidence"])["pods"] and "OPEN" not in sent_text(), sent_text()
 col.run_round()                                                             # same probe report again: no change
 assert len(inc(state="open")) == 2
 
@@ -188,7 +191,7 @@ assert ops.signature("ERROR db timeout after 30 s id=4f3a2b1c9d8e7f60") == ops.s
 LOGS["training-api-abc-3"] = "INFO ok\nERROR old problem 1"
 col.run_round()
 assert not inc(symptom="new-error") and q("SELECT * FROM signatures")       # learning period: known, no incident
-col.set_meta("logs_since", str(time.time() - 7200))
+col.set_meta("logs_since:" + NS, str(time.time() - 7200))
 LOGS["training-api-abc-3"] = "ERROR old problem 2\nERROR redis connection refused to 10.0.0.5:6379"
 col.run_round()
 [ne] = inc(symptom="new-error")
@@ -275,3 +278,29 @@ srv.shutdown()
 assert not any("/api/v1/namespaces/" in c and c.split("?")[0].rsplit("/", 1)[-1] not in RES and not c.split("?")[0].endswith("/log")
                for c in calls), "unexpected API path"
 print("ok")
+
+# --- new kinds: CronJob as a new service, ConfigMap change, unsent alerts kept, errors in other namespaces, model test
+col.set_meta("logs_since:llm-team", str(time.time() - 7200))
+K["llm-team"]["cj"] = [{"metadata": {"name": "nightly", "creationTimestamp": iso(T0)},
+                        "spec": {"jobTemplate": {"spec": {"template": {"spec": {"containers": [{"name": "j", "image": "x/job:1"}]}}}}}}]
+K["llm-team"]["cm"] = [{"metadata": {"name": "vllm-config"}, "data": {"max_len": "4096"}}]
+LOGS["vllm-abc-9"] = "ERROR cuda out of memory"
+col.run_round()
+K["llm-team"]["cm"][0]["data"]["max_len"] = "8192"
+col.run_round()
+types = {(c["name"], c["type"]) for c in q("SELECT * FROM changes")}
+assert ("nightly", "new-service") in types and ("vllm-config", "configmap") in types, types
+assert inc(symptom="new-error", ns="llm-team"), q("SELECT ns, symptom, obj FROM incidents WHERE symptom='new-error'")
+assert q("SELECT count(*) n FROM outbox WHERE sent IS NULL")[0]["n"] > 0 and col.state()["unsent"]   # London unreachable here
+ops.OPS_URL = "https://dash/"
+K["llm-team"]["pods"] = [pod("vllm-abc-9", "vllm", waiting="CrashLoopBackOff", restarts=9, ready=False)]
+col.run_round()
+assert "https://dash/#/incident?id=" in q("SELECT text FROM outbox ORDER BY id DESC LIMIT 1")[0]["text"]
+ops.http_json = lambda m, url, h=None, body=None, timeout=30: {"data": [{"id": "m1"}]} if url.endswith("/models") else (_ for _ in ()).throw(OSError("down"))
+os.environ.update(LITELLM_URL="https://l/v1", LITELLM_KEY="k", LITELLM_MODEL="x")
+col.cache.clear()
+col.test_models(time.time()); col.test_models(time.time())
+assert col.model_tests["m1"]["ok"] is False and inc(symptom="model-test", obj="m1"), col.model_tests
+for k in ("LITELLM_URL", "LITELLM_KEY", "LITELLM_MODEL"):
+    os.environ.pop(k)
+print("ok (new kinds)")

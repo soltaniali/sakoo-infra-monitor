@@ -123,6 +123,9 @@ VIEWS.overview = async () => {
     st.errors && st.errors.length ? h('div', {class: 'card small err'}, 'Read errors: ' + st.errors.join(' · ')) : '',
     h('div', {class: 'tiles'}, s.tiles.map(t => h('a', {class: 'tile ' + t.status, href: t.link},
       h('div', {class: 'tn'}, t.n + ' · ' + t.title), h('div', {class: 'tv'}, t.value), h('div', {class: 'ts mut'}, t.sub)))),
+    s.unsent && s.unsent.length ? [h('h2', {}, 'Alerts not sent yet · ' + s.unsent.length),
+      h('div', {class: 'card small'}, h('p', {class: 'err'}, 'The Telegram relay (London) is unreachable; these go out together when it is back.'),
+        s.unsent.map(u => h('pre', {}, fmt(u.ts) + '  ' + u.text)))] : '',
     h('h2', {}, 'Open incidents · ' + s.incidents.length), h('div', {class: 'card'}, incidentTable(s.incidents)),
     h('h2', {}, 'Changes in the last 24 h · ' + s.changes.length), h('div', {class: 'card'}, changeTable(s.changes)));
 };
@@ -189,6 +192,7 @@ VIEWS.models = async () => {
     ['Engine', m => m.engine], ['Resource profile', m => m.profile], ['Pods', m => m.pods.map(p => p.name + (p.restarts ? ' (' + p.restarts + ' restarts)' : '') + (p.node ? ' on ' + p.node : '')).join(', ')],
     ['Source', m => h('span', {class: 'small mut'}, m.url)], ['Age', m => ago(m.created)],
     ['Open incidents', m => m.open ? h('a', {href: '#/incidents'}, m.open) : '0']];
+  if (me.integrations.litellm) cols.splice(4, 0, ['Test call', m => !m.test ? '–' : m.test.ok ? m.test.ms + ' ms' : h('span', {class: 'err', title: m.test.detail}, 'failed')]);
   if (me.integrations.grafana) cols.splice(4, 0, ['GPU %', m => m.gpu == null ? '–' : m.gpu + ' %']);
   if (me.integrations.litellm) cols.splice(4, 0, ['In litellm', m => m.litellm == null ? '?' : m.litellm ? 'yes' : h('span', {class: 'err'}, 'no')]);
   return h('div', {}, h('h1', {}, 'KubeAI models · ' + ms.length), h('div', {class: 'card'}, table(cols, ms)),

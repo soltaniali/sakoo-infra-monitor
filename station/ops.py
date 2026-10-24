@@ -42,7 +42,7 @@ CLEAN_TO_CLOSE, ERROR_QUIET_CLOSE = 2, 1800
 LOG_BASELINE_S = 3600  # first hour: learn the error signatures that already exist, open no incidents for them
 RETENTION = 30 * 86400
 BUG = ("crashloop", "oomkilled", "flapping", "new-error", "probe-failing")
-DOWN = ("down", "model-down", "pending", "image-pull", "endpoint", "infra")
+DOWN = ("down", "model-down", "model-test", "pending", "image-pull", "endpoint", "infra")
 ERROR_RE = re.compile(r"(?i)\b(error|critical|fatal|traceback|panic|exception)\b")
 probe.TIMEOUT = 25  # the VPN path is slow: 8 s timed out on big lists
 
@@ -66,6 +66,8 @@ RULES = {
                   "Pipeline B: service is up but broken"),
     "endpoint": ("a probe check of our endpoint or asset fails", "check the service behind it (pods, logs)",
                  "Pipeline B: service is up but broken"),
+    "model-test": ("a test call to the model through litellm fails twice in a row",
+                   "check the model pod and its log, then the litellm route for this model", "Pipeline B: service is up but broken"),
     "infra": ("an infra check fails", "send the message below to the infra team", "Infra or us? Decide the owner first"),
 }
 SCHEMA = """
@@ -78,6 +80,7 @@ CREATE TABLE IF NOT EXISTS incidents (id INTEGER PRIMARY KEY, key TEXT, scope TE
   opened REAL, last_seen REAL, closed REAL, clean INTEGER, alerted INTEGER, summary TEXT);
 CREATE TABLE IF NOT EXISTS signatures (sig TEXT PRIMARY KEY, ns TEXT, workload TEXT, first REAL, last REAL,
   count INTEGER, sample TEXT);
+CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY, ts REAL, text TEXT, sent REAL);
 CREATE INDEX IF NOT EXISTS changes_ts ON changes (ts);
 CREATE INDEX IF NOT EXISTS incidents_state ON incidents (state, scope);
 """
@@ -189,9 +192,12 @@ def gaps(containers):
 
 
 def sum_workload(o, kind):
-    tpl, st = o["spec"]["template"], o.get("status", {})
+    st = o.get("status", {})
+    tpl = o["spec"]["jobTemplate"]["spec"]["template"] if kind == "CronJob" else o["spec"]["template"]
     cs = tpl.get("spec", {}).get("containers", [])
-    return {"kind": kind, "name": o["metadata"]["name"], "desired": o["spec"].get("replicas", 1), "ready": st.get("readyReplicas", 0),
+    desired, ready = {"DaemonSet": (st.get("desiredNumberScheduled", 0), st.get("numberReady", 0)),
+                      "CronJob": (0, 0)}.get(kind, (o["spec"].get("replicas", 1), st.get("readyReplicas", 0)))  # a CronJob runs now and then
+    return {"kind": kind, "name": o["metadata"]["name"], "desired": desired, "ready": ready,
             "images": [short_image(c["image"]) for c in cs], "tpl": digest(tpl), "created": ts(o["metadata"].get("creationTimestamp")),
             "gaps": gaps(cs)}
 
@@ -229,6 +235,7 @@ class Collector:
         self.alerts, self.probe, self.probe_seen = [], {}, None
         self.status = {"last": None, "took": None, "errors": [], "slow_last": None}
         self.integ_err, self.cache = {}, {}
+        self.model_tests, self.test_fails = {}, {}  # model -> {ok, ms, detail, ts, route}
         self.bg = queue.Queue()
         threading.Thread(target=self._bg_loop, daemon=True).start()
 
@@ -363,6 +370,9 @@ class Collector:
             snap = {"pods": kget("/api/v1/namespaces/%s/pods" % ns)["items"],
                     "deploy": opt("/apis/apps/v1/namespaces/%s/deployments" % ns),
                     "sts": opt("/apis/apps/v1/namespaces/%s/statefulsets" % ns),
+                    "ds": opt("/apis/apps/v1/namespaces/%s/daemonsets" % ns),
+                    "cj": opt("/apis/batch/v1/namespaces/%s/cronjobs" % ns),
+                    "cm": opt("/api/v1/namespaces/%s/configmaps" % ns),
                     "events": opt("/api/v1/namespaces/%s/events?fieldSelector=type%%3DWarning" % ns),
                     "ing": opt("/apis/networking.k8s.io/v1/namespaces/%s/ingresses" % ns),
                     "models": opt("/apis/kubeai.org/v1/namespaces/%s/models" % ns) if ns == OUR_NS else []}
@@ -411,7 +421,7 @@ class Collector:
                 except Exception as e:
                     errors.append("%s: %s" % (ns, probe.err(e)))
         self.hosts = {h: ns for ns, inv in self.inv.items() for k, v in inv.items() if v["kind"] == "Ingress" for h in v["hosts"]}
-        for step in ([self.check_probe] + ([self.scan_logs] if slow else []) + [self.judge_changes]):
+        for step in ([self.check_probe] + ([self.scan_logs, self.test_models] if slow else []) + [self.judge_changes]):
             try:
                 step(t)
             except Exception as e:
@@ -436,9 +446,15 @@ class Collector:
         pods = [sum_pod(p) for p in snap["pods"]]
         events = sorted((e for e in map(sum_event, snap["events"]) if e["ts"] and t - e["ts"] < 3600), key=lambda e: e["ts"])
         inv = {}
-        for kind, items in (("Deployment", snap["deploy"]), ("StatefulSet", snap["sts"])):
+        for kind, items in (("Deployment", snap["deploy"]), ("StatefulSet", snap["sts"]), ("DaemonSet", snap.get("ds", [])),
+                            ("CronJob", snap.get("cj", []))):
             for o in items:
                 inv["%s/%s/%s" % (kind, ns, o["metadata"]["name"])] = sum_workload(o, kind)
+        for c in snap.get("cm", []):  # config changes that do not touch a pod template
+            name = c["metadata"]["name"]
+            if name == "kube-root-ca.crt" or name.endswith(("-lock", "-leader", "leader-election", "-state", "-status", "-heartbeat")):
+                continue
+            inv["ConfigMap/%s/%s" % (ns, name)] = {"kind": "ConfigMap", "name": name, "data": digest([c.get("data"), c.get("binaryData")])}
         for i in snap["ing"]:
             inv["Ingress/%s/%s" % (ns, i["metadata"]["name"])] = sum_ingress(i)
         for m in snap["models"]:
@@ -455,7 +471,7 @@ class Collector:
         if alertable(ns, owner_of(ns, name)) and typ != "new-namespace" or (typ == "new-namespace" and not ns.startswith("user-")):
             label = {"release": "RELEASE", "config": "CONFIG CHANGE", "new-service": "NEW SERVICE", "new-host": "NEW HOSTNAME",
                      "new-model": "NEW MODEL", "model-changed": "MODEL CHANGED", "removed": "REMOVED", "model-removed": "MODEL REMOVED",
-                     "new-namespace": "NEW NAMESPACE", "removed-namespace": "NAMESPACE REMOVED"}.get(typ, typ.upper())
+                     "new-namespace": "NEW NAMESPACE", "removed-namespace": "NAMESPACE REMOVED", "configmap": "CONFIGMAP CHANGED"}.get(typ, typ.upper())
             what = "%s → %s" % (before, after) if before and after else (after or before)
             extra = (" · gaps: " + ", ".join(info["gaps"])) if info.get("gaps") else ""
             self.alerts.append("🆕 %s %s/%s: %s%s" % (label, ns, name, what, extra))
@@ -467,8 +483,11 @@ class Collector:
         """Compare with the stored inventory of this namespace. The first read of a namespace is the baseline."""
         old = {r["key"]: json.loads(r["data"]) for r in self.rows("SELECT key, data FROM inventory WHERE ns=?", (ns,))}
         if self.meta("seen:" + ns):
+            fresh_kinds = () if self.meta("seen2:" + ns) else ("DaemonSet", "CronJob")  # kinds added later: baseline once
             for key in sorted(new.keys() - old.keys()):
                 o = new[key]
+                if o["kind"] in fresh_kinds or o["kind"] == "ConfigMap":  # a new ConfigMap comes with its service
+                    continue
                 if o["kind"] == "Model":
                     self.add_change(t, ns, "Model", o["name"], "new-model", "", "%s %s" % (o["engine"], o["profile"]), {"url": o["url"]})
                 elif o["kind"] == "Ingress":
@@ -477,6 +496,8 @@ class Collector:
                     self.add_change(t, ns, o["kind"], o["name"], "new-service", "", ",".join(o["images"]), {"gaps": o["gaps"]})
             for key in sorted(old.keys() - new.keys()):
                 o = old[key]
+                if o["kind"] == "ConfigMap":
+                    continue
                 self.add_change(t, ns, o["kind"], o["name"], "model-removed" if o["kind"] == "Model" else "removed", o["name"], "", {})
             for key in sorted(new.keys() & old.keys()):
                 a, b = old[key], new[key]
@@ -486,7 +507,12 @@ class Collector:
                                     "; ".join("%s %s" % (f, b.get(f)) for f in fields), {})
                 elif b["kind"] == "Ingress" and set(b["hosts"]) - set(a["hosts"]):
                     self.add_change(t, ns, "Ingress", b["name"], "new-host", "", ", ".join(sorted(set(b["hosts"]) - set(a["hosts"]))), {})
-                elif b["kind"] in ("Deployment", "StatefulSet"):
+                elif b["kind"] == "ConfigMap":
+                    busy = self.one("SELECT count(*) n FROM changes WHERE ns=? AND name=? AND type='configmap' AND ts>?",
+                                    (ns, b["name"], t - 3600))["n"] >= 3  # rewritten all the time by a program: state, not config
+                    if a["data"] != b["data"] and not busy:
+                        self.add_change(t, ns, "ConfigMap", b["name"], "configmap", "data " + a["data"], "data " + b["data"], {})
+                elif b["kind"] in ("Deployment", "StatefulSet", "DaemonSet", "CronJob"):
                     if a["images"] != b["images"]:
                         self.add_change(t, ns, b["kind"], b["name"], "release", ",".join(a["images"]), ",".join(b["images"]), {})
                     elif a["tpl"] != b["tpl"]:
@@ -496,6 +522,7 @@ class Collector:
             self.conn.executemany("INSERT INTO inventory VALUES (?, ?, ?)", [(k, ns, json.dumps(v)) for k, v in new.items()])
             self.conn.commit()
         self.set_meta("seen:" + ns, "1")
+        self.set_meta("seen2:" + ns, "1")
 
     def judge_changes(self, t):
         for c in self.rows("SELECT * FROM changes WHERE verdict='watching'"):
@@ -506,8 +533,8 @@ class Collector:
                 bad = self.one("SELECT id FROM incidents WHERE ns=? AND obj=? AND opened>=? ORDER BY id LIMIT 1", (c["ns"], c["name"], c["ts"]))
                 verdict = "bad" if bad else "healthy"
                 if bad and alertable(c["ns"], owner_of(c["ns"], c["name"])):
-                    self.alerts.append("⚠️ BAD %s %s/%s: %s → %s (incident #%d)" % (
-                        c["type"].upper(), c["ns"], c["name"], c["before"], c["after"], bad["id"]))
+                    what = "%s → %s" % (c["before"], c["after"]) if c["before"] else c["after"]
+                    self.alerts.append("⚠️ BAD %s %s/%s: %s (incident #%d)" % (c["type"].upper(), c["ns"], c["name"], what, bad["id"]))
             else:
                 verdict = None
             if verdict:
@@ -559,7 +586,7 @@ class Collector:
         has = {s[2] for s in sym.values()}
         for key, o in inv.items():
             short = None
-            if o["kind"] in ("Deployment", "StatefulSet") and o["desired"] and o["ready"] < o["desired"]:
+            if o["kind"] in ("Deployment", "StatefulSet", "DaemonSet", "CronJob") and o["desired"] and o["ready"] < o["desired"]:
                 short, grace = "down", DOWN_GRACE
                 detail = "%d/%d replicas ready" % (o["ready"], o["desired"])
             elif o["kind"] == "Model" and o["min"] and o["ready"] < o["min"]:
@@ -598,36 +625,74 @@ class Collector:
         self.observe("probe", sym, t, alert=False)
 
     def scan_logs(self, t):
-        """New error signatures in the logs of our namespace (last SLOW_EVERY rounds of log)."""
-        baseline = float(self.meta("logs_since") or 0) or t
-        self.set_meta("logs_since", str(baseline))
-        learning = t - baseline < LOG_BASELINE_S
+        """New error signatures in the logs of every readable namespace (last SLOW_EVERY rounds of log)."""
+        if self.meta("logs_since") and not self.meta("logs_since:" + OUR_NS):  # learned before per-namespace learning
+            self.set_meta("logs_since:" + OUR_NS, self.meta("logs_since"))
+        learning = {}
+        for ns in list(self.pods):
+            since = float(self.meta("logs_since:" + ns) or 0) or t
+            self.set_meta("logs_since:" + ns, str(since))
+            learning[ns] = t - since < LOG_BASELINE_S
         open_keys = {r["key"] for r in self.rows("SELECT key FROM incidents WHERE state='open' AND scope='logs'")}
-        seen = {}  # sig -> [workload, pod, sample line, count]
-        for p in self.pods.get(OUR_NS, []):
-            if p["phase"] != "Running":
-                continue
-            for c in p["containers"]:
-                try:
-                    text = kget("/api/v1/namespaces/%s/pods/%s/log?container=%s&sinceSeconds=%d&tailLines=500"
-                                % (OUR_NS, p["name"], c, ROUND_S * SLOW_EVERY + 30), raw=True)
-                except Exception:
-                    continue
+        jobs = [(ns, p, c) for ns, pods in list(self.pods.items()) for p in pods if p["phase"] == "Running" for c in p["containers"]]
+
+        def read(job):
+            ns, p, c = job
+            try:
+                return job, kget("/api/v1/namespaces/%s/pods/%s/log?container=%s&sinceSeconds=%d&tailLines=500"
+                                 % (ns, p["name"], c, ROUND_S * SLOW_EVERY + 30), raw=True)
+            except Exception:
+                return job, ""
+        seen = {}  # (ns, sig) -> [workload, pod, sample line, count]
+        with concurrent.futures.ThreadPoolExecutor(WORKERS) as ex:
+            for (ns, p, c), text in ex.map(read, jobs):
                 for line in text.splitlines():
                     if ERROR_RE.search(line):
-                        seen.setdefault(signature(line), [p["workload"], p["name"], line[:500], 0])[3] += 1
+                        sig = signature(line) if ns == OUR_NS else signature(ns + " " + line)  # our old signatures stay valid
+                        seen.setdefault((ns, sig), [p["workload"], p["name"], line[:500], 0])[3] += 1
         known = {r["sig"] for r in self.rows("SELECT sig FROM signatures")}
         with self.lock:
             self.conn.executemany("INSERT INTO signatures VALUES (?,?,?,?,?,?,?) ON CONFLICT(sig) DO UPDATE SET last=?, count=count+?",
-                                  [(s, OUR_NS, wl, t, t, n, line, t, n) for s, (wl, _, line, n) in seen.items()])
+                                  [(s, ns, wl, t, t, n, line, t, n) for (ns, s), (wl, _, line, n) in seen.items()])
             self.conn.commit()
         sym = {}
-        for sig, (wl, pod, line, n) in seen.items():
-            key = "logs|new-error|%s|%s|%s" % (OUR_NS, wl, sig)
-            if (sig not in known and not learning) or key in open_keys:
-                sym[key] = ("new-error", OUR_NS, wl, "%s (%d× in the last %d min)" % (line[:300], n, ROUND_S * SLOW_EVERY // 60),
+        for (ns, sig), (wl, pod, line, n) in seen.items():
+            key = "logs|new-error|%s|%s|%s" % (ns, wl, sig)
+            if (sig not in known and not learning.get(ns, True)) or key in open_keys:
+                sym[key] = ("new-error", ns, wl, "%s (%d× in the last %d min)" % (line[:300], n, ROUND_S * SLOW_EVERY // 60),
                             {"pod": pod, "sample": line})
         self.observe("logs", sym, t)
+
+    def test_models(self, t):
+        """Every 5 min: a 1-token chat call (or a tiny embedding) to each KubeAI model litellm knows. Needs the litellm key."""
+        if not self.integrations()["litellm"]:
+            return
+        names = self.litellm_models() or []
+        base, auth = os.environ["LITELLM_URL"].rstrip("/"), {"Authorization": "Bearer " + os.environ["LITELLM_KEY"]}
+        sym = {}
+        for o in [o for o in self.inv.get(OUR_NS, {}).values() if o["kind"] == "Model" and o["min"]]:
+            if o["engine"] == "FasterWhisper":
+                continue  # speech models take audio, not text
+            route = next((n for n in names if n == o["name"] or o["name"] in n), None)
+            if not route:
+                continue
+            embed = o["engine"] == "Infinity" or any(k in o["name"] for k in ("embed", "bge", "jina", "dinov2"))
+            t0 = time.time()
+            try:
+                if embed:
+                    http_json("POST", base + "/embeddings", auth, {"model": route, "input": "ping"}, timeout=60)
+                else:
+                    http_json("POST", base + "/chat/completions", auth,
+                              {"model": route, "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]}, timeout=60)
+                ok, detail = True, "%d ms" % ((time.time() - t0) * 1000)
+            except Exception as e:
+                ok, detail = False, probe.err(e)[:200]
+            self.model_tests[o["name"]] = {"ok": ok, "ms": int((time.time() - t0) * 1000), "detail": detail, "ts": t, "route": route}
+            self.test_fails[o["name"]] = 0 if ok else self.test_fails.get(o["name"], 0) + 1
+            if self.test_fails[o["name"]] >= 2:
+                sym["models|model-test|%s|%s" % (OUR_NS, o["name"])] = ("model-test", OUR_NS, o["name"],
+                                                                         "test call via litellm (%s) failed: %s" % (route, detail), {})
+        self.observe("models", sym, t)
 
     # --- incidents ------------------------------------------------------------------------------------------------
     def observe(self, scope, sym, t, alert=True):
@@ -734,8 +799,9 @@ class Collector:
         if send:
             icon = {"infra": "🔴", "us": "🟠"}.get(d["owner"], "🟡")
             who = {"infra": "infra team", "us": "MLOps"}.get(d["owner"], "team " + d["owner"])
-            self.alerts.append("%s OPEN #%d %s · %s/%s · %s\n%s\nCause: %s\nFix: %s" % (
-                icon, iid, symptom, ns, obj, who, detail[:200], d["cause"][:300], d["fix"][:300]))
+            self.alerts.append("%s OPEN #%d %s · %s/%s · %s\n%s\nCause: %s\nFix: %s%s" % (
+                icon, iid, symptom, ns, obj, who, detail[:200], d["cause"][:300], d["fix"][:300],
+                "\n%s#/incident?id=%d" % (OPS_URL, iid) if OPS_URL else ""))
         if self.integrations()["litellm"]:
             self.bg.put(("litellm", iid))
         return iid
@@ -746,29 +812,36 @@ class Collector:
             self.alerts.append("✅ CLOSED #%d %s · %s/%s (open %d min)" % (r["id"], r["symptom"], r["ns"], r["obj"], (t - r["opened"]) // 60))
 
     def flush_alerts(self):
-        """Send this round's alerts as one Telegram message through London. Kept for the next round if London fails."""
-        if not self.alerts or not os.environ.get("PROBE_KEY") or not probe.CFG.get("receiver_url"):
+        """Send unsent alerts as one Telegram message through London. Every alert is kept in `outbox`: while London
+        is down they wait there (and on the page) and go out together once it is back."""
+        if self.alerts:
+            with self.lock:
+                self.conn.executemany("INSERT INTO outbox (ts, text) VALUES (?, ?)", [(time.time(), a) for a in self.alerts])
+                self.conn.commit()
+            self.alerts = []
+        pending = self.rows("SELECT id, text FROM outbox WHERE sent IS NULL ORDER BY id")
+        if not pending or not os.environ.get("PROBE_KEY") or not probe.CFG.get("receiver_url"):
             return
-        n = len(self.alerts)
-        text = "\n\n".join(self.alerts[:15]) + ("\n\n+%d more on the dashboard" % (n - 15) if n > 15 else "")
-        text = ("Sakoo ops\n\n" + text + ("\n\n" + OPS_URL if OPS_URL else ""))[:3900]
+        n = len(pending)
+        text = "\n\n".join(r["text"] for r in pending[:15]) + ("\n\n+%d more on the dashboard" % (n - 15) if n > 15 else "")
+        text = ("Sakoo ops\n\n" + text)[:3900]
         body = json.dumps({"ts": int(time.time()), "text": text}).encode()
         sig = hmac.new(os.environ["PROBE_KEY"].encode(), body, hashlib.sha256).hexdigest()
         req = urllib.request.Request(probe.CFG["receiver_url"].rsplit("/", 1)[0] + "/alert", data=body, method="POST",
                                      headers={"Content-Type": "application/json", "X-Signature": sig})
         try:
             urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=20).read()
-            self.alerts = []
+            self.exec("UPDATE outbox SET sent=? WHERE sent IS NULL AND id<=?", (time.time(), pending[-1]["id"]))
             self.integ_err.pop("alerts", None)
         except Exception as e:
             self.integ_err["alerts"] = probe.err(e)
-            self.alerts = self.alerts[-50:]
 
     def prune(self, t):
         with self.lock:
             self.conn.execute("DELETE FROM changes WHERE ts < ?", (t - RETENTION,))
             self.conn.execute("DELETE FROM incidents WHERE state='closed' AND closed < ?", (t - RETENTION,))
             self.conn.execute("DELETE FROM signatures WHERE last < ?", (t - RETENTION,))
+            self.conn.execute("DELETE FROM outbox WHERE ts < ?", (t - RETENTION,))
             self.conn.commit()
         self.set_meta("pruned", str(t))
 
@@ -825,7 +898,8 @@ class Collector:
              "sub": "probe checks down: infra · ours" + (" · probe has %d problems" % probe_down["monitor"] if probe_down["monitor"] else ""),
              "status": "bad" if probe_down["infra"] or probe_down["us"] or probe_down["asset"] else "ok", "link": "#/infra"},
         ]
-        return {"tiles": tiles, "incidents": incs, "changes": changes[:40], "status": self.status, "now": t,
+        unsent = self.rows("SELECT ts, text FROM outbox WHERE sent IS NULL ORDER BY id DESC LIMIT 50")
+        return {"tiles": tiles, "incidents": incs, "unsent": unsent, "changes": changes[:40], "status": self.status, "now": t,
                 "integrations": dict(self.integrations(), errors=self.integ_err), "probe_ts": self.probe.get("ts")}
 
     def incidents(self, state="open", kind=None, limit=300):
@@ -866,13 +940,13 @@ class Collector:
         for o in sorted((o for o in self.inv.get(OUR_NS, {}).values() if o["kind"] == "Model"), key=lambda o: o["name"]):
             pods = [p for p in self.pods.get(OUR_NS, []) if p["workload"] == o["name"]]
             g = [gpu[p["name"]] for p in pods if p["name"] in gpu]
-            out.append(dict(o, pods=pods, open=counts.get(o["name"], 0), gpu=round(sum(g) / len(g), 1) if g else None,
+            out.append(dict(o, pods=pods, open=counts.get(o["name"], 0), test=self.model_tests.get(o["name"]), gpu=round(sum(g) / len(g), 1) if g else None,
                             litellm=None if llm_names is None else any(o["name"] == n or o["name"] in n for n in llm_names)))
         return out
 
     def namespaces_info(self):
         counts = {r["ns"]: r["n"] for r in self.rows("SELECT ns, count(*) n FROM incidents WHERE state='open' GROUP BY ns")}
-        return [{"ns": ns, "pods": len(self.pods.get(ns, [])), "workloads": sum(o["kind"] in ("Deployment", "StatefulSet") for o in inv.values()),
+        return [{"ns": ns, "pods": len(self.pods.get(ns, [])), "workloads": sum(o["kind"] in ("Deployment", "StatefulSet", "DaemonSet", "CronJob") for o in inv.values()),
                  "open": counts.get(ns, 0), "read": self.read_at.get(ns)} for ns, inv in sorted(self.inv.items())]
 
     def services(self, ns):
