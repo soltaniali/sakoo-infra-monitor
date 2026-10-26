@@ -34,7 +34,8 @@ MAX_SKEW = 300  # reject reports older/newer than 5 min (replays)
 LABEL = {"infra": "🔴 INFRA DOWN", "us": "🟠 MLOPS ISSUE", "asset": "🟠 MLOPS ASSET DOWN", "monitor": "⚠️ PROBE CANNOT SEE SAKOO"}
 MAX_TRIES, BLOCK_S = 5, 900  # wrong /login passwords per chat before a 15 min block
 lock, sub_lock = threading.Lock(), threading.Lock()
-login_fails = {}  # chat id -> [wrong tries, blocked until]
+login_fails = {}
+alert_ids = []  # ids of the last /alert batches delivered  # chat id -> [wrong tries, blocked until]
 
 
 def tg(method, _timeout=20, **params):
@@ -253,11 +254,16 @@ class Handler(BaseHTTPRequestHandler):
         if abs(time.time() - msg["ts"]) > MAX_SKEW:
             return self._reply(403, b"stale report\n")
         if self.path == "/alert":
+            if msg.get("id") and msg["id"] in alert_ids:  # the station retried after a slow send: already delivered
+                return self._reply(200, b"ok (already sent)\n")
             try:
                 telegram(str(msg["text"])[:3900])
             except Exception as e:  # nobody reached: the station keeps the alert and retries next round
                 print("alert relay failed:", e, file=sys.stderr, flush=True)
                 return self._reply(502, b"telegram failed\n")
+            if msg.get("id"):
+                alert_ids.append(msg["id"])
+                del alert_ids[:-200]
             return self._reply(200, b"ok\n")
         apply(msg["results"])
         self._reply(200, b"ok\n")

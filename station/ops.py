@@ -43,7 +43,10 @@ LOG_BASELINE_S = 3600  # first hour: learn the error signatures that already exi
 RETENTION = 30 * 86400
 BUG = ("crashloop", "oomkilled", "flapping", "new-error", "probe-failing")
 DOWN = ("down", "model-down", "model-test", "pending", "image-pull", "endpoint", "infra")
-ERROR_RE = re.compile(r"(?i)\b(error|critical|fatal|traceback|panic|exception)\b")
+# a log LEVEL, not a word in the message: payloads (prompts, papers) contain "error" and "critical" as plain words
+ERROR_RE = re.compile(r'\b(ERROR|CRITICAL|FATAL|PANIC)\b|(?i:level=(error|fatal|critical))|(?i:"level"\s*:\s*"(error|fatal|critical)")'
+                      r'|^Traceback \(most recent call last\)|^\s*[A-Za-z_.]+(Error|Exception): ')
+LEVEL_ZONE = 160  # only the start of a line holds its level; the rest is the message
 probe.TIMEOUT = 25  # the VPN path is slow: 8 s timed out on big lists
 
 # symptom: (cause, suggested fix, playbook section)
@@ -684,7 +687,7 @@ class Collector:
         with concurrent.futures.ThreadPoolExecutor(WORKERS) as ex:
             for (ns, p, c), text in ex.map(read, jobs):
                 for line in text.splitlines():
-                    if ERROR_RE.search(line):
+                    if ERROR_RE.search(line[:LEVEL_ZONE]):
                         sig = signature(line) if ns == OUR_NS else signature(ns + " " + line)  # our old signatures stay valid
                         seen.setdefault((ns, sig), [p["workload"], p["name"], line[:500], 0])[3] += 1
         known = {r["sig"] for r in self.rows("SELECT sig FROM signatures")}
@@ -862,12 +865,12 @@ class Collector:
         n = len(pending)
         text = "\n\n".join(r["text"] for r in pending[:15]) + ("\n\n+%d more on the dashboard" % (n - 15) if n > 15 else "")
         text = ("Sakoo ops\n\n" + text)[:3900]
-        body = json.dumps({"ts": int(time.time()), "text": text}).encode()
+        body = json.dumps({"ts": int(time.time()), "text": text, "id": "ops-%d" % pending[-1]["id"]}).encode()  # London skips a repeat
         sig = hmac.new(os.environ["PROBE_KEY"].encode(), body, hashlib.sha256).hexdigest()
         req = urllib.request.Request(probe.CFG["receiver_url"].rsplit("/", 1)[0] + "/alert", data=body, method="POST",
                                      headers={"Content-Type": "application/json", "X-Signature": sig})
         try:
-            urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=20).read()
+            urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=60).read()
             self.exec("UPDATE outbox SET sent=? WHERE sent IS NULL AND id<=?", (time.time(), pending[-1]["id"]))
             self.integ_err.pop("alerts", None)
         except Exception as e:

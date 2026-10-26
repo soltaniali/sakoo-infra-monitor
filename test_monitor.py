@@ -53,6 +53,12 @@ sig = probe.hmac.new(b"k1", body, probe.hashlib.sha256).hexdigest()
 urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:18090/alert", data=body, headers={"X-Signature": sig}), timeout=5)
 assert sent[-1] == "Sakoo ops\n\nOPEN #1", sent
 sent.pop()
+body = json.dumps({"ts": int(time.time()), "text": "dup", "id": "ops-7"}).encode()      # same batch id twice: sent once
+sig = probe.hmac.new(b"k1", body, probe.hashlib.sha256).hexdigest()
+for _ in range(2):
+    urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:18090/alert", data=body, headers={"X-Signature": sig}), timeout=5)
+assert sent.count("dup") == 1, sent
+sent.remove("dup")
 
 st = json.loads(receiver.STATE.read_text())               # probe silent, then back
 st["last_report"] = time.time() - 1000

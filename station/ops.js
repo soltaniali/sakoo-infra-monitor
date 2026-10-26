@@ -237,7 +237,8 @@ VIEWS.logs = async q => {
     try {
       const r = await api('/api/logs?' + qs({ns, pod, container, tail: tail.value, previous: prev.checked ? '1' : ''}));
       const lines = r.text.split('\n');
-      const re = /\b(error|critical|fatal|traceback|panic|exception)\b/i;
+      const lvl = /\b(ERROR|CRITICAL|FATAL|PANIC)\b|level=(error|fatal|critical)|"level"\s*:\s*"(error|fatal|critical)"|^Traceback|^\s*[A-Za-z_.]+(Error|Exception): /;
+      const re = {test: l => lvl.test(l.slice(0, 160))};  // the level sits at the start of a line, not in the message
       out.textContent = (only.checked ? lines.filter(l => re.test(l)) : lines).join('\n') || '(empty)';
     } catch (e) { out.textContent = 'Error: ' + e.message; }
   }

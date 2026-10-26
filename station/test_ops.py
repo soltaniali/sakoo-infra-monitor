@@ -319,3 +319,8 @@ assert any(r["pod"] == "gpu-abc-1" for r in cap["idle"]) and any(x["gpu"] == "mi
 tr = col.trends()
 assert tr["days"] and tr["days"][0]["opened"] and tr["top_incidents"], tr
 print("ok (capacity, trends)")
+# a word "error" or "critical" inside a payload is not a log error; a level is
+assert not ops.ERROR_RE.search('{"abstract": "a critical issue: erroneous retrieval, error rates fall"}'[:ops.LEVEL_ZONE])
+assert ops.ERROR_RE.search("2026-10-26 09:02:35 ERROR upstream timed out") and ops.ERROR_RE.search('{"level": "error", "msg": "x"}')
+assert ops.ERROR_RE.search("ValueError: No embedding model is loaded") and not ops.ERROR_RE.search((("x" * 200) + " ERROR late")[:ops.LEVEL_ZONE])
+print("ok (levels)")
