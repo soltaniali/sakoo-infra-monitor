@@ -304,3 +304,18 @@ assert col.model_tests["m1"]["ok"] is False and inc(symptom="model-test", obj="m
 for k in ("LITELLM_URL", "LITELLM_KEY", "LITELLM_MODEL"):
     os.environ.pop(k)
 print("ok (new kinds)")
+
+# --- capacity and trends (extra tabs; the 8 tiles stay as they are)
+assert ops.qty("500m") == 0.5 and ops.qty("1Gi") == 1024 ** 3 and ops.qty("2") == 2.0
+g = pod("gpu-abc-1", "gpu")
+g["spec"]["containers"][0]["resources"] = {"requests": {"cpu": "4", "nvidia.com/mig-1g.10gb": "1"}, "limits": {"memory": "1Gi"}}
+K["llm-team"]["pods"].append(g)
+col.run_round()
+p = next(p for p in col.pods["llm-team"] if p["name"] == "gpu-abc-1")
+p["use_cpu"], p["use_mem"] = 0.01, 0.95 * 1024 ** 3
+cap = col.capacity()
+assert any(r["pod"] == "gpu-abc-1" and r["pct"] == 95 for r in cap["near_limit"]), cap["near_limit"]
+assert any(r["pod"] == "gpu-abc-1" for r in cap["idle"]) and any(x["gpu"] == "mig-1g.10gb" for x in cap["gpus"]), cap
+tr = col.trends()
+assert tr["days"] and tr["days"][0]["opened"] and tr["top_incidents"], tr
+print("ok (capacity, trends)")

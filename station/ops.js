@@ -61,7 +61,7 @@ function showLogin(msg) {
 }
 
 const TABS = [['overview', 'Overview'], ['incidents', 'Incidents'], ['changes', 'Changes'], ['models', 'Models'],
-  ['services', 'Services'], ['logs', 'Logs'], ['infra', 'Infra or us']];
+  ['services', 'Services'], ['logs', 'Logs'], ['infra', 'Infra or us'], ['capacity', 'Capacity'], ['trends', 'Trends']];
 function nav(page) {
   document.getElementById('tabs').replaceChildren(...TABS.map(([k, t]) => h('a', {href: '#/' + k, class: page === k || (page === 'incident' && k === 'incidents') ? 'on' : ''}, t)));
   document.getElementById('who').replaceChildren(me.user + ' · ', h('a', {href: '#', onclick: async ev => { ev.preventDefault(); await post('/api/logout', {}); showLogin(); }}, 'log out'));
@@ -256,6 +256,42 @@ VIEWS.logs = async q => {
     sum, h('div', {class: 'card'}, out));
   if (pod) load(); else out.textContent = 'No pods in this namespace.';
   return view;
+};
+
+const bar = (v, max) => h('span', {style: 'display:inline-block;height:8px;border-radius:4px;background:var(--info);width:' + Math.round(80 * Math.min(v / (max || 1), 1)) + 'px'});
+VIEWS.capacity = async () => {
+  const c = await api('/api/capacity');
+  const maxCpu = Math.max(...c.namespaces.map(r => r.cpu_use), 1);
+  const noMetrics = !c.namespaces.some(r => r.metrics);
+  return h('div', {}, h('h1', {}, 'Capacity'),
+    h('p', {class: 'mut'}, 'Live use from metrics.k8s.io against what pods requested. Not one of the 8 events: a view to spot waste and pods about to run out of memory.'),
+    noMetrics ? h('div', {class: 'card err small'}, 'No usage numbers: metrics.k8s.io answered nothing.') : '',
+    h('h2', {}, 'Pods near their memory limit (85% or more) · ' + c.near_limit.length),
+    h('div', {class: 'card'}, table([['Namespace', r => r.ns], ['Pod', r => r.pod], ['Used', r => r.used_gib + ' GiB'], ['Limit', r => r.limit_gib + ' GiB'],
+      ['%', r => h('span', {class: r.pct >= 95 ? 'err' : ''}, r.pct + ' %')]], c.near_limit)),
+    h('h2', {}, 'GPUs held · ' + c.gpus.reduce((a, g) => a + g.count, 0)),
+    h('div', {class: 'card'}, table([['Namespace', g => g.ns], ['Workload', g => g.workload], ['GPU', g => g.gpu + ' × ' + g.count],
+      ['CPU now', g => g.cpu == null ? '–' : g.cpu.toFixed(2) + ' cores']], c.gpus)),
+    h('h2', {}, 'Idle pods that reserve 1+ CPU (using under 2%) · ' + c.idle.length),
+    h('div', {class: 'card'}, table([['Namespace', r => r.ns], ['Pod', r => r.pod], ['CPU reserved', r => r.cpu_req], ['CPU used', r => r.cpu_use],
+      ['GPU', r => r.gpu]], c.idle)),
+    h('h2', {}, 'By namespace'),
+    h('div', {class: 'card'}, table([['Namespace', r => r.ns], ['Pods', r => r.pods], ['CPU used / requested', r => [bar(r.cpu_use, maxCpu), ' ', r.cpu_use + ' / ' + r.cpu_req]],
+      ['RAM used / requested', r => r.mem_use_gib + ' / ' + r.mem_req_gib + ' GiB'], ['GPUs', r => r.gpu]], c.namespaces)));
+};
+
+VIEWS.trends = async () => {
+  const tr = await api('/api/trends');
+  const maxO = Math.max(...tr.days.map(d => d.opened || 0), 1), maxR = Math.max(...tr.days.map(d => d.restarts || 0), 1);
+  return h('div', {}, h('h1', {}, 'Trends'),
+    h('p', {class: 'mut'}, 'Last 14 days, Tehran calendar. Restart counts start from the day this tab was added.'),
+    h('div', {class: 'card'}, table([['Day', d => d.day], ['Incidents opened', d => [bar(d.opened || 0, maxO), ' ', d.opened || 0]], ['Closed', d => d.closed || 0],
+      ['Avg time to close', d => d.fix_min == null ? '–' : d.fix_min + ' min'], ['Changes', d => d.changes || 0],
+      ['Restarts', d => [bar(d.restarts || 0, maxR), ' ', d.restarts || 0]]], tr.days)),
+    h('h2', {}, 'Services with the most incidents (30 days)'),
+    h('div', {class: 'card'}, table([['Namespace', r => r.ns], ['Service', r => r.obj], ['Incidents', r => r.n], ['Open now', r => r.open]], tr.top_incidents)),
+    h('h2', {}, 'Services that restart most (7 days)'),
+    h('div', {class: 'card'}, table([['Namespace', r => r.ns], ['Service', r => r.wl], ['Restarts', r => r.n]], tr.top_restarts)));
 };
 
 VIEWS.infra = async () => {

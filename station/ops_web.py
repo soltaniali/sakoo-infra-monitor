@@ -153,6 +153,10 @@ class Handler(BaseHTTPRequestHandler):
             return COL.namespaces_info()
         if what == "services":
             return COL.services(self.known_ns(q))
+        if what == "capacity":
+            return COL.capacity()
+        if what == "trends":
+            return COL.trends()
         if what == "infra":
             return COL.infra()
         if what == "logs":

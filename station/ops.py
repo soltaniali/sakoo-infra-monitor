@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS incidents (id INTEGER PRIMARY KEY, key TEXT, scope TE
   opened REAL, last_seen REAL, closed REAL, clean INTEGER, alerted INTEGER, summary TEXT);
 CREATE TABLE IF NOT EXISTS signatures (sig TEXT PRIMARY KEY, ns TEXT, workload TEXT, first REAL, last REAL,
   count INTEGER, sample TEXT);
+CREATE TABLE IF NOT EXISTS restarts (day TEXT, ns TEXT, wl TEXT, first INTEGER, last INTEGER, PRIMARY KEY (day, ns, wl));
 CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY, ts REAL, text TEXT, sent REAL);
 CREATE INDEX IF NOT EXISTS changes_ts ON changes (ts);
 CREATE INDEX IF NOT EXISTS incidents_state ON incidents (state, scope);
@@ -162,6 +163,34 @@ def workload_of(p):
     return name[:-len(h) - 1] if h and name.endswith("-" + h) else name
 
 
+def qty(v):
+    """Kubernetes quantity -> number (CPU in cores, memory in bytes). '500m' -> 0.5, '1Gi' -> 1073741824."""
+    if v in (None, ""):
+        return 0.0
+    v = str(v)
+    units = {"m": 1e-3, "k": 1e3, "M": 1e6, "G": 1e9, "T": 1e12, "Ki": 1024, "Mi": 1024 ** 2, "Gi": 1024 ** 3, "Ti": 1024 ** 4,
+             "n": 1e-9, "u": 1e-6}
+    for u in sorted(units, key=len, reverse=True):
+        if v.endswith(u):
+            return float(v[:-len(u)]) * units[u]
+    return float(v)
+
+
+def resources(containers):
+    """Summed requests/limits of a pod's containers; GPUs as {resource name: count} (nvidia.com/gpu, MIG slices)."""
+    r = {"cpu_req": 0.0, "mem_req": 0.0, "mem_lim": 0.0, "gpu": {}}
+    for c in containers:
+        res = c.get("resources", {})
+        req, lim = res.get("requests", {}), res.get("limits", {})
+        r["cpu_req"] += qty(req.get("cpu"))
+        r["mem_req"] += qty(req.get("memory"))
+        r["mem_lim"] += qty(lim.get("memory"))
+        for k, v in {**req, **lim}.items():
+            if k.startswith("nvidia.com/"):
+                r["gpu"][k] = max(r["gpu"].get(k, 0), int(qty(v)))
+    return r
+
+
 def sum_pod(p):
     st, spec = p.get("status", {}), p.get("spec", {})
     css = st.get("initContainerStatuses", []) + st.get("containerStatuses", [])
@@ -177,7 +206,8 @@ def sum_pod(p):
             "restarts": sum(c.get("restartCount", 0) for c in st.get("containerStatuses", [])),
             "node": spec.get("nodeName"), "created": ts(p["metadata"].get("creationTimestamp")), "started": ts(st.get("startTime")),
             "waiting": waiting, "last": last, "sched": sched, "init_running": init_running, "containers": containers, "bad": bad if bad in containers else (containers or [None])[0],
-            "mem": {c["name"]: c.get("resources", {}).get("limits", {}).get("memory") for c in spec.get("containers", [])}}
+            "mem": {c["name"]: c.get("resources", {}).get("limits", {}).get("memory") for c in spec.get("containers", [])},
+            "res": resources(spec.get("containers", []))}
 
 
 def gaps(containers):
@@ -375,7 +405,8 @@ class Collector:
                     "cm": opt("/api/v1/namespaces/%s/configmaps" % ns),
                     "events": opt("/api/v1/namespaces/%s/events?fieldSelector=type%%3DWarning" % ns),
                     "ing": opt("/apis/networking.k8s.io/v1/namespaces/%s/ingresses" % ns),
-                    "models": opt("/apis/kubeai.org/v1/namespaces/%s/models" % ns) if ns == OUR_NS else []}
+                    "models": opt("/apis/kubeai.org/v1/namespaces/%s/models" % ns) if ns == OUR_NS else [],
+                    "usage": opt("/apis/metrics.k8s.io/v1beta1/namespaces/%s/pods" % ns)}
             return snap
         except KubeError as e:
             if e.code == 403:
@@ -460,6 +491,12 @@ class Collector:
         for m in snap["models"]:
             inv["Model/%s/%s" % (ns, m["metadata"]["name"])] = sum_model(m)
         self.diff(ns, inv, t)
+        use = {u["metadata"]["name"]: (sum(qty(c.get("usage", {}).get("cpu")) for c in u.get("containers", [])),
+                                       sum(qty(c.get("usage", {}).get("memory")) for c in u.get("containers", [])))
+               for u in snap.get("usage", [])}
+        for p in pods:
+            p["use_cpu"], p["use_mem"] = use.get(p["name"], (None, None))
+        self.record_restarts(ns, pods, t)
         self.pods[ns], self.events[ns], self.inv[ns], self.read_at[ns] = pods, events, inv, t
         self.detect(ns, pods, events, inv, t)
 
@@ -842,6 +879,7 @@ class Collector:
             self.conn.execute("DELETE FROM incidents WHERE state='closed' AND closed < ?", (t - RETENTION,))
             self.conn.execute("DELETE FROM signatures WHERE last < ?", (t - RETENTION,))
             self.conn.execute("DELETE FROM outbox WHERE ts < ?", (t - RETENTION,))
+            self.conn.execute("DELETE FROM restarts WHERE day < ?", (time.strftime("%Y-%m-%d", time.gmtime(t - RETENTION)),))
             self.conn.commit()
         self.set_meta("pruned", str(t))
 
@@ -957,6 +995,69 @@ class Collector:
         return {"ns": ns, "read": self.read_at.get(ns), "workloads": sorted(workloads, key=lambda o: o["name"]),
                 "ingresses": [o for o in self.inv.get(ns, {}).values() if o["kind"] == "Ingress"], "pods": self.pods.get(ns, []),
                 "events": self.events.get(ns, [])[-30:]}
+
+    def record_restarts(self, ns, pods, t):
+        """Restart counter per workload, first and last value of each day: the day's restarts = last - first."""
+        day, per = time.strftime("%Y-%m-%d", time.gmtime(t)), {}
+        for p in pods:
+            per[p["workload"]] = per.get(p["workload"], 0) + p["restarts"]
+        with self.lock:
+            self.conn.executemany("INSERT INTO restarts VALUES (?,?,?,?,?) ON CONFLICT(day, ns, wl) DO UPDATE SET last=excluded.last, "
+                                  "first=min(first, excluded.first)", [(day, ns, wl, n, n) for wl, n in per.items()])
+            self.conn.commit()
+
+    def capacity(self):
+        """Per namespace: CPU/RAM used vs requested, GPUs held. Pods near their memory limit, idle pods that hold resources."""
+        gib, rows, near, idle, gpus = 1024 ** 3, [], [], [], []
+        for ns, pods in sorted(self.pods.items()):
+            live = [p for p in pods if p["phase"] == "Running"]
+            if not live:
+                continue
+            cpu_use = sum(p.get("use_cpu") or 0 for p in live)
+            mem_use = sum(p.get("use_mem") or 0 for p in live)
+            g = {}
+            for p in live:
+                for k, n in p["res"]["gpu"].items():
+                    g[k] = g.get(k, 0) + n
+                    gpus.append({"ns": ns, "pod": p["name"], "workload": p["workload"], "gpu": k.replace("nvidia.com/", ""), "count": n,
+                                 "cpu": p.get("use_cpu")})
+                lim, use = p["res"]["mem_lim"], p.get("use_mem")
+                if lim and use and use / lim >= 0.85:
+                    near.append({"ns": ns, "pod": p["name"], "used_gib": round(use / gib, 2), "limit_gib": round(lim / gib, 2),
+                                 "pct": round(100 * use / lim)})
+                req = p["res"]["cpu_req"]
+                if req >= 1 and p.get("use_cpu") is not None and p["use_cpu"] < 0.02 * req:
+                    idle.append({"ns": ns, "pod": p["name"], "cpu_req": round(req, 2), "cpu_use": round(p["use_cpu"], 3),
+                                 "gpu": ", ".join("%s×%d" % (k.replace("nvidia.com/", ""), n) for k, n in p["res"]["gpu"].items())})
+            rows.append({"ns": ns, "pods": len(live), "cpu_use": round(cpu_use, 2), "cpu_req": round(sum(p["res"]["cpu_req"] for p in live), 2),
+                         "mem_use_gib": round(mem_use / gib, 1), "mem_req_gib": round(sum(p["res"]["mem_req"] for p in live) / gib, 1),
+                         "gpu": ", ".join("%s×%d" % (k.replace("nvidia.com/", ""), n) for k, n in sorted(g.items())),
+                         "gpu_n": sum(g.values()), "metrics": any(p.get("use_cpu") is not None for p in live)})
+        rows.sort(key=lambda r: (-r["gpu_n"], -r["cpu_use"]))
+        return {"namespaces": rows, "near_limit": sorted(near, key=lambda r: -r["pct"]), "idle": sorted(idle, key=lambda r: -r["cpu_req"]),
+                "gpus": sorted(gpus, key=lambda r: (r["ns"], r["pod"]))}
+
+    def trends(self, days=14):
+        """Per day: incidents opened/closed, changes, mean time to close; services that break or restart most."""
+        t = time.time()
+        since = t - days * 86400
+        day = "strftime('%Y-%m-%d', {}, 'unixepoch', '+210 minutes')"  # Tehran calendar day
+        per = {}
+        for r in self.rows("SELECT %s d, count(*) n FROM incidents WHERE opened>=? GROUP BY d" % day.format("opened"), (since,)):
+            per.setdefault(r["d"], {})["opened"] = r["n"]
+        for r in self.rows("SELECT %s d, count(*) n, avg(closed - opened) m FROM incidents WHERE closed>=? GROUP BY d" % day.format("closed"),
+                           (since,)):
+            per.setdefault(r["d"], {}).update(closed=r["n"], fix_min=round(r["m"] / 60) if r["m"] else None)
+        for r in self.rows("SELECT %s d, count(*) n FROM changes WHERE ts>=? GROUP BY d" % day.format("ts"), (since,)):
+            per.setdefault(r["d"], {})["changes"] = r["n"]
+        for r in self.rows("SELECT day d, sum(last - first) n FROM restarts WHERE day>=? GROUP BY day",
+                           (time.strftime("%Y-%m-%d", time.gmtime(since)),)):
+            per.setdefault(r["d"], {})["restarts"] = r["n"]
+        top_inc = self.rows("SELECT ns, obj, count(*) n, sum(state='open') open FROM incidents WHERE opened>=? AND ns!='-' "
+                            "GROUP BY ns, obj ORDER BY n DESC LIMIT 10", (t - 30 * 86400,))
+        top_rst = self.rows("SELECT ns, wl, sum(last - first) n FROM restarts WHERE day>=? GROUP BY ns, wl HAVING n>0 ORDER BY n DESC LIMIT 10",
+                            (time.strftime("%Y-%m-%d", time.gmtime(t - 7 * 86400)),))
+        return {"days": [dict(v, day=k) for k, v in sorted(per.items(), reverse=True)], "top_incidents": top_inc, "top_restarts": top_rst}
 
     def infra(self):
         res = self.probe.get("results", {})
