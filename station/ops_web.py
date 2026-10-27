@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sakoo ops dashboard: team login, JSON API and the page; runs the collector (ops.py) in a thread. Stdlib only.
+"""AIP ops dashboard: team login, JSON API and the page; runs the collector (ops.py) in a thread. Stdlib only.
 
   ops_web.py                 serve on $OPS_BIND:$OPS_PORT (default 0.0.0.0:8443; compose publishes it on 127.0.0.1 only)
   ops_web.py adduser NAME    add a user or change their password (asked twice, hidden)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sakoo ops collector (diagnose only). Every round it reads Kubernetes through the station's VPN (GET requests only),
+"""AIP ops collector (diagnose only). Every round it reads Kubernetes through the station's VPN (GET requests only),
 keeps an inventory, records changes (feature/release, new service, new model), detects symptoms (bug, down), and turns
 them into incidents with cause, owner, evidence and a suggested fix. Humans do the fix. Stdlib only.
 
@@ -319,7 +319,7 @@ class Collector:
         url = os.environ["LITELLM_URL"].rstrip("/") + "/chat/completions"
         r = http_json("POST", url, {"Authorization": "Bearer " + os.environ["LITELLM_KEY"]}, {
             "model": os.environ["LITELLM_MODEL"], "temperature": 0.2, "max_tokens": 350, "messages": [
-                {"role": "system", "content": "You help the on-call MLOps engineer of Sakoo, a Kubernetes AI platform. Reply in at most "
+                {"role": "system", "content": "You help the on-call MLOps engineer of AIP, a Kubernetes AI platform. Reply in at most "
                                               "5 short sentences, plain text: what failed, the most likely cause, the next step."},
                 {"role": "user", "content": text[-6000:]}]}, timeout=120)
         return r["choices"][0]["message"]["content"].strip()
@@ -864,7 +864,7 @@ class Collector:
             return
         n = len(pending)
         text = "\n\n".join(r["text"] for r in pending[:15]) + ("\n\n+%d more on the dashboard" % (n - 15) if n > 15 else "")
-        text = ("Sakoo ops\n\n" + text)[:3900]
+        text = ("AIP ops\n\n" + text)[:3900]
         body = json.dumps({"ts": int(time.time()), "text": text, "id": "ops-%d" % pending[-1]["id"]}).encode()  # London skips a repeat
         sig = hmac.new(os.environ["PROBE_KEY"].encode(), body, hashlib.sha256).hexdigest()
         req = urllib.request.Request(probe.CFG["receiver_url"].rsplit("/", 1)[0] + "/alert", data=body, method="POST",
@@ -957,7 +957,7 @@ class Collector:
         i["change"] = self.one("SELECT * FROM changes WHERE id=?", (i["change_id"],)) if i["change_id"] else None
         logs = [l for l in i["evidence"].get("logs", "").splitlines() if l.strip()][-5:]
         i["handoff"] = "\n".join([
-            "[Sakoo] %s in %s/%s since %s Tehran time" % (i["symptom"], i["ns"], i["obj"],
+            "[AIP] %s in %s/%s since %s Tehran time" % (i["symptom"], i["ns"], i["obj"],
                                                           time.strftime("%Y-%m-%d %H:%M", time.gmtime(i["opened"] + 3.5 * 3600))),
             "What we see: " + i["detail"], "Likely cause: " + i["cause"], "Suggested fix: " + i["fix"]]
             + (["Last log lines:"] + logs if logs else []) + (["Dashboard: %s#/incident?id=%d" % (OPS_URL, iid)] if OPS_URL else []))

@@ -31,7 +31,7 @@ STATE, SUBS, OFFSET = DIR / "state.json", DIR / "subscribers.json", DIR / "tg_of
 FAIL_AFTER = int(os.environ.get("FAIL_AFTER", 2))
 SILENT_AFTER = int(os.environ.get("SILENT_AFTER_S", 180))
 MAX_SKEW = 300  # reject reports older/newer than 5 min (replays)
-LABEL = {"infra": "🔴 INFRA DOWN", "us": "🟠 MLOPS ISSUE", "asset": "🟠 MLOPS ASSET DOWN", "monitor": "⚠️ PROBE CANNOT SEE SAKOO"}
+LABEL = {"infra": "🔴 INFRA DOWN", "us": "🟠 MLOPS ISSUE", "asset": "🟠 MLOPS ASSET DOWN", "monitor": "⚠️ PROBE CANNOT SEE AIP"}
 MAX_TRIES, BLOCK_S = 5, 900  # wrong /login passwords per chat before a 15 min block
 lock, sub_lock = threading.Lock(), threading.Lock()
 login_fails = {}
@@ -98,11 +98,11 @@ def status_text():
     state = load()
     age = time.time() - state["last_report"]
     current = {n: c for n, c in state["checks"].items() if c.get("seen", 0) >= state["last_report"] - 1}
-    head = "<b>Sakoo status</b> · last report %d s ago%s" % (age, " · ⚠️ probe silent" if state.get("silent") else "")
+    head = "<b>AIP status</b> · last report %d s ago%s" % (age, " · ⚠️ probe silent" if state.get("silent") else "")
     return "\n".join([head] + dashboard.status_lines(current))
 
 
-HELP = ("Sakoo infra monitor.\n/login <password>: get alerts\n/logout: stop alerts\n/status: what is failing now\n/dashboard: history of ups and downs\n"
+HELP = ("AIP infra monitor.\n/login <password>: get alerts\n/logout: stop alerts\n/status: what is failing now\n/dashboard: history of ups and downs\n"
         "Alert types: 🔴 infra team, 🟠 ours (MLOps endpoints and assets), ⚠️ the probe itself.")
 
 
@@ -130,7 +130,7 @@ def handle(update):
                 subs = subscribers()
                 subs[chat] = who
                 save_subscribers(subs)
-            return reply("✅ Logged in. You will get Sakoo infra alerts.\n" + HELP)
+            return reply("✅ Logged in. You will get AIP infra alerts.\n" + HELP)
         tries += 1
         login_fails[chat] = [0, time.time() + BLOCK_S] if tries >= MAX_TRIES else [tries, 0]
         return reply("❌ Wrong password.")
@@ -225,7 +225,7 @@ def watchdog_tick():
             state["silent"] = True
             dashboard.record("probe reports", "monitor", False, "no report for %d min" % (quiet // 60))
             send(["🔴 PROBE SILENT: no report for %d min. Either the probe (its machine, VPN or internet) is down, "
-                  "or Sakoo is unreachable from it. Check the probe first." % (quiet // 60)], state)
+                  "or AIP is unreachable from it. Check the probe first." % (quiet // 60)], state)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -280,7 +280,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     if "--test" in sys.argv:
-        telegram("Sakoo infra monitor: receiver test message")
+        telegram("AIP infra monitor: receiver test message")
         print("sent")
         return
 

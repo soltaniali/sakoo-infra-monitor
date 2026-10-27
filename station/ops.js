@@ -1,5 +1,5 @@
 'use strict';
-// Sakoo Ops page. Every value from the API goes into the DOM as text (never as HTML): logs can contain anything.
+// AIP Ops page. Every value from the API goes into the DOM as text (never as HTML): logs can contain anything.
 const TZ = 'Asia/Tehran';
 const app = document.getElementById('app');
 let me = null, timer = null;
@@ -56,7 +56,7 @@ function showLogin(msg) {
   app.replaceChildren(h('form', {class: 'card login', onsubmit: async ev => {
     ev.preventDefault();
     try { await post('/api/login', {user: u.value, password: p.value}); render(); } catch (e) { if (e.message !== 'login') err.textContent = e.message; }
-  }}, h('h1', {}, 'Sakoo Ops'), h('label', {}, 'User', u), h('label', {}, 'Password', p), h('button', {class: 'primary'}, 'Log in'), err));
+  }}, h('h1', {}, 'AIP Ops'), h('label', {}, 'User', u), h('label', {}, 'Password', p), h('button', {class: 'primary'}, 'Log in'), err));
   u.focus();
 }
 
@@ -159,7 +159,7 @@ VIEWS.incident = async q => {
       e.target.disabled = true; e.target.textContent = 'Asking the LLM…';
       try { sum.replaceChildren(h('pre', {}, (await post('/api/summarize', {incident: i.id})).summary)); } catch (x) { sum.replaceChildren(h('span', {class: 'err'}, x.message)); }
       e.target.disabled = false; e.target.textContent = 'Summarize again';
-    }}, i.summary ? 'Summarize again' : 'Summarize with Sakoo LLM') : h('span', {class: 'mut small'}, 'LLM summaries are off (set LITELLM_* in secrets/ops.env).')),
+    }}, i.summary ? 'Summarize again' : 'Summarize with AIP LLM') : h('span', {class: 'mut small'}, 'LLM summaries are off (set LITELLM_* in secrets/ops.env).')),
     h('h2', {}, 'Message for the owner'), h('div', {class: 'card'}, handoff, h('div', {class: 'row'}, h('button', {onclick: async () => {
       handoff.select();
       try { await navigator.clipboard.writeText(i.handoff); copied.textContent = 'copied'; } catch (x) { document.execCommand('copy'); copied.textContent = 'copied'; }

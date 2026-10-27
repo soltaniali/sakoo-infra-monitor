@@ -198,8 +198,8 @@ def page(query, current, meta=None):
     e, qs = html.escape, lambda **kw: "?" + urllib.parse.urlencode(dict({"t": tok, "range": rng}, **kw))
     data = intervals(start, end)
     out = ["<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-           "<title>Sakoo uptime</title><style>%s</style></head><body><main>" % CSS,
-           "<h1>Sakoo uptime</h1><div class=mut>Tehran time · updated %s · link valid until %s</div>"
+           "<title>AIP uptime</title><style>%s</style></head><body><main>" % CSS,
+           "<h1>AIP uptime</h1><div class=mut>Tehran time · updated %s · link valid until %s</div>"
            % (fmt(end), fmt(int(tok.split(".")[0])) if "." in tok else "?"),
            "<div class='jump mut'>Jump to: %s</div>" % " ".join("<a href='#%s'>%s</a>" % (o, e(t)) for o, t in SECTIONS),
            "<div class=tabs>" + "".join("<a class='%s' href='%s'>%s</a>" % ("on" if r == rng and not at else "", qs(range=r), r)

@@ -202,7 +202,7 @@ assert len(inc(symptom="new-error")) == 1
 st = col.state()
 tiles = {t["n"]: t for t in st["tiles"]}
 assert tiles[1]["value"] == 1 and tiles[2]["value"] == 2 and tiles[6]["value"] == "3/3" and tiles[8]["value"] == "1 · 1", tiles
-assert col.incident(tr["id"])["handoff"].startswith("[Sakoo] crashloop in aip-mlops-service/training-api"), col.incident(tr["id"])
+assert col.incident(tr["id"])["handoff"].startswith("[AIP] crashloop in aip-mlops-service/training-api"), col.incident(tr["id"])
 
 # --- integrations with fake GitLab / Grafana answers: who made the release, GPU % of a model pod (Viewer token: no datasource list)
 def fake_http(method, url, headers=None, body=None, timeout=30):

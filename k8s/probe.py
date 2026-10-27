@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sakoo infra probe. Checks the infra-owned layers of Sakoo and POSTs the results to the receiver on the
+"""AIP infra probe. Checks the infra-owned layers of AIP and POSTs the results to the receiver on the
 London server, which sends the Telegram alerts. Stdlib only. Runs in two places with different configs:
   - inside the cluster (k8s/probe.json): cluster DNS, ingress, node objects via the pod's service account
   - on a machine with the VPNs (station/probe-station.json): internal and public ingress path, node kubelet
@@ -75,7 +75,7 @@ def get(url, insecure=False, headers=None, ctx=None):
     ctx = ctx or (ssl._create_unverified_context() if insecure else ssl.create_default_context())
     req = urllib.request.Request(url, headers=dict({"User-Agent": "sakoo-infra-probe"}, **(headers or {})))
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ctx))
-    try:  # no proxy: checks must take the direct path into Sakoo, not an HTTP(S)_PROXY from the environment
+    try:  # no proxy: checks must take the direct path into AIP, not an HTTP(S)_PROXY from the environment
         with opener.open(req, timeout=TIMEOUT) as r:
             return r.status, r.read()
     except urllib.error.HTTPError as e:
@@ -138,7 +138,7 @@ def check_http(url, healthy_text=None, insecure=False):
 def check_vpn(iface, log=None):
     """Up = the interface exists AND OpenVPN's log shows it connected after its last restart. The interface alone is
     not enough: OpenVPN keeps tun devices (persist-tun) while it reconnects, and a dead tunnel must not look like
-    every Sakoo check failing."""
+    every AIP check failing."""
     try:
         state = Path("/sys/class/net/%s/operstate" % iface).read_text().strip()
     except OSError:

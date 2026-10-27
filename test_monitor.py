@@ -48,10 +48,10 @@ try:
     raise AssertionError("bad signature accepted")
 except urllib.error.HTTPError as e:
     assert e.code == 403
-body = json.dumps({"ts": int(time.time()), "text": "Sakoo ops\n\nOPEN #1"}).encode()   # /alert relays the ops dashboard's text
+body = json.dumps({"ts": int(time.time()), "text": "AIP ops\n\nOPEN #1"}).encode()   # /alert relays the ops dashboard's text
 sig = probe.hmac.new(b"k1", body, probe.hashlib.sha256).hexdigest()
 urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:18090/alert", data=body, headers={"X-Signature": sig}), timeout=5)
-assert sent[-1] == "Sakoo ops\n\nOPEN #1", sent
+assert sent[-1] == "AIP ops\n\nOPEN #1", sent
 sent.pop()
 body = json.dumps({"ts": int(time.time()), "text": "dup", "id": "ops-7"}).encode()      # same batch id twice: sent once
 sig = probe.hmac.new(b"k1", body, probe.hashlib.sha256).hexdigest()
