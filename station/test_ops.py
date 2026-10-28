@@ -324,3 +324,12 @@ assert not ops.ERROR_RE.search('{"abstract": "a critical issue: erroneous retrie
 assert ops.ERROR_RE.search("2026-10-26 09:02:35 ERROR upstream timed out") and ops.ERROR_RE.search('{"level": "error", "msg": "x"}')
 assert ops.ERROR_RE.search("ValueError: No embedding model is loaded") and not ops.ERROR_RE.search((("x" * 200) + " ERROR late")[:ops.LEVEL_ZONE])
 print("ok (levels)")
+# --- users: what each user runs (user-* namespaces + JupyterHub notebooks)
+nbp = pod("jupyter-sara", "jupyter-sara", labels={"hub.jupyter.org/username": "sara"})
+K.setdefault("jupyterhub", empty())["pods"] = [nbp]
+col.namespaces = []  # re-read namespaces so jupyterhub is read
+col.run_round()
+us = {u["user"]: u for u in col.users()}
+assert "x" in us and "y" in us and "sara" in us and us["sara"]["kinds"] == ["notebook"], us.keys()
+assert "agent" in us["y"]["kinds"] and col.user("sara")["pods"][0]["ns"] == "jupyterhub"
+print("ok (users)")

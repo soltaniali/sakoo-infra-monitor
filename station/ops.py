@@ -210,7 +210,8 @@ def sum_pod(p):
             "node": spec.get("nodeName"), "created": ts(p["metadata"].get("creationTimestamp")), "started": ts(st.get("startTime")),
             "waiting": waiting, "last": last, "sched": sched, "init_running": init_running, "containers": containers, "bad": bad if bad in containers else (containers or [None])[0],
             "mem": {c["name"]: c.get("resources", {}).get("limits", {}).get("memory") for c in spec.get("containers", [])},
-            "res": resources(spec.get("containers", []))}
+            "res": resources(spec.get("containers", [])),
+            "jhub_user": p["metadata"].get("labels", {}).get("hub.jupyter.org/username")}
 
 
 def gaps(containers):
@@ -1008,6 +1009,57 @@ class Collector:
             self.conn.executemany("INSERT INTO restarts VALUES (?,?,?,?,?) ON CONFLICT(day, ns, wl) DO UPDATE SET last=excluded.last, "
                                   "first=min(first, excluded.first)", [(day, ns, wl, n, n) for wl, n in per.items()])
             self.conn.commit()
+
+    def user_pods(self):
+        """{user: [(ns, pod)]}: everything running in user-<name>, plus each user's JupyterHub notebook."""
+        out = {}
+        for ns, pods in self.pods.items():
+            for p in pods:
+                who = ns[5:] if ns.startswith("user-") else p.get("jhub_user")
+                if who:
+                    out.setdefault(who, []).append((ns, p))
+        return out
+
+    def users(self):
+        """One row per user: what they run now, what it uses, what is broken, what changed (7 days)."""
+        gib, t, rows = 1024 ** 3, time.time(), []
+        nss = {}
+        for who, items in self.user_pods().items():
+            for ns, _ in items:
+                nss.setdefault(who, set()).add(ns)
+        for who, items in sorted(self.user_pods().items()):
+            live = [p for _, p in items if p["phase"] == "Running"]
+            ns_list = sorted(nss[who])
+            q = ",".join("?" * len(ns_list))
+            inc = self.one("SELECT count(*) n FROM incidents WHERE state='open' AND ns IN (%s)" % q, ns_list)["n"]
+            chg = self.one("SELECT count(*) n, max(ts) last FROM changes WHERE ts>=? AND ns IN (%s)" % q, [t - 7 * 86400] + ns_list)
+            gpu = {}
+            for p in live:
+                for k, n in p["res"]["gpu"].items():
+                    gpu[k.replace("nvidia.com/", "")] = gpu.get(k.replace("nvidia.com/", ""), 0) + n
+            rows.append({"user": who, "namespaces": ns_list, "pods": len(items), "running": len(live),
+                         "pending": sum(p["phase"] == "Pending" for _, p in items),
+                         "kinds": sorted({"notebook" if p.get("jhub_user") else "agent" if p["workload"].endswith("clearml-agent")
+                                          else "workload" for _, p in items}),
+                         "cpu_use": round(sum(p.get("use_cpu") or 0 for p in live), 2),
+                         "cpu_req": round(sum(p["res"]["cpu_req"] for p in live), 1),
+                         "mem_use_gib": round(sum(p.get("use_mem") or 0 for p in live) / gib, 1),
+                         "gpu": ", ".join("%s×%d" % kv for kv in sorted(gpu.items())),
+                         "restarts": sum(p["restarts"] for _, p in items), "open": inc,
+                         "changes_7d": chg["n"], "last_change": chg["last"],
+                         "started": min((p["started"] or t for _, p in items), default=None)})
+        return rows
+
+    def user(self, who):
+        items = self.user_pods().get(who)
+        if items is None:
+            raise KeyError("no such user")
+        ns_list = sorted({ns for ns, _ in items})
+        q = ",".join("?" * len(ns_list))
+        return {"user": who, "namespaces": ns_list, "pods": [dict(p, ns=ns) for ns, p in items],
+                "incidents": self.rows("SELECT id, ns, obj, symptom, owner, cause, opened, closed, state FROM incidents WHERE ns IN (%s) "
+                                       "ORDER BY id DESC LIMIT 50" % q, ns_list),
+                "changes": self.rows("SELECT * FROM changes WHERE ns IN (%s) ORDER BY ts DESC LIMIT 50" % q, ns_list)}
 
     def capacity(self):
         """Per namespace: CPU/RAM used vs requested, GPUs held. Pods near their memory limit, idle pods that hold resources."""

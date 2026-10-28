@@ -61,7 +61,7 @@ function showLogin(msg) {
 }
 
 const TABS = [['overview', 'Overview'], ['incidents', 'Incidents'], ['changes', 'Changes'], ['models', 'Models'],
-  ['services', 'Services'], ['logs', 'Logs'], ['infra', 'Infra or us'], ['capacity', 'Capacity'], ['trends', 'Trends']];
+  ['services', 'Services'], ['logs', 'Logs'], ['infra', 'Infra or us'], ['users', 'Users'], ['capacity', 'Capacity'], ['trends', 'Trends']];
 function nav(page) {
   document.getElementById('tabs').replaceChildren(...TABS.map(([k, t]) => h('a', {href: '#/' + k, class: page === k || (page === 'incident' && k === 'incidents') ? 'on' : ''}, t)));
   document.getElementById('who').replaceChildren(me.user + ' · ', h('a', {href: '#', onclick: async ev => { ev.preventDefault(); await post('/api/logout', {}); showLogin(); }}, 'log out'));
@@ -260,6 +260,32 @@ VIEWS.logs = async q => {
 };
 
 const bar = (v, max) => h('span', {style: 'display:inline-block;height:8px;border-radius:4px;background:var(--info);width:' + Math.round(80 * Math.min(v / (max || 1), 1)) + 'px'});
+VIEWS.users = async () => {
+  const us = await api('/api/users');
+  return h('div', {}, h('h1', {}, 'Users · ' + us.length),
+    h('p', {class: 'mut'}, 'What each user runs now (user-* namespaces and JupyterHub notebooks), what it uses, what is broken. ' +
+      'Per-request activity (logins, API calls, LLM use) needs the logging in access requests 45–47.'),
+    h('div', {class: 'card'}, table([
+      ['User', u => h('a', {href: '#/user?' + qs({name: u.user})}, u.user)], ['Runs', u => u.kinds.join(', ')],
+      ['Pods', u => u.running + ' running' + (u.pending ? ', ' + u.pending + ' pending' : '')],
+      ['CPU used / reserved', u => u.cpu_use + ' / ' + u.cpu_req], ['RAM', u => u.mem_use_gib + ' GiB'], ['GPU', u => u.gpu],
+      ['Restarts', u => u.restarts], ['Open incidents', u => u.open ? h('span', {class: 'err'}, u.open) : 0],
+      ['Changes (7 d)', u => u.changes_7d ? u.changes_7d + ' · ' + ago(u.last_change) : 0], ['Running since', u => ago(u.started)]], us)));
+};
+
+VIEWS.user = async q => {
+  const u = await api('/api/user?' + qs({name: q.name}));
+  return h('div', {}, h('p', {}, h('a', {href: '#/users'}, '← users')), h('h1', {}, u.user),
+    h('p', {class: 'mut'}, 'Namespaces: ' + u.namespaces.join(', ')),
+    h('h2', {}, 'Pods · ' + u.pods.length), h('div', {class: 'card'}, table([['Namespace', p => p.ns], ['Pod', p => p.name], ['Phase', p => p.phase],
+      ['Ready', p => p.ready ? 'yes' : h('span', {class: 'err'}, 'no')], ['Restarts', p => p.restarts],
+      ['CPU / RAM now', p => p.use_cpu == null ? '–' : p.use_cpu.toFixed(2) + ' cores / ' + (p.use_mem / 1073741824).toFixed(1) + ' GiB'],
+      ['Problem', p => p.waiting.join(', ')], ['Age', p => ago(p.created)],
+      ['', p => p.bad ? h('a', {href: '#/logs?' + qs({ns: p.ns, pod: p.name, container: p.bad})}, 'logs') : '']], u.pods)),
+    h('h2', {}, 'Incidents'), h('div', {class: 'card'}, incidentTable(u.incidents)),
+    h('h2', {}, 'Changes'), h('div', {class: 'card'}, changeTable(u.changes.map(c => Object.assign(c, {info: JSON.parse(c.info || '{}')})))));
+};
+
 VIEWS.capacity = async () => {
   const c = await api('/api/capacity');
   const maxCpu = Math.max(...c.namespaces.map(r => r.cpu_use), 1);
