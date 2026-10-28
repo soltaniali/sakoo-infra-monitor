@@ -37,6 +37,9 @@ input,select,button{font:inherit;padding:5px 8px;border:1px solid var(--line);bo
 button{cursor:pointer}button.primary{background:var(--fg);color:var(--bg);border-color:var(--fg)}
 .login{max-width:340px;margin:60px auto;display:grid;gap:10px}.login label{display:grid;gap:4px}
 .small{font-size:12px}
+.locked{opacity:.55;border-style:dashed;display:grid;gap:4px}.locked .chip{margin-right:8px}
+.locked-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(260px,100%),1fr));gap:12px}
+.locked-cell{color:var(--mut);opacity:.6;cursor:help}.locked-title{color:var(--mut)}
 @media (max-width:700px){.kv{grid-template-columns:1fr}}
 </style>
 </head>

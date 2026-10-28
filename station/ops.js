@@ -260,17 +260,34 @@ VIEWS.logs = async q => {
 };
 
 const bar = (v, max) => h('span', {style: 'display:inline-block;height:8px;border-radius:4px;background:var(--info);width:' + Math.round(80 * Math.min(v / (max || 1), 1)) + 'px'});
+// What we cannot see yet: shown greyed, with what unlocks it, so it is not forgotten.
+const LOCKED_USER = [
+  {key: 'login', title: 'Logins', shows: 'last login, failed logins, IP', needs: 'access request 45 (Casdoor login records)'},
+  {key: 'requests', title: 'API requests', shows: 'requests per service, errors, slowest calls', needs: 'access request 46 (user in gateway/Traefik access log) + audit line in our services'},
+  {key: 'llm', title: 'LLM usage', shows: 'models used, tokens, LLM errors', needs: 'access request 47 (LiteLLM spend logs, Langfuse)'},
+  {key: 'train', title: 'Trainings', shows: 'queued, running and failed ClearML tasks', needs: 'a read-only ClearML API key (our own service)'},
+  {key: 'quota', title: 'Quota', shows: 'quota used vs limit', needs: 'access request 41 (RMG read-only)'},
+  {key: 'org', title: 'Organisation', shows: 'university or company, contact, service level', needs: 'access request 26 (customer list)'},
+  {key: 'history', title: 'Log history', shows: 'logs of pods that are gone, 30 days', needs: 'access requests 7 and 12 (central log store)'},
+];
+const lockedCell = l => h('span', {class: 'locked-cell', title: l.title + ': not visible yet. Needs ' + l.needs}, '—');
+const lockedCard = l => h('div', {class: 'card locked'}, h('div', {}, h('b', {}, l.title), h('span', {class: 'chip'}, 'not visible yet')),
+  h('div', {class: 'small'}, 'Will show: ' + l.shows), h('div', {class: 'small'}, 'Needs: ' + l.needs));
+
 VIEWS.users = async () => {
   const us = await api('/api/users');
+  const lockedCols = LOCKED_USER.slice(0, 4).map(l => [h('span', {class: 'locked-cell', title: 'Needs ' + l.needs}, l.title), () => lockedCell(l)]);
   return h('div', {}, h('h1', {}, 'Users · ' + us.length),
-    h('p', {class: 'mut'}, 'What each user runs now (user-* namespaces and JupyterHub notebooks), what it uses, what is broken. ' +
-      'Per-request activity (logins, API calls, LLM use) needs the logging in access requests 45–47.'),
+    h('p', {class: 'mut'}, 'What each user runs now (user-* namespaces and JupyterHub notebooks), what it uses, what is broken. Grey = not visible yet; hover to see what unlocks it.'),
     h('div', {class: 'card'}, table([
       ['User', u => h('a', {href: '#/user?' + qs({name: u.user})}, u.user)], ['Runs', u => u.kinds.join(', ')],
       ['Pods', u => u.running + ' running' + (u.pending ? ', ' + u.pending + ' pending' : '')],
       ['CPU used / reserved', u => u.cpu_use + ' / ' + u.cpu_req], ['RAM', u => u.mem_use_gib + ' GiB'], ['GPU', u => u.gpu],
       ['Restarts', u => u.restarts], ['Open incidents', u => u.open ? h('span', {class: 'err'}, u.open) : 0],
-      ['Changes (7 d)', u => u.changes_7d ? u.changes_7d + ' · ' + ago(u.last_change) : 0], ['Running since', u => ago(u.started)]], us)));
+      ['Changes (7 d)', u => u.changes_7d ? u.changes_7d + ' · ' + ago(u.last_change) : 0], ['Running since', u => ago(u.started)],
+      ...lockedCols], us)),
+    h('h2', {class: 'locked-title'}, 'Not visible yet · ' + LOCKED_USER.length),
+    h('div', {class: 'locked-grid'}, LOCKED_USER.map(lockedCard)));
 };
 
 VIEWS.user = async q => {
@@ -283,7 +300,9 @@ VIEWS.user = async q => {
       ['Problem', p => p.waiting.join(', ')], ['Age', p => ago(p.created)],
       ['', p => p.bad ? h('a', {href: '#/logs?' + qs({ns: p.ns, pod: p.name, container: p.bad})}, 'logs') : '']], u.pods)),
     h('h2', {}, 'Incidents'), h('div', {class: 'card'}, incidentTable(u.incidents)),
-    h('h2', {}, 'Changes'), h('div', {class: 'card'}, changeTable(u.changes.map(c => Object.assign(c, {info: JSON.parse(c.info || '{}')})))));
+    h('h2', {}, 'Changes'), h('div', {class: 'card'}, changeTable(u.changes.map(c => Object.assign(c, {info: JSON.parse(c.info || '{}')})))),
+    h('h2', {class: 'locked-title'}, 'Activity · not visible yet'),
+    h('div', {class: 'locked-grid'}, LOCKED_USER.map(lockedCard)));
 };
 
 VIEWS.capacity = async () => {
