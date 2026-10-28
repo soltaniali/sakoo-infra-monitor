@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS incidents (id INTEGER PRIMARY KEY, key TEXT, scope TE
 CREATE TABLE IF NOT EXISTS signatures (sig TEXT PRIMARY KEY, ns TEXT, workload TEXT, first REAL, last REAL,
   count INTEGER, sample TEXT);
 CREATE TABLE IF NOT EXISTS restarts (day TEXT, ns TEXT, wl TEXT, first INTEGER, last INTEGER, PRIMARY KEY (day, ns, wl));
+CREATE TABLE IF NOT EXISTS state_since (key TEXT PRIMARY KEY, state TEXT, since REAL);
 CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY, ts REAL, text TEXT, sent REAL);
 CREATE INDEX IF NOT EXISTS changes_ts ON changes (ts);
 CREATE INDEX IF NOT EXISTS incidents_state ON incidents (state, scope);
@@ -137,7 +138,7 @@ def short_image(image):
 
 def owner_of(ns, obj):
     """us = MLOps; infra = infra team; otherwise the team or user that owns the namespace."""
-    if ns == OUR_NS or (ns.startswith("user-") and obj.endswith("clearml-agent")):  # per-user ClearML agents are ours
+    if ns == OUR_NS or (ns.startswith("user-") and obj.endswith("clearml-agent")):  # per-user mlops-core agents are ours
         return "us"
     return ns
 
@@ -211,7 +212,8 @@ def sum_pod(p):
             "waiting": waiting, "last": last, "sched": sched, "init_running": init_running, "containers": containers, "bad": bad if bad in containers else (containers or [None])[0],
             "mem": {c["name"]: c.get("resources", {}).get("limits", {}).get("memory") for c in spec.get("containers", [])},
             "res": resources(spec.get("containers", [])),
-            "jhub_user": p["metadata"].get("labels", {}).get("hub.jupyter.org/username")}
+            "jhub_user": p["metadata"].get("labels", {}).get("hub.jupyter.org/username"),
+            "since": ts(next((c.get("lastTransitionTime") for c in st.get("conditions", []) if c["type"] == "Ready"), None))}
 
 
 def gaps(containers):
@@ -270,6 +272,7 @@ class Collector:
         self.status = {"last": None, "took": None, "errors": [], "slow_last": None}
         self.integ_err, self.cache = {}, {}
         self.model_tests, self.test_fails = {}, {}  # model -> {ok, ms, detail, ts, route}
+        self.states = {r["key"]: (r["state"], r["since"]) for r in self.rows("SELECT * FROM state_since")}  # liveness
         self.bg = queue.Queue()
         threading.Thread(target=self._bg_loop, daemon=True).start()
 
@@ -501,6 +504,11 @@ class Collector:
         for p in pods:
             p["use_cpu"], p["use_mem"] = use.get(p["name"], (None, None))
         self.record_restarts(ns, pods, t)
+        for key, o in inv.items():  # liveness of every workload and model: its state, since when, checked when
+            if o["kind"] in ("Deployment", "StatefulSet", "DaemonSet", "Model"):
+                want = o["min"] if o["kind"] == "Model" else o["desired"]
+                o["state"] = "ready" if o["ready"] >= want else "not ready"
+                o["since"], o["checked"] = self.mark(key, o["state"], t), t
         self.pods[ns], self.events[ns], self.inv[ns], self.read_at[ns] = pods, events, inv, t
         self.detect(ns, pods, events, inv, t)
 
@@ -654,6 +662,7 @@ class Collector:
         sym = {}
         for name, r in data["results"].items():
             ok, detail, owner = r[:3]
+            self.mark("probe:" + name, "up" if ok else "down", data["ts"])
             if ok or owner == "monitor":
                 continue
             symptom = "infra" if owner == "infra" else "endpoint"
@@ -1000,6 +1009,15 @@ class Collector:
                 "ingresses": [o for o in self.inv.get(ns, {}).values() if o["kind"] == "Ingress"], "pods": self.pods.get(ns, []),
                 "events": self.events.get(ns, [])[-30:]}
 
+    def mark(self, key, state, t):
+        """Liveness: since when has `key` been in `state`? A new state starts a new 'since'. Returns the since time."""
+        old = self.states.get(key)
+        if old and old[0] == state:
+            return old[1]
+        self.states[key] = (state, t)
+        self.exec("INSERT OR REPLACE INTO state_since VALUES (?, ?, ?)", (key, state, t))
+        return t
+
     def record_restarts(self, ns, pods, t):
         """Restart counter per workload, first and last value of each day: the day's restarts = last - first."""
         day, per = time.strftime("%Y-%m-%d", time.gmtime(t)), {}
@@ -1116,5 +1134,6 @@ class Collector:
 
     def infra(self):
         res = self.probe.get("results", {})
-        return {"ts": self.probe.get("ts"), "results": [{"name": n, "ok": r[0], "detail": r[1], "owner": r[2], "meta": r[3] if len(r) > 3 else {}}
+        return {"ts": self.probe.get("ts"), "results": [{"name": n, "ok": r[0], "detail": r[1], "owner": r[2], "meta": r[3] if len(r) > 3 else {},
+                                                         "since": self.states.get("probe:" + n, (None, None))[1], "checked": self.probe.get("ts")}
                                                         for n, r in sorted(res.items())]}

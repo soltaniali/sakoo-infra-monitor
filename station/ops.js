@@ -82,9 +82,15 @@ async function render() {
 window.addEventListener('hashchange', render);
 
 // --- shared pieces -------------------------------------------------------------------------------------------------
+// Liveness: a status, since when it has been so, and when it was last checked.
+function live(state, since, checked, bad) {
+  return h('span', {title: (since ? 'since ' + fmt(since) : '') + (checked ? ', checked ' + fmt(checked) : '')},
+    h('span', {class: bad ? 'err' : ''}, state), h('span', {class: 'small mut'}, (since ? ' · since ' + ago(since) : '') + (checked ? ' · checked ' + ago(checked) : '')));
+}
 const incidentCols = [
   ['#', r => r.id], ['Opened', r => h('span', {title: fmt(r.opened)}, ago(r.opened))], ['What', r => SYM[r.symptom] || r.symptom],
   ['Where', r => (r.ns === '-' ? '' : r.ns + ' / ') + r.obj], ['Owner', r => OWNER(r.owner)],
+  ['Last seen', r => r.closed ? h('span', {class: 'mut'}, 'closed ' + ago(r.closed)) : h('span', {title: fmt(r.last_seen)}, ago(r.last_seen))],
   ['Cause', r => h('span', {class: 'small'}, r.cause)]];
 const incidentTable = rows => table(incidentCols, rows, r => { location.hash = '#/incident?id=' + r.id; });
 function changeTable(rows) {
@@ -97,9 +103,9 @@ function changeTable(rows) {
         : i.author ? h('span', {}, i.author + ': ' + i.commit) : i.commits_in_window ? h('span', {class: 'small mut'}, 'commits around then: ' + i.commits_in_window.join(' · ')) : ''; }],
     ['Notes', r => h('span', {class: 'small mut'}, ((r.info || {}).gaps || []).join(', '))]], rows);
 }
-function podTable(pods, ns) {
+function podTable(pods, ns, checked) {
   return table([
-    ['Pod', p => p.name], ['Phase', p => p.phase], ['Ready', p => p.ready ? 'yes' : h('span', {class: 'err'}, 'no')],
+    ['Pod', p => p.name], ['Phase', p => p.phase], ['Ready', p => live(p.ready ? 'ready' : 'not ready', p.since, checked, !p.ready)],
     ['Restarts', p => p.restarts], ['Problem', p => [...p.waiting, ...p.last.map(l => 'last exit: ' + l[0])].join(', ')],
     ['Node', p => p.node || ''], ['Age', p => ago(p.created)],
     ['', p => ns && p.bad ? h('a', {href: '#/logs?' + qs({ns, pod: p.name, container: p.bad})}, 'logs') : '']], pods);
@@ -188,7 +194,7 @@ VIEWS.changes = async q => {
 
 VIEWS.models = async () => {
   const ms = await api('/api/models');
-  const cols = [['Model', m => m.name], ['Ready', m => h('span', {class: m.min && m.ready < m.min ? 'err' : ''}, m.ready + '/' + m.min)],
+  const cols = [['Model', m => m.name], ['Ready', m => live(m.ready + '/' + m.min, m.since, m.checked, m.min && m.ready < m.min)],
     ['Engine', m => m.engine], ['Resource profile', m => m.profile], ['Pods', m => m.pods.map(p => p.name + (p.restarts ? ' (' + p.restarts + ' restarts)' : '') + (p.node ? ' on ' + p.node : '')).join(', ')],
     ['Source', m => h('span', {class: 'small mut'}, m.url)], ['Age', m => ago(m.created)],
     ['Open incidents', m => m.open ? h('a', {href: '#/incidents'}, m.open) : '0']];
@@ -212,11 +218,12 @@ VIEWS.services = async q => {
     h('span', {class: 'mut'}, 'read ' + ago(s.read))),
     h('h2', {}, 'Workloads · ' + s.workloads.length), h('div', {class: 'card'}, table([
       ['Kind', w => w.kind], ['Name', w => w.name],
-      ['Ready', w => w.kind === 'Model' ? w.ready + '/' + w.min : h('span', {class: w.ready < w.desired ? 'err' : ''}, w.ready + '/' + w.desired)],
+      ['Ready', w => w.kind === 'Model' ? live(w.ready + '/' + w.min, w.since, w.checked, w.ready < w.min)
+        : w.kind === 'CronJob' ? h('span', {class: 'mut'}, 'runs on schedule') : live(w.ready + '/' + w.desired, w.since, w.checked, w.ready < w.desired)],
       ['Image / source', w => h('span', {class: 'small'}, w.images ? w.images.join(', ') : w.url)], ['Restarts', w => w.restarts],
       ['Gaps', w => h('span', {class: 'small mut'}, (w.gaps || []).join(', '))], ['Age', w => ago(w.created)]], s.workloads)),
     s.ingresses.length ? [h('h2', {}, 'Hostnames'), h('div', {class: 'card'}, table([['Ingress', i => i.name], ['Hosts', i => i.hosts.join(', ')], ['TLS', i => i.tls ? 'yes' : 'no']], s.ingresses))] : '',
-    h('h2', {}, 'Pods · ' + s.pods.length), h('div', {class: 'card'}, podTable(s.pods, ns)),
+    h('h2', {}, 'Pods · ' + s.pods.length), h('div', {class: 'card'}, podTable(s.pods, ns, s.read)),
     h('h2', {}, 'Warning events (last hour)'), h('div', {class: 'card'}, eventTable(s.events)));
 };
 
@@ -265,7 +272,7 @@ const LOCKED_USER = [
   {key: 'login', title: 'Logins', shows: 'last login, failed logins, IP', needs: 'access request 45 (Casdoor login records)'},
   {key: 'requests', title: 'API requests', shows: 'requests per service, errors, slowest calls', needs: 'access request 46 (user in gateway/Traefik access log) + audit line in our services'},
   {key: 'llm', title: 'LLM usage', shows: 'models used, tokens, LLM errors', needs: 'access request 47 (LiteLLM spend logs, Langfuse)'},
-  {key: 'train', title: 'Trainings', shows: 'queued, running and failed ClearML tasks', needs: 'a read-only ClearML API key (our own service)'},
+  {key: 'train', title: 'Trainings', shows: 'queued, running and failed mlops-core tasks', needs: 'a read-only mlops-core API key (our own service)'},
   {key: 'quota', title: 'Quota', shows: 'quota used vs limit', needs: 'access request 41 (RMG read-only)'},
   {key: 'org', title: 'Organisation', shows: 'university or company, contact, service level', needs: 'access request 26 (customer list)'},
   {key: 'history', title: 'Log history', shows: 'logs of pods that are gone, 30 days', needs: 'access requests 7 and 12 (central log store)'},
@@ -295,7 +302,7 @@ VIEWS.user = async q => {
   return h('div', {}, h('p', {}, h('a', {href: '#/users'}, '← users')), h('h1', {}, u.user),
     h('p', {class: 'mut'}, 'Namespaces: ' + u.namespaces.join(', ')),
     h('h2', {}, 'Pods · ' + u.pods.length), h('div', {class: 'card'}, table([['Namespace', p => p.ns], ['Pod', p => p.name], ['Phase', p => p.phase],
-      ['Ready', p => p.ready ? 'yes' : h('span', {class: 'err'}, 'no')], ['Restarts', p => p.restarts],
+      ['Ready', p => live(p.ready ? 'ready' : 'not ready', p.since, null, !p.ready)], ['Restarts', p => p.restarts],
       ['CPU / RAM now', p => p.use_cpu == null ? '–' : p.use_cpu.toFixed(2) + ' cores / ' + (p.use_mem / 1073741824).toFixed(1) + ' GiB'],
       ['Problem', p => p.waiting.join(', ')], ['Age', p => ago(p.created)],
       ['', p => p.bad ? h('a', {href: '#/logs?' + qs({ns: p.ns, pod: p.name, container: p.bad})}, 'logs') : '']], u.pods)),
@@ -349,7 +356,7 @@ VIEWS.infra = async () => {
       const rows = r.results.filter(x => x.owner === o).sort((a, b) => a.ok - b.ok || a.name.localeCompare(b.name));
       if (!rows.length) return '';
       return [h('h2', {}, title + ' · ' + rows.filter(x => !x.ok).length + ' down / ' + rows.length),
-        h('div', {class: 'card'}, table([['', x => h('span', {class: 'chip ' + (x.ok ? 'ok' : 'bad')}, x.ok ? 'up' : 'down')], ['Check', x => x.name],
+        h('div', {class: 'card'}, table([['Status', x => live(h('span', {class: 'chip ' + (x.ok ? 'ok' : 'bad')}, x.ok ? 'up' : 'down'), x.since, x.checked)], ['Check', x => x.name],
           ['Owner', x => x.meta && x.meta.person ? x.meta.person : ''], ['Detail', x => h('span', {class: 'small'}, x.detail)]], rows))];
     }));
 };

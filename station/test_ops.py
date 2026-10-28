@@ -333,3 +333,10 @@ us = {u["user"]: u for u in col.users()}
 assert "x" in us and "y" in us and "sara" in us and us["sara"]["kinds"] == ["notebook"], us.keys()
 assert "agent" in us["y"]["kinds"] and col.user("sara")["pods"][0]["ns"] == "jupyterhub"
 print("ok (users)")
+# --- liveness: a state keeps its 'since' until it changes; workloads and probe checks carry since + checked
+s1 = col.mark("t:x", "up", 100.0)
+assert col.mark("t:x", "up", 200.0) == 100.0 and col.mark("t:x", "down", 300.0) == 300.0 and col.mark("t:x", "down", 400.0) == 300.0
+w = next(o for o in col.inv[NS].values() if o["kind"] == "Deployment")
+assert w["state"] == "ready" and w["since"] and w["checked"], w
+assert all("since" in r and "checked" in r for r in col.infra()["results"])
+print("ok (liveness)")
