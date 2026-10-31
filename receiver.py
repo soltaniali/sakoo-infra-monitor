@@ -103,6 +103,7 @@ def status_text():
 
 
 HELP = ("AIP infra monitor.\n/login <password>: get alerts\n/logout: stop alerts\n/status: what is failing now\n/dashboard: history of ups and downs\n"
+        "/channel @name: also post every alert in a channel (bot must be its admin) · /unchannel @name: stop\n"
         "Alert types: 🔴 infra team, 🟠 ours (MLOps endpoints and assets), ⚠️ the probe itself.")
 
 
@@ -134,6 +135,36 @@ def handle(update):
         tries += 1
         login_fails[chat] = [0, time.time() + BLOCK_S] if tries >= MAX_TRIES else [tries, 0]
         return reply("❌ Wrong password.")
+    if cmd in ("/channel", "/unchannel"):  # forward every alert to a channel too (bot must be its admin)
+        if chat not in subscribers():
+            return reply("Log in first: /login <password>")
+        target = text.split()[1] if len(text.split()) > 1 else ""
+        if not target:
+            return reply("Usage: /channel @channelname  (or the channel id -100...). Add this bot to the channel as an admin "
+                         "that may post messages first.")
+        try:
+            info = tg("getChat", chat_id=target)
+        except Exception as e:
+            return reply("Cannot find %s: %s. Is the bot an admin of that channel?" % (target, e))
+        cid, title = str(info["id"]), info.get("title") or target
+        with sub_lock:
+            subs = subscribers()
+            if cmd == "/unchannel":
+                subs.pop(cid, None)
+            else:
+                subs[cid] = "channel " + title
+            save_subscribers(subs)
+        if cmd == "/unchannel":
+            return reply("Channel %s removed: no more alerts there." % title)
+        try:
+            tg("sendMessage", chat_id=cid, text="✅ AIP monitor: every alert will be posted here from now on.")
+        except Exception as e:
+            with sub_lock:
+                subs = subscribers()
+                subs.pop(cid, None)
+                save_subscribers(subs)
+            return reply("The bot cannot post in %s (%s). Make it an admin with 'Post messages', then try again." % (title, e))
+        return reply("Channel %s added (id %s). Every alert now goes there too." % (title, cid))
     if cmd == "/logout":
         with sub_lock:
             subs = subscribers()

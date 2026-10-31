@@ -172,6 +172,15 @@ receiver.apply({"svc-a": [True, "1 ready pod(s), /a 200", "asset", {"person": "A
 st = receiver.status_text()
 assert "<b>Critical</b>" in st and "svc-a  Armin" in st and "↳ no ready pod &lt;x&gt;" in st, st   # aligned, escaped
 assert st.index("❌ svc-b") < st.index("✅ svc-a"), st                                            # down first
+real_tg = receiver.tg                                     # /channel: a channel becomes a subscriber, gets every alert
+receiver.tg = lambda m, _timeout=20, **p: {"id": -100123, "title": "AIP alerts"} if m == "getChat" else real_tg(m, _timeout, **p)
+assert "Log in first" in msg(9, "/channel @aipalerts")
+assert "added" in msg(42, "/channel @aipalerts") and receiver.subscribers()["-100123"] == "channel AIP alerts"
+calls.clear()
+receiver.telegram("🔴 test")
+assert "-100123" in [p["chat_id"] for m, p in calls if m == "sendMessage"]
+assert "removed" in msg(42, "/unchannel @aipalerts") and "-100123" not in receiver.subscribers()
+receiver.tg = real_tg
 assert "Logged out" in msg(42, "/logout") and receiver.subscribers() == {}
 receiver.telegram("nobody listens")                       # no subscribers: no crash
 
