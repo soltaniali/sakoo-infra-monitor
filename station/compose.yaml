@@ -24,6 +24,7 @@ services:
     extra_hosts:                  # internal names, not in public DNS; reached through the cluster VPN (tun0)
       - "gitprod.aip.sharif.ir:172.30.153.10"
       - "monitoringprod.aip.sharif.ir:172.30.153.10"
+      - "langfusepilot.aipsharif.ir:185.220.226.23"   # public name, but the host's DNS often fails; reached through tun1
     env_file:                     # optional integrations (litellm, GitLab, Grafana): set-ops-tokens.sh, see README
       - path: ./secrets/ops.env
         required: false

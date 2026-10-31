@@ -379,6 +379,64 @@ col.prom = lambda q, at=None: [{"metric": {"__name__": "litellm_requests_metric_
 os.environ.update(GRAFANA_URL="https://g", GRAFANA_TOKEN="t")
 q4 = tickets.analyze(col, dict(rows[0], **d))["q4"]
 assert q4["answer"] == "12 requests, 3400 tokens in 30 days" and q4["locked"] is None, q4
+# per-user usage: key alias '<user>-<key>' groups LiteLLM counters, user-<name> namespace gives CPU/GPU hours
+def fake_prom(q, at=None):
+    if "litellm_requests_metric_total[30d]" in q:
+        return [{"metric": {"api_key_alias": "uni-k1", "hashed_api_key": "h1", "model": "m1"}, "value": [0, "10"]},
+                {"metric": {"api_key_alias": "uni-k2", "hashed_api_key": "h2", "model": "m2"}, "value": [0, "5"]},
+                {"metric": {"api_key_alias": "None", "model": "m1"}, "value": [0, "99"]}]
+    if "litellm_spend_metric_total[30d]" in q:
+        return [{"metric": {"api_key_alias": "uni-k1", "hashed_api_key": "h1", "model": "m1"}, "value": [0, "1.234"]}]
+    if "container_cpu_usage_seconds_total" in q:
+        return [{"metric": {"namespace": "user-uni"}, "value": [0, "7.6"]}]
+    if "api_key_alias=~\"uni-.*\"" in q:
+        return [{"metric": {"__name__": "litellm_requests_metric_total", "model": "m1"}, "value": [0, "15"]}]
+    return []
+col.prom, col.cache = fake_prom, {}
+u = col.usage()["users"]
+assert list(u) == ["uni"] and u["uni"]["requests"] == 15 and u["uni"]["spend"] == 1.23 and u["uni"]["cpu_h"] == 8, u
+assert u["uni"]["keys"]["uni-k1"]["requests"] == 10 and u["uni"]["models"] == {"m1": 10, "m2": 5}, u
+assert any(r["user"] == "uni" and r["kinds"] == ["API key"] and r["use"]["requests"] == 15 for r in col.users())
+assert col.user("uni")["use"]["requests"] == 15
+(ops.DATA / tickets.USERS_FILE).write_text(json.dumps({rows[0]["requester"]: "uni"}), encoding="utf-8")
+a = tickets.analyze(col, dict(rows[0], **dict(d, key_hashes=[])))
+assert a["q3"]["user"] == "uni" and a["q3"]["user_found"] == "map" and a["q3"]["answer"].startswith("uni: 8 CPU core-h"), a["q3"]
+assert a["q4"]["answer"] == "15 requests, 0 tokens in 30 days" and a["q4"]["locked"] is None, a["q4"]
+(ops.DATA / tickets.USERS_FILE).write_text(json.dumps({rows[0]["requester"]: "uni-k2"}), encoding="utf-8")
+col.prom = lambda q, at=None: [{"metric": {"__name__": "litellm_requests_metric_total"}, "value": [0, "5"]}] if 'api_key_alias="uni-k2"' in q else fake_prom(q)
+a = tickets.analyze(col, dict(rows[0], **dict(d, key_hashes=[])))
+assert a["q3"]["user"] == "uni" and a["q4"]["answer"].startswith("5 requests") and a["q4"]["usage"][0]["key"] == "uni-k2", a["q4"]
+(ops.DATA / tickets.USERS_FILE).unlink()
+# the team's name list: real names, one person with several accounts, ticket requester matched by name
+(ops.DATA / "people.json").write_text(json.dumps([{"name": "دانشگاه دانشکده نمونه", "account": None, "users": [], "keys": ["uni-k2"]},
+                                                  {"name": "Uni Co", "account": "uni", "users": ["uni", "uni2"], "keys": []}]), encoding="utf-8")
+assert next(r for r in col.users() if r["user"] == "uni")["person"] == {"name": "Uni Co", "users": ["uni", "uni2"]}
+assert col.user("uni")["key_people"] == {"uni-k2": "دانشگاه دانشکده نمونه"}
+a = tickets.analyze(col, dict(rows[0], **dict(d, key_hashes=[], requester="کاربر نمونه - دانشکده نمونه")))
+assert a["q3"]["user_found"] == "name list" and a["q4"]["usage"][0]["key"] == "uni-k2", a["q4"]
+# Langfuse request log of the key, around the ticket: per model/level, errors grouped, ticket Q2/Q5 filled
+seen = []
+def fake_lf(path, **q):
+    seen.append(json.loads(q.get("filter") or json.dumps(json.loads(q.get("query", "{}")).get("filters", []))))
+    if path == "/api/public/metrics":
+        return {"data": [{"providedModelName": "m1", "level": "DEFAULT", "count_count": "8", "sum_totalTokens": "900", "p95_latency": 2500.0},
+                         {"providedModelName": "m1", "level": "ERROR", "count_count": "2", "sum_totalTokens": None, "p95_latency": 10.0}]}
+    err = {"startTime": "2026-10-29T06:02:39.133Z", "model": "m1", "level": "ERROR", "latency": 0.1, "usage": {"total": 0},
+           "metadata": {"user_api_key_alias": "uni-k2"}, "statusMessage": "502 Bad Gateway req 1234567 sk-TESTkey0000fake1234"}
+    return {"data": [err, dict(err, startTime="2026-10-29T07:00:00Z")] if q.get("level") == "ERROR" else [dict(err, level="DEFAULT", statusMessage="")]}
+col.lf, col.cache = fake_lf, {}
+os.environ.update(LANGFUSE_URL="https://lf", LANGFUSE_PK="pk", LANGFUSE_SK="sk")
+a = tickets.analyze(col, dict(rows[0], **dict(d, key_hashes=[], requester="کاربر نمونه - دانشکده نمونه")))
+assert seen[0][0]["operator"] == "=" and seen[0][0]["value"] == "uni-k2", seen
+assert a["q2"]["answer"].startswith("10 LLM requests within 2 h of the ticket (2 failed)") and a["q2"]["locked"] is None, a["q2"]
+e = a["q5"]["user_errors"]
+assert len(e) == 1 and e[0]["count"] == 2 and "sk-TESTkey" not in e[0]["error"] and "1234567" not in e[0]["error"], e
+assert a["q5"]["answer"].endswith("2 of 10 failed") and a["q5"]["status"] in ("warn", "bad"), a["q5"]
+col.cache = {}
+assert col.user("uni")["llm_log"]["recent"][0]["model"] == "m1" and seen[-1][0]["operator"] == "starts with"
+for k in ("LANGFUSE_URL", "LANGFUSE_PK", "LANGFUSE_SK"):
+    os.environ.pop(k)
+(ops.DATA / "people.json").unlink()
 for k in ("GRAFANA_URL", "GRAFANA_TOKEN"):
     os.environ.pop(k)
 

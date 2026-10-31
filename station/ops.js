@@ -43,7 +43,7 @@ const qs = o => new URLSearchParams(Object.entries(o).filter(([, v]) => v !== ''
 function table(cols, rows, onclick) {
   if (!rows.length) return h('div', {class: 'mut'}, 'None.');
   return h('table', {}, h('tr', {}, cols.map(c => h('th', {}, c[0]))),
-    rows.map(r => h('tr', {class: onclick ? 'click' : '', onclick: onclick && (() => onclick(r))}, cols.map(c => h('td', {}, c[1](r))))));
+    rows.map((r, i) => h('tr', {class: onclick ? 'click' : '', onclick: onclick && (() => onclick(r))}, cols.map(c => h('td', {}, c[1](r, i, rows))))));
 }
 
 // --- login and navigation ------------------------------------------------------------------------------------------
@@ -120,8 +120,8 @@ const VIEWS = {};
 VIEWS.overview = async () => {
   const s = await api('/api/state');
   const st = s.status || {}, ig = s.integrations || {};
-  const chips = ['ai', 'litellm', 'gitlab', 'grafana', 'tickets'].map(k => h('span', {class: 'chip ' + (ig[k] ? (ig.errors[k] ? 'warn' : 'ok') : ''),
-    title: ig.errors[k] || (ig[k] ? 'on' : 'off: set its env in secrets/ops.env')}, {ai: 'AI summaries', litellm: 'model test calls', gitlab: 'who changed it', grafana: 'GPU %', tickets: 'ticket site'}[k]));
+  const chips = ['ai', 'litellm', 'gitlab', 'grafana', 'langfuse', 'tickets'].map(k => h('span', {class: 'chip ' + (ig[k] ? (ig.errors[k] ? 'warn' : 'ok') : ''),
+    title: ig.errors[k] || (ig[k] ? 'on' : 'off: set its env in secrets/ops.env')}, {ai: 'AI summaries', litellm: 'model test calls', gitlab: 'who changed it', grafana: 'GPU % · usage', langfuse: 'LLM request log', tickets: 'ticket site'}[k]));
   return h('div', {},
     h('div', {class: 'row mut small'}, 'Last round ' + ago(st.last) + (st.took != null ? ' (' + st.took + ' s)' : '') + ' · ' +
       (st.namespaces || 0) + ' namespaces read · full read ' + ago(st.slow_last) + ' · probe report ' + ago(s.probe_ts), ' ', chips,
@@ -202,7 +202,7 @@ VIEWS.models = async () => {
   if (me.integrations.grafana) cols.splice(4, 0, ['GPU %', m => m.gpu == null ? '–' : m.gpu + ' %']);
   if (me.integrations.litellm) cols.splice(4, 0, ['In litellm', m => m.litellm == null ? '?' : m.litellm ? 'yes' : h('span', {class: 'err'}, 'no')]);
   return h('div', {}, h('h1', {}, 'KubeAI models · ' + ms.length), h('div', {class: 'card'}, table(cols, ms)),
-    !me.integrations.grafana ? h('p', {class: 'mut small'}, 'GPU % is off: set GRAFANA_URL and GRAFANA_TOKEN in secrets/ops.env.') : '');
+    !me.integrations.grafana ? h('p', {class: 'mut small'}, 'GPU % is off: run set-grafana-login.sh (Grafana login) or set GRAFANA_TOKEN.') : '');
 };
 
 async function nsSelect(current, onpick) {
@@ -277,39 +277,68 @@ const LOCKED_USER = [
   {key: 'org', title: 'Organisation', shows: 'university or company, contact, service level', needs: 'access request 26 (customer list)'},
   {key: 'history', title: 'Log history', shows: 'logs of pods that are gone, 30 days', needs: 'access requests 7 and 12 (central log store)'},
 ];
+// LLM usage comes from Grafana's Prometheus (LiteLLM counters per key) once a Grafana login is set
+// real name from the team's name list; a person with several accounts: first row shows the name, the others "↳ same"
+const personCell = (u, i, rows) => !u.person ? h('span', {class: 'mut'}, '–') : u.person.users.length < 2 ? h('span', {dir: 'auto'}, u.person.name)
+  : u.person.users[0] === u.user || !u.person.users.includes((rows[i - 1] || {}).user) ? h('span', {dir: 'auto', title: u.person.users.join(', ')},
+    h('b', {}, u.person.name), h('div', {class: 'small mut'}, u.person.users.length + ' namespaces: ' + u.person.users.join(', ')))
+  : h('span', {class: 'mut small', title: u.person.name}, '↳ same as above');
+// LLM requests from Langfuse: per model/level, grouped errors, last requests (never prompts or answers)
+const llmLog = (lg, err) => !lg ? (err ? h('div', {class: 'card err small'}, 'Langfuse: ' + err) : '') : [
+  h('div', {class: 'card'}, h('b', {}, 'Per model'), table([['Model', m => m.model], ['Level', m => m.level === 'ERROR' ? h('span', {class: 'err'}, 'error') : 'ok'],
+    ['Requests', m => m.count], ['Tokens', m => m.tokens], ['p95 latency', m => (m.p95_ms / 1000).toFixed(1) + ' s']], lg.models),
+    h('b', {}, 'Errors · ' + lg.errors.reduce((n, e) => n + e.count, 0) + (lg.errors.length ? ' (last 50 grouped)' : '')),
+    table([['Error', e => h('span', {class: 'small', dir: 'auto'}, e.error)], ['Times', e => e.count], ['Model', e => e.model || '–'], ['Key', e => e.key || '–'],
+      ['Last', e => fmt(e.last)]], lg.errors),
+    h('b', {}, 'Last requests'), table([['Time', r => fmt(r.ts)], ['Model', r => r.model || '–'], ['Key', r => r.key || '–'],
+      ['Result', r => r.level === 'ERROR' ? h('span', {class: 'err small'}, r.status || 'error') : 'ok'], ['Latency', r => r.latency_s == null ? '–' : r.latency_s.toFixed(1) + ' s'],
+      ['Tokens', r => r.tokens == null ? '–' : r.tokens]], lg.recent))];
+const userLocked = () => LOCKED_USER.filter(l => !(l.key === 'llm' && me.integrations.grafana));
+const llmCell = u => !u || !u.requests ? '–' : [u.requests + ' req · ' + u.tokens + ' tok · $' + u.spend,
+  u.failed ? h('span', {class: 'err'}, ' · ' + u.failed + ' failed') : ''];
 const lockedCell = l => h('span', {class: 'locked-cell', title: l.title + ': not visible yet. Needs ' + l.needs}, '—');
 const lockedCard = l => h('div', {class: 'card locked'}, h('div', {}, h('b', {}, l.title), h('span', {class: 'chip'}, 'not visible yet')),
   h('div', {class: 'small'}, 'Will show: ' + l.shows), h('div', {class: 'small'}, 'Needs: ' + l.needs));
 
 VIEWS.users = async () => {
   const us = await api('/api/users');
-  const lockedCols = LOCKED_USER.slice(0, 4).map(l => [h('span', {class: 'locked-cell', title: 'Needs ' + l.needs}, l.title), () => lockedCell(l)]);
+  const locked = userLocked(), lockedCols = locked.slice(0, 3).map(l => [h('span', {class: 'locked-cell', title: 'Needs ' + l.needs}, l.title), () => lockedCell(l)]);
   return h('div', {}, h('h1', {}, 'Users · ' + us.length),
     h('p', {class: 'mut'}, 'What each user runs now (user-* namespaces and JupyterHub notebooks), what it uses, what is broken. Grey = not visible yet; hover to see what unlocks it.'),
     h('div', {class: 'card'}, table([
-      ['User', u => h('a', {href: '#/user?' + qs({name: u.user})}, u.user)], ['Runs', u => u.kinds.join(', ')],
+      ['Name', personCell], ['User', u => h('a', {href: '#/user?' + qs({name: u.user})}, u.user)], ['Runs', u => u.kinds.join(', ')],
       ['Pods', u => u.running + ' running' + (u.pending ? ', ' + u.pending + ' pending' : '')],
       ['CPU used / reserved', u => u.cpu_use + ' / ' + u.cpu_req], ['RAM', u => u.mem_use_gib + ' GiB'], ['GPU', u => u.gpu],
       ['Restarts', u => u.restarts], ['Open incidents', u => u.open ? h('span', {class: 'err'}, u.open) : 0],
       ['Changes (7 d)', u => u.changes_7d ? u.changes_7d + ' · ' + ago(u.last_change) : 0], ['Running since', u => ago(u.started)],
+      ...(me.integrations.grafana ? [['LLM 30 d', u => llmCell(u.use)], ['CPU-h · GPU-h 30 d', u => u.use ? u.use.cpu_h + ' · ' + u.use.gpu_h : '–']] : []),
       ...lockedCols], us)),
-    h('h2', {class: 'locked-title'}, 'Not visible yet · ' + LOCKED_USER.length),
-    h('div', {class: 'locked-grid'}, LOCKED_USER.map(lockedCard)));
+    h('h2', {class: 'locked-title'}, 'Not visible yet · ' + locked.length),
+    h('div', {class: 'locked-grid'}, locked.map(lockedCard)));
 };
 
 VIEWS.user = async q => {
   const u = await api('/api/user?' + qs({name: q.name}));
   return h('div', {}, h('p', {}, h('a', {href: '#/users'}, '← users')), h('h1', {}, u.user),
-    h('p', {class: 'mut'}, 'Namespaces: ' + u.namespaces.join(', ')),
+    u.person ? h('p', {}, h('b', {dir: 'auto'}, u.person.name), u.person.users.length > 1 ? [' · same person: ',
+      u.person.users.filter(x => x !== u.user).map(x => [h('a', {href: '#/user?' + qs({name: x})}, x), ' '])] : '') : '',
+    h('p', {class: 'mut'}, 'Namespaces: ' + (u.namespaces.join(', ') || 'none (API key only)')),
+    u.use ? [h('h2', {}, 'LLM and compute · 30 d' + (u.use_from ? ' (Prometheus data from ' + fmt(u.use_from) + ')' : '')),
+      h('div', {class: 'card'}, h('p', {}, llmCell(u.use), ' · CPU ' + u.use.cpu_h + ' core-h · GPU ' + u.use.gpu_h + ' h'),
+        table([['Key', k => k[0]], ['Used by', k => h('span', {dir: 'auto'}, u.key_people[k[0]] || '–')], ['Requests', k => k[1].requests], ['Tokens', k => k[1].tokens], ['Spend $', k => k[1].spend],
+          ['Failed', k => k[1].failed ? h('span', {class: 'err'}, k[1].failed) : 0], ['Key hash', k => h('span', {class: 'small mut'}, k[1].hash.slice(0, 8) + '…')]],
+          Object.entries(u.use.keys)),
+        h('p', {class: 'small'}, 'Requests per model: ' + (Object.entries(u.use.models).map(([m, n]) => m + ' ' + n).join(', ') || '–')))] : '',
     h('h2', {}, 'Pods · ' + u.pods.length), h('div', {class: 'card'}, table([['Namespace', p => p.ns], ['Pod', p => p.name], ['Phase', p => p.phase],
       ['Ready', p => live(p.ready ? 'ready' : 'not ready', p.since, null, !p.ready)], ['Restarts', p => p.restarts],
       ['CPU / RAM now', p => p.use_cpu == null ? '–' : p.use_cpu.toFixed(2) + ' cores / ' + (p.use_mem / 1073741824).toFixed(1) + ' GiB'],
       ['Problem', p => p.waiting.join(', ')], ['Age', p => ago(p.created)],
       ['', p => p.bad ? h('a', {href: '#/logs?' + qs({ns: p.ns, pod: p.name, container: p.bad})}, 'logs') : '']], u.pods)),
+    me.integrations.langfuse ? [h('h2', {}, 'LLM requests · last 7 days (Langfuse)'), llmLog(u.llm_log, u.llm_error)] : '',
     h('h2', {}, 'Incidents'), h('div', {class: 'card'}, incidentTable(u.incidents)),
     h('h2', {}, 'Changes'), h('div', {class: 'card'}, changeTable(u.changes.map(c => Object.assign(c, {info: JSON.parse(c.info || '{}')})))),
     h('h2', {class: 'locked-title'}, 'Activity · not visible yet'),
-    h('div', {class: 'locked-grid'}, LOCKED_USER.map(lockedCard)));
+    h('div', {class: 'locked-grid'}, userLocked().map(lockedCard)));
 };
 
 // --- support tickets: six questions per ticket, answered from our data ------------------------------------------------
@@ -354,8 +383,11 @@ VIEWS.ticket = async q => {
     h('h2', {}, TQ[0][1]), h('div', {class: 'card'}, h('ul', {}, a.q1.answer.split('; ').map(x => h('li', {class: a.q1.status === 'ok' ? '' : 'err'}, x))), h('p', {}, a.q1.check), a.q1.ai ? h('p', {class: 'small'}, 'AI: ' + a.q1.ai) : ''),
     h('h2', {}, TQ[1][1]), h('div', {class: 'card'}, qChip(a.q2),
       a.q2.model_pods.length ? h('p', {}, 'Logs of the model pods: ', a.q2.model_pods.map(p => [h('a', {href: '#/logs?' + qs(p)}, p.pod), ' '])) : '',
+      a.q2.log ? [h('p', {class: 'small mut'}, 'LLM calls of the user ' + fmt(a.q2.log.from) + ' → ' + fmt(a.q2.log.to) + ' (Langfuse):'), llmLog(a.q2.log)] : '',
       lockedNote(a.q2.locked)),
     h('h2', {}, TQ[2][1]), h('div', {class: 'card'}, qChip(a.q3),
+      a.q3.user ? h('p', {class: 'small'}, 'User ', h('a', {href: '#/user?' + qs({name: a.q3.user})}, a.q3.user),
+        {key: ' (owner of the API key in the ticket)', 'name list': ' (requester name matched the name list)'}[a.q3.user_found] || ' (from data/ticket-users.json)') : '',
       a.q3.pods.length ? table([['Model', p => p.model], ['Pod', p => p.pod], ['Ready', p => live(p.ready ? 'ready' : 'not ready', p.since, null, !p.ready)],
         ['GPU', p => p.gpu], ['CPU now', p => p.cpu_use == null ? '–' : p.cpu_use.toFixed(2)], ['Node', p => p.node]], a.q3.pods) : '',
       lockedNote(a.q3.locked)),
@@ -369,6 +401,8 @@ VIEWS.ticket = async q => {
       h('p', {class: 'small mut'}, 'Matched at the moments the user wrote: ' + a.q5.moments.map(fmt).join(', ') +
         ' · our data starts ' + fmt(a.q5.data_from) +
         (a.q5.first_answer_h != null ? ' · first staff answer after ' + a.q5.first_answer_h + ' h' : ' · no staff answer yet')),
+      a.q5.user_errors && a.q5.user_errors.length ? [h('b', {}, 'Failed calls of the user then'), table([['Error', e => h('span', {class: 'small', dir: 'auto'}, e.error)],
+        ['Times', e => e.count], ['Model', e => e.model || '–'], ['Last', e => fmt(e.last)]], a.q5.user_errors)] : '',
       h('b', {}, 'On what the user uses'), whenTable(a.q5.incidents), h('b', {}, 'Platform-wide (ours or infra)'), whenTable(a.q5.platform)),
     h('h2', {}, TQ[5][1]), h('div', {class: 'card'}, qChip(a.q6)),
     h('h2', {}, 'Conversation · ' + t.messages.length), h('div', {class: 'card'}, t.messages.map(m =>

@@ -17,6 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 SYNC_S = 600
 FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
@@ -31,29 +32,53 @@ PURPOSES = [  # first match wins; words in English and Persian as users write th
 ]
 ERROR_HINT = re.compile(r"\b[45]\d\d\b|error|exception|traceback|timeout|خطا|ارور|قطع|پاسخ.?گو نیست|loop|لوپ|none", re.I)
 LOCKED = {
-    "user_logs": "access requests 46/47: LiteLLM spend logs or gateway access log with the user's key, and the audit line in our services",
-    "user_infra": "access request 47 (LiteLLM spend per key) and 26 (customer list: which org owns which key)",
-    "user_services": "access request 47 (LiteLLM spend logs: models, tokens, errors per key)",
-    "key_usage": "the Grafana token (Prometheus already scrapes LiteLLM's /metrics, per hashed API key): sh station/set-ops-tokens.sh",
+    "user_logs": "the requester's AIP username or key (data/ticket-users.json or the name list) and Langfuse keys: sh station/set-langfuse-keys.sh",
+    "user_infra": "the requester's AIP username: add it to data/ticket-users.json on the station ({\"name on ticket\": \"username\"})",
+    "user_services": "the requester's AIP username (data/ticket-users.json on the station) or their API key hash",
+    "key_usage": "a Grafana login on the station: sh station/set-grafana-login.sh",
 }
 # LiteLLM's Prometheus counters, per API key (label hashed_api_key = sha256 of the key); names differ between versions
 USAGE_Q = ('sum by (__name__, model) (increase({__name__=~"litellm_(requests|total_tokens|spend|proxy_failed_requests)_metric(_total)?'
-           '|litellm_total_tokens(_total)?", hashed_api_key="%s"}[%s]))')
+           '|litellm_total_tokens(_total)?", %s}[%s]))')
+USERS_FILE = "ticket-users.json"  # in OPS_DATA, edited by hand: {"requester name on the ticket site": "AIP username" or "key alias"}
 
 
-def key_usage(col, hashes, at):
-    """Requests, tokens, spend and failures per model for the user's key: last 30 days, and the day around the ticket."""
+def key_usage(col, selectors, at):
+    """Requests, tokens, spend and failures per model, last 30 days and the day around the ticket.
+    selectors: (label shown, PromQL label matcher), one per key hash or user."""
     out = []
-    for h in hashes:
+    for key, sel in selectors:
         for label, rng, when in (("last 30 days", "30d", None), ("24 h around the ticket", "24h", at + 12 * 3600)):
-            rows = col.cached("key:%s:%s" % (h[:12], label), 900, lambda: col.prom(USAGE_Q % (h, rng), when)) or []
+            rows = col.cached("key:%s:%s" % (sel, label), 900, lambda: col.prom(USAGE_Q % (sel, rng), when)) or []
             for r in rows:
                 v = float(r["value"][1])
                 if v:
                     name = r["metric"].get("__name__", "")
-                    out.append({"key": h[:8], "period": label, "model": r["metric"].get("model", "?"), "value": round(v, 2),
+                    out.append({"key": key, "period": label, "model": r["metric"].get("model", "?"), "value": round(v, 2),
                                 "metric": next(k for k in ("failed", "tokens", "spend", "requests") if k in name)})
     return out
+
+
+def ticket_user(col, d, use):
+    """AIP username of the requester: from the hand-kept map, else the owner of an API key posted in the ticket."""
+    try:
+        known = json.loads((Path(os.environ.get("OPS_DATA", "/data")) / USERS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        known = {}
+    if known.get(d.get("requester")):
+        return known[d["requester"]], "map"
+    # the team's name list: a requester "<person> - <university>" contains the university of "دانشگاه <university>"
+    req = re.sub(r"\s+", " ", d.get("requester") or "")
+    for p in col.people():
+        core = re.sub(r"^(دانشگاه|شرکت)\s+", "", p["name"])
+        if len(core) >= 4 and core in req and (p["keys"] or p["users"]):
+            return (p["keys"] or p["users"])[0], "name list"
+    for who, r in use.items():
+        for alias, k in r["keys"].items():
+            if k["hash"] in (d.get("key_hashes") or []):
+                return alias, "key"
+    return None, None
+
 
 
 
@@ -280,6 +305,15 @@ def analyze(col, d, ai=None):
     q1 = {"status": "bad" if d.get("secret_posted") else "warn" if problems else "ok", "answer": "; ".join(problems) or "complete",
           "check": verdict, "ai": ai.get("summary") if ai else None}
 
+    use = col.usage().get("users", {})
+    who, found = ticket_user(col, d, use)
+    alias = who if who and "-" in who else None  # usernames have no '-'; key aliases are '<user>-<key name>'
+    who = who.split("-", 1)[0] if who else None
+    # the user's own LLM requests from 2 h before the first to 2 h after the last moment they wrote (Langfuse)
+    log = col.llm_log(alias or who, moments[0] - NEAR_S, moments[-1] + NEAR_S) if who else None
+    n_req = sum(m["count"] for m in log["models"]) if log else 0
+    n_err = sum(m["count"] for m in log["models"] if m["level"] == "ERROR") if log else 0
+
     # 2. how it was used, and logs
     how = []
     if hosts:
@@ -291,8 +325,11 @@ def analyze(col, d, ai=None):
         if re.search(rx, low):
             how.append(k)
     log_pods = [{"ns": m["ns"], "pod": p["name"], "container": p["bad"]} for m in models for p in col.pods.get(m["ns"], []) if p["workload"] == m["name"]]
-    q2 = {"status": "info", "answer": ", ".join(how) or "not said in the ticket", "model_pods": log_pods,
-          "locked": LOCKED["user_logs"]}
+    if log:
+        how.insert(0, "%d LLM requests within 2 h of the ticket (%d failed)" % (n_req, n_err) if n_req
+                   else "no LLM request within 2 h of the ticket")
+    q2 = {"status": "warn" if n_err else "info", "answer": ", ".join(how) or "not said in the ticket", "model_pods": log_pods,
+          "log": log, "locked": None if log else LOCKED["user_logs"]}
 
     # 3. infra used (what is behind the models they use; the user's own share is locked)
     infra = []
@@ -302,25 +339,37 @@ def analyze(col, d, ai=None):
                 gpu = ", ".join("%s×%d" % (k.replace("nvidia.com/", ""), n) for k, n in p["res"]["gpu"].items())
                 infra.append({"model": m["name"], "pod": p["name"], "gpu": gpu, "cpu_use": p.get("use_cpu"), "node": p.get("node"),
                               "ready": p.get("ready"), "since": p.get("since")})
-    q3 = {"status": "info", "answer": "%d model pod(s) behind what the ticket uses" % len(infra) if infra else "nothing in the cluster matched",
-          "pods": infra, "locked": LOCKED["user_infra"]}
+    own = use.get(who) or {}
+    answer = "%d model pod(s) behind what the ticket uses" % len(infra) if infra else "nothing in the cluster matched"
+    if who:
+        answer = "%s: %d CPU core-h, %d GPU-h in 30 d; %s" % (who, own.get("cpu_h", 0), own.get("gpu_h", 0), answer)
+    q3 = {"status": "info", "answer": answer, "pods": infra, "user": who, "user_found": found,
+          "user_use": {k: own[k] for k in ("cpu_h", "gpu_h")} if own else None, "locked": None if who else LOCKED["user_infra"]}
 
     # 4. services used
-    usage = key_usage(col, d.get("key_hashes") or [], created) if d.get("key_hashes") and col.integrations()["grafana"] else []
+    # the key posted in the ticket if any, else every key of the user (alias '<user>-<key name>')
+    # (a key alias in the map, e.g. adminc2level-tarbiatmodares: one university's key of an org account)
+    sels = [(h[:8], 'hashed_api_key="%s"' % h) for h in d.get("key_hashes") or []] or (
+        [(alias, 'api_key_alias="%s"' % alias.replace('"', ""))] if alias else
+        [(who, 'api_key_alias=~"%s-.*"' % re.sub(r"[^\w.-]", "", who))] if who else [])
+    usage = key_usage(col, sels, created) if sels and col.integrations()["grafana"] else []
     total = lambda k, p: round(sum(u["value"] for u in usage if u["metric"] == k and u["period"] == p))
     named = ", ".join([m["name"] for m in models] + hosts) or "not said in the ticket"
     q4 = {"status": "warn" if total("failed", "24 h around the ticket") else "info",
           "answer": ("%d requests, %d tokens in 30 days" % (total("requests", "last 30 days"), total("tokens", "last 30 days")) if usage
-                     else named), "named": named, "models": models, "usage": usage,
-          "locked": None if usage else LOCKED["key_usage"] if d.get("key_hashes") else LOCKED["user_services"]}
+                     else named), "named": named, "models": models, "usage": usage, "user": who,
+          "locked": None if usage else LOCKED["key_usage"] if sels else LOCKED["user_services"]}
 
     # 5. down or broken at that time
     plat_active = [i for i in platform if i["when"] == "active"]
-    q5 = {"status": "bad" if mine_active else "warn" if mine or plat_active else "ok" if covered else "info",
+    q5 = {"status": "bad" if mine_active else "warn" if mine or plat_active or n_err else "ok" if covered else "info",
           "answer": ("at the time: %d open on what the user uses, %d platform-wide; within 2 h: %d more"
                      % (len(mine_active), len(plat_active), len(mine) + len(platform) - len(mine_active) - len(plat_active))) if covered
           else "no data: monitoring starts %s" % tehran(first_data),
+          "user_errors": log["errors"] if log else None,
           "incidents": mine, "platform": platform[:20], "moments": moments, "data_from": first_data, "first_answer_h": wait_h}
+    if log:  # Langfuse keeps older history than our incidents: the user's own failed calls still answer "was it broken"
+        q5["answer"] += "; the user's own LLM calls then: %d of %d failed" % (n_err, n_req)
 
     # 6. what for
     purpose = next((p for p, rx in PURPOSES if re.search(rx, low)), "other")

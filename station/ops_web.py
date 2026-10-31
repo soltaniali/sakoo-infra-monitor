@@ -299,6 +299,11 @@ def check_cli():
     if on["litellm"]:
         names = col.litellm_models()
         print("litellm  OK  %d models" % len(names) if names is not None else "litellm  FAIL %s" % col.integ_err.get("litellm"))
+    if on["langfuse"]:
+        try:
+            print("langfuse OK  project %s" % ", ".join(p["name"] for p in col.lf("/api/public/projects")["data"]))
+        except Exception as e:
+            print("langfuse FAIL %s" % ops.probe.err(e))
     if on["ai"]:
         try:
             print("ai       OK  %s answers: %s" % (os.environ.get("AI_MODEL") or os.environ.get("LITELLM_MODEL"), col.llm("Say OK.", max_tokens=5)[:40]))

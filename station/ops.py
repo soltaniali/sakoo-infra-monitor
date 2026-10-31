@@ -10,10 +10,11 @@ Optional integrations, each on when its env is set (secrets/ops.env):
   AI_URL (…/v1), AI_KEY, AI_MODEL                     any OpenAI-compatible LLM (free tier: Mistral, OpenRouter, ...) for log,
                                                        incident and ticket summaries; without it the LITELLM_* model is used
   GITLAB_URL, GITLAB_TOKEN, GITLAB_PROJECTS            author and MR of a change (comma-separated project paths)
-  GRAFANA_URL, GRAFANA_TOKEN [, GRAFANA_DATASOURCE_UID] GPU % per model pod (DCGM_FI_DEV_GPU_UTIL)
+  GRAFANA_URL, GRAFANA_TOKEN or GRAFANA_USER + GRAFANA_PASSWORD [, GRAFANA_DATASOURCE_UID] GPU % per model pod (DCGM_FI_DEV_GPU_UTIL)
   TICKETS_URL, TICKETS_USER, TICKETS_PASSWORD           support tickets, each checked against our data (tickets.py)
 Alerts: one Telegram message per round, through the London receiver's POST /alert (HMAC with PROBE_KEY).
 """
+import base64
 import calendar
 import concurrent.futures
 import contextlib
@@ -309,7 +310,8 @@ class Collector:
         e = os.environ.get
         return {"litellm": bool(e("LITELLM_URL") and e("LITELLM_KEY") and e("LITELLM_MODEL")),
                 "gitlab": bool(e("GITLAB_URL") and e("GITLAB_TOKEN") and e("GITLAB_PROJECTS")),
-                "grafana": bool(e("GRAFANA_URL") and e("GRAFANA_TOKEN")), "tickets": tickets.enabled(),
+                "grafana": bool(e("GRAFANA_URL") and (e("GRAFANA_TOKEN") or e("GRAFANA_USER") and e("GRAFANA_PASSWORD"))),
+                "tickets": tickets.enabled(), "langfuse": bool(e("LANGFUSE_URL") and e("LANGFUSE_PK") and e("LANGFUSE_SK")),
                 "ai": bool(e("AI_URL") and e("AI_KEY") and e("AI_MODEL")) or bool(e("LITELLM_URL") and e("LITELLM_KEY") and e("LITELLM_MODEL"))}
 
     def cached(self, key, ttl, fn):
@@ -352,7 +354,10 @@ class Collector:
 
     def prom(self, query, at=None):
         """Instant query on Grafana's Prometheus (GET); at = epoch seconds for history, else now."""
-        g, auth = os.environ["GRAFANA_URL"].rstrip("/"), {"Authorization": "Bearer " + os.environ["GRAFANA_TOKEN"]}
+        g, tok = os.environ["GRAFANA_URL"].rstrip("/"), os.environ.get("GRAFANA_TOKEN")
+        # a token, or a normal Grafana login (basic auth works: the login form is on, no SSO)
+        auth = {"Authorization": "Bearer " + tok if tok else "Basic " + base64.b64encode(
+            (os.environ["GRAFANA_USER"] + ":" + os.environ["GRAFANA_PASSWORD"]).encode()).decode()}
         uid = os.environ.get("GRAFANA_DATASOURCE_UID") or self.meta("grafana_uid")
         if not uid:
             try:
@@ -375,6 +380,88 @@ class Collector:
                 out.setdefault(pod, []).append(float(s["value"][1]))
             return {p: sum(v) / len(v) for p, v in out.items() if p}
         return self.cached("grafana", 60, fetch) or {}
+
+    def lf(self, path, **q):
+        """GET on the AIP Langfuse public API. LiteLLM traces every call there (callbacks: langfuse)."""
+        auth = {"Authorization": "Basic " + base64.b64encode((os.environ["LANGFUSE_PK"] + ":" + os.environ["LANGFUSE_SK"]).encode()).decode()}
+        url = os.environ["LANGFUSE_URL"].rstrip("/") + path + "?" + urllib.parse.urlencode(q)
+        try:
+            return http_json("GET", url, auth, timeout=120)
+        except urllib.error.HTTPError:
+            raise
+        except urllib.error.URLError:  # flaky network: one more try
+            time.sleep(3)
+            return http_json("GET", url, auth, timeout=120)
+
+    def llm_log(self, who, frm, to):
+        """LLM requests of a user (every key alias '<user>-*') or of one key alias ('<user>-<key>') between frm and to
+        (epoch), from Langfuse: per model and level (count, tokens, p95 latency), the most common errors, the last
+        requests. Never prompts or answers. None without Langfuse."""
+        if not self.integrations()["langfuse"]:
+            return None
+        f = [{"column": "metadata", "key": "user_api_key_alias", "type": "stringObject",
+              "operator": "=" if "-" in who else "starts with", "value": who if "-" in who else who + "-"}]
+        iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+        def fetch():
+            q = {"view": "observations", "dimensions": [{"field": "providedModelName"}, {"field": "level"}], "filters": f,
+                 "metrics": [{"measure": "count", "aggregation": "count"}, {"measure": "totalTokens", "aggregation": "sum"},
+                             {"measure": "latency", "aggregation": "p95"}], "fromTimestamp": iso(frm), "toTimestamp": iso(to)}
+            models = sorted(({"model": r["providedModelName"] or "(no model)", "level": r["level"], "count": int(float(r["count_count"])),
+                              "tokens": int(float(r.get("sum_totalTokens") or 0)), "p95_ms": round(float(r.get("p95_latency") or 0))}
+                             for r in self.lf("/api/public/metrics", query=json.dumps(q))["data"]), key=lambda m: -m["count"])
+            obs = lambda **kw: self.lf("/api/public/observations", limit=50, fromStartTime=iso(frm), toStartTime=iso(to),
+                                       filter=json.dumps(f), **kw)["data"]
+            slim = lambda o: {"ts": ts(o["startTime"]), "model": o.get("model"), "level": o.get("level"), "latency_s": o.get("latency"),
+                              "tokens": (o.get("usage") or {}).get("total"), "key": (o.get("metadata") or {}).get("user_api_key_alias"),
+                              "status": tickets.mask(o.get("statusMessage"))[:300]}
+            errors = {}
+            for o in map(slim, obs(level="ERROR")):  # same message with other ids/numbers = one row
+                e = errors.setdefault(re.sub(r"[0-9a-f-]{16,}|\d{5,}", "…", o["status"][:160]), {"count": 0, "last": 0, "model": o["model"], "key": o["key"]})
+                e["count"], e["last"] = e["count"] + 1, max(e["last"], o["ts"] or 0)
+            return {"models": models, "errors": sorted(({"error": k, **v} for k, v in errors.items()), key=lambda e: -e["count"]),
+                    "recent": [slim(o) for o in obs()[:20]], "from": frm, "to": to}
+        return self.cached("lf:%s:%d:%d" % (who, frm // 300, to // 300), 300, fetch)
+
+    def usage(self):
+        """Per user, last 30 days (Prometheus history starts later: see "from"), from Grafana's Prometheus:
+        LiteLLM requests/tokens/spend/failures per key (key alias = '<user>-<key name>') and CPU core-hours,
+        GPU-hours of the user-<name> namespace. {"from": epoch, "users": {user: {...}}}; {} without Grafana."""
+        if not self.integrations()["grafana"]:
+            return {}
+
+        def fetch():
+            users = {}
+            row = lambda who: users.setdefault(who, {"requests": 0, "tokens": 0, "spend": 0, "failed": 0, "cpu_h": 0, "gpu_h": 0,
+                                                     "keys": {}, "models": {}})
+            for what, metric in (("requests", "litellm_requests_metric_total"), ("tokens", "litellm_total_tokens_metric_total"),
+                                 ("spend", "litellm_spend_metric_total"), ("failed", "litellm_proxy_failed_requests_metric_total")):
+                for s in self.prom("sum by (api_key_alias, hashed_api_key, model) (increase(%s[30d]))" % metric):
+                    m, v = s["metric"], float(s["value"][1])
+                    alias = m.get("api_key_alias") or ""
+                    if not v or "-" not in alias:  # 'None' = master key or no alias: no user to put it on
+                        continue
+                    r = row(alias.split("-", 1)[0])
+                    r[what] += v
+                    k = r["keys"].setdefault(alias, {"hash": m.get("hashed_api_key", ""), "requests": 0, "tokens": 0, "spend": 0, "failed": 0})
+                    k[what] += v
+                    if what == "requests" and m.get("model"):
+                        r["models"][m["model"]] = r["models"].get(m["model"], 0) + v
+            for what, q in (("cpu_h", 'sum by (namespace) (increase(container_cpu_usage_seconds_total{namespace=~"user-.*",container!=""}[30d])) / 3600'),
+                            ("gpu_h", 'sum by (namespace) (sum_over_time((sum by (namespace) (kube_pod_container_resource_requests'
+                                      '{resource="nvidia_com_gpu",namespace=~"user-.*"}))[30d:1h]))')):
+                for s in self.prom(q):
+                    row(s["metric"]["namespace"][5:])[what] += float(s["value"][1])
+            for r in users.values():
+                for d in [r] + list(r["keys"].values()):
+                    for f in ("requests", "tokens", "failed", "cpu_h", "gpu_h"):
+                        if f in d:
+                            d[f] = round(d[f])
+                    d["spend"] = round(d["spend"], 2)
+                r["models"] = {m: round(n) for m, n in sorted(r["models"].items(), key=lambda x: -x[1])}
+            lo = self.prom("prometheus_tsdb_lowest_timestamp_seconds")
+            return {"from": float(lo[0]["value"][1]) if lo else None, "users": users}
+        return self.cached("usage", 300, fetch) or {}
 
     def gitlab_enrich(self, change_id):
         """Author and MR of a change: commits in the 30 min before it whose diff mentions the new image tag or the name."""
@@ -1095,15 +1182,40 @@ class Collector:
                          "restarts": sum(p["restarts"] for _, p in items), "open": inc,
                          "changes_7d": chg["n"], "last_change": chg["last"],
                          "started": min((p["started"] or t for _, p in items), default=None)})
-        return rows
+        use = self.usage().get("users", {})
+        for who in sorted(set(use) - {r["user"] for r in rows}):  # API key only, nothing running
+            rows.append({"user": who, "namespaces": [], "pods": 0, "running": 0, "pending": 0, "kinds": ["API key"], "cpu_use": 0,
+                         "cpu_req": 0, "mem_use_gib": 0, "gpu": "", "restarts": 0, "open": 0, "changes_7d": 0, "last_change": None,
+                         "started": None})
+        people = self.people()
+        for r in rows:
+            r["use"] = use.get(r["user"])
+            p = next((p for p in people if r["user"] in p["users"]), None)
+            r["person"] = p and {"name": p["name"], "users": p["users"]}
+        # one person's namespaces next to each other (Avir: aviraip, aviraip2)
+        return sorted(rows, key=lambda r: (r["person"]["users"][0] if r["person"] else r["user"], r["user"]))
+
+    @staticmethod
+    def people():
+        """[{name, account, users, keys}]: real names of accounts, from the team's name list (data/people.json, not in git)."""
+        try:
+            return json.loads((DATA / "people.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
 
     def user(self, who):
-        items = self.user_pods().get(who)
-        if items is None:
+        items, use, now = self.user_pods().get(who), self.usage(), time.time()
+        if items is None and who not in use.get("users", {}):
             raise KeyError("no such user")
+        items = items or []
         ns_list = sorted({ns for ns, _ in items})
         q = ",".join("?" * len(ns_list))
         return {"user": who, "namespaces": ns_list, "pods": [dict(p, ns=ns) for ns, p in items],
+                "use": use.get("users", {}).get(who), "use_from": use.get("from"),
+                "person": next(({"name": p["name"], "users": p["users"]} for p in self.people() if who in p["users"]), None),
+                "key_people": {k: p["name"] for p in self.people() for k in p["keys"]},
+                "llm_log": self.llm_log(who, now - 7 * 86400, now), "llm_error": self.integ_err.get(
+                    "lf:%s:%d:%d" % (who, (now - 7 * 86400) // 300, now // 300)),
                 "incidents": self.rows("SELECT id, ns, obj, symptom, owner, cause, opened, closed, state FROM incidents WHERE ns IN (%s) "
                                        "ORDER BY id DESC LIMIT 50" % q, ns_list),
                 "changes": self.rows("SELECT * FROM changes WHERE ns IN (%s) ORDER BY ts DESC LIMIT 50" % q, ns_list)}
