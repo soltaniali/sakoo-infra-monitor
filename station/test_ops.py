@@ -340,3 +340,78 @@ w = next(o for o in col.inv[NS].values() if o["kind"] == "Deployment")
 assert w["state"] == "ready" and w["since"] and w["checked"], w
 assert all("since" in r and "checked" in r for r in col.infra()["results"])
 print("ok (liveness)")
+# --- tickets: parse the ticket site's pages, then answer the six questions from our data
+import tickets  # noqa: E402
+LIST = ('<tbody><tr class="unread-row"><td><a class="ticket-subject" href="/tickets/7/"><span><strong>m1 &amp; 502</strong><small>TK-7</small></span></a></td>'
+        '<td><span class="person-cell"><i>A</i>Ali</span></td><td><span class="muted">تخصیص نیافته</span></td><td>فنی</td>'
+        '<td><span class="badge status-pending">x</span></td><td><span class="priority priority-urgent"><i></i>x</span></td>'
+        '<td><time>۲۰۲۶/۱۰/۰۴ - ۰۹:۰۳</time></td><td></td></tr></tbody><a href="?page=2&q=">بعدی</a>')
+rows, more = tickets.parse_list(LIST)
+assert more and rows[0]["id"] == 7 and rows[0]["subject"] == "m1 & 502" and rows[0]["requester"] == "Ali" and rows[0]["status"] == "pending", rows
+assert rows[0]["last"] == ops.calendar.timegm((2026, 10, 4, 9, 3, 0)) - 3.5 * 3600
+when = time.strftime("%Y/%m/%d - %H:%M", time.gmtime(time.time() + 3.5 * 3600 + 120))  # after the first incident: inside our data
+PAGE = ('<p>ایجادشده توسط <strong>Ali</strong> در %s</p><article class="message message-user"><header><strong>Ali</strong><small>x</small>'
+        '<time>%s</time></header><div class="message-body">model m1 gives 502 error<br>base_url = https://mlopsapipilot.aipsharif.ir/v1<br>'
+        'token = sk-TESTkey0000fake1234</div></article>') % (when, when)
+d = tickets.parse_ticket(PAGE)
+assert d["secret_posted"] and "sk-TESTkey" not in d["messages"][0]["text"] and "\n" in d["messages"][0]["text"], d
+K[NS]["models"] = [model("m1", ready=0)]
+K[NS]["pods"] = [pod("m1-abc-1", "m1", ready=False)]
+col.run_round(); col.run_round()
+a = tickets.analyze(col, dict(rows[0], **d))
+assert a["q1"]["status"] == "bad" and "rotate" in a["q1"]["answer"] and "no one assigned" in a["q1"]["answer"], a["q1"]
+assert a["q4"]["models"][0]["name"] == "m1" and "mlopsapipilot.aipsharif.ir" in a["q4"]["answer"], a["q4"]
+assert a["q5"]["incidents"] and a["q5"]["status"] == "bad" and a["q6"]["answer"] == "LLM inference", (a["q5"], a["q6"])
+assert a["q3"]["pods"][0]["pod"] == "m1-abc-1" and a["q2"]["model_pods"][0]["pod"] == "m1-abc-1"
+assert any(i["when"] == "active" and i["obj"] == "m1" for i in a["q5"]["incidents"]) and "open on what the user uses" in a["q5"]["answer"], a["q5"]
+assert d["key_hashes"] == [ops.hashlib.sha256(b"sk-TESTkey0000fake1234").hexdigest()]
+# exact time: an incident that closed 3 h before the user wrote is not matched; one that ended 30 min before is "near"
+i0 = {"opened": 1000.0, "closed": 2000.0}
+assert tickets.when_vs(i0, [2000.0 + 3 * 3600]) is None and tickets.when_vs(i0, [1500.0]) == ("active", 1500.0)
+assert tickets.when_vs(i0, [2000.0 + 1800]) == ("ended 30 min before", 3800.0)
+assert tickets.when_vs({"opened": 5000.0, "closed": None}, [5000.0 - 600]) == ("started 10 min after", 4400.0)
+old = dict(rows[0], **dict(d, created=time.time() - 400 * 86400))
+old["messages"] = [dict(d["messages"][0], ts=old["created"])]
+assert tickets.analyze(col, old)["q5"]["answer"].startswith("no data"), tickets.analyze(col, old)["q5"]
+# key usage from LiteLLM's Prometheus counters (Grafana)
+col.prom = lambda q, at=None: [{"metric": {"__name__": "litellm_requests_metric_total", "model": "m1"}, "value": [0, "12"]},
+                               {"metric": {"__name__": "litellm_total_tokens_metric_total", "model": "m1"}, "value": [0, "3400"]}]
+os.environ.update(GRAFANA_URL="https://g", GRAFANA_TOKEN="t")
+q4 = tickets.analyze(col, dict(rows[0], **d))["q4"]
+assert q4["answer"] == "12 requests, 3400 tokens in 30 days" and q4["locked"] is None, q4
+for k in ("GRAFANA_URL", "GRAFANA_TOKEN"):
+    os.environ.pop(k)
+
+
+class FakeSite:
+    opened = []
+    def __init__(self, *a): pass
+    def login(self): pass
+    def tickets(self): return rows
+    def ticket(self, tid): FakeSite.opened.append(tid); return d
+
+
+tickets.Site = FakeSite
+os.environ.update(TICKETS_URL="https://t", TICKETS_USER="u", TICKETS_PASSWORD="p")
+tickets.sync(col); tickets.sync(col)
+assert FakeSite.opened == [7], FakeSite.opened   # unchanged ticket is not opened again (opening marks it read)
+lst = col.tickets()
+assert lst["enabled"] and lst["tickets"][0]["answers"]["q1"]["status"] == "bad" and col.ticket(7)["answers"]["q5"]["incidents"]
+assert "sk-TESTkey" not in json.dumps(col.ticket(7))
+seen = []
+def fake_ai(m, url, h=None, body=None, timeout=30):
+    seen.append((url, body["model"]))
+    if body["model"] == "busy":
+        raise ops.urllib.error.HTTPError(url, 429, "Too Many Requests", {}, None)
+    return {"choices": [{"message": {"content":
+    'x {"filed_ok": false, "missing": ["time"], "purpose": "LLM inference", "summary": "m1 502"} y'}}]}
+
+
+ops.http_json = fake_ai
+os.environ.update(AI_URL="https://free/v1", AI_KEY="k", AI_MODEL="busy, free-model")
+tickets.sync(col)   # unchanged ticket, no AI answer yet: ask now, without opening the page again
+assert FakeSite.opened == [7] and [m for _, m in seen] == ["busy", "free-model"], seen
+assert "AI: missing time" in col.ticket(7)["answers"]["q1"]["answer"] and col.ticket(7)["answers"]["q1"]["ai"] == "m1 502"
+for k in ("TICKETS_URL", "TICKETS_USER", "TICKETS_PASSWORD", "AI_URL", "AI_KEY", "AI_MODEL"):
+    os.environ.pop(k)
+print("ok (tickets)")

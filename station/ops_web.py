@@ -157,6 +157,10 @@ class Handler(BaseHTTPRequestHandler):
             return COL.users()
         if what == "user":
             return COL.user(name(q, "name"))
+        if what == "tickets":
+            return COL.tickets()
+        if what == "ticket":
+            return COL.ticket(int(q["id"]))
         if what == "capacity":
             return COL.capacity()
         if what == "trends":
@@ -222,8 +226,8 @@ class Handler(BaseHTTPRequestHandler):
         return self.send(200, {"user": user}, extra=[("Set-Cookie", cookie)])
 
     def summarize(self, b, user):
-        if not COL.integrations()["litellm"]:
-            raise BadRequest("log summaries are off: set LITELLM_URL, LITELLM_KEY and LITELLM_MODEL")
+        if not COL.integrations()["ai"]:
+            raise BadRequest("summaries are off: set AI_URL, AI_KEY and AI_MODEL (or LITELLM_*)")
         if "incident" in b:
             text = COL.incident_text(int(b["incident"]))
         else:
@@ -295,6 +299,11 @@ def check_cli():
     if on["litellm"]:
         names = col.litellm_models()
         print("litellm  OK  %d models" % len(names) if names is not None else "litellm  FAIL %s" % col.integ_err.get("litellm"))
+    if on["ai"]:
+        try:
+            print("ai       OK  %s answers: %s" % (os.environ.get("AI_MODEL") or os.environ.get("LITELLM_MODEL"), col.llm("Say OK.", max_tokens=5)[:40]))
+        except Exception as e:
+            print("ai       FAIL %s" % ops.probe.err(e))
 
 
 def main():

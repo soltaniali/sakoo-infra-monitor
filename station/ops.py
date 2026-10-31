@@ -6,9 +6,12 @@ them into incidents with cause, owner, evidence and a suggested fix. Humans do t
 Rounds: every ROUND_S our namespace; every SLOW_EVERY rounds all readable namespaces and our pods' logs.
 Data: SQLite $OPS_DATA/ops.db (default /data). Probe results: $PROBE_RESULTS (written by probe.py on this station).
 Optional integrations, each on when its env is set (secrets/ops.env):
-  LITELLM_URL (…/v1), LITELLM_KEY, LITELLM_MODEL     log and incident summaries, "registered in litellm?" for models
+  LITELLM_URL (…/v1), LITELLM_KEY, LITELLM_MODEL     model test calls, "registered in litellm?" for models
+  AI_URL (…/v1), AI_KEY, AI_MODEL                     any OpenAI-compatible LLM (free tier: Mistral, OpenRouter, ...) for log,
+                                                       incident and ticket summaries; without it the LITELLM_* model is used
   GITLAB_URL, GITLAB_TOKEN, GITLAB_PROJECTS            author and MR of a change (comma-separated project paths)
   GRAFANA_URL, GRAFANA_TOKEN [, GRAFANA_DATASOURCE_UID] GPU % per model pod (DCGM_FI_DEV_GPU_UTIL)
+  TICKETS_URL, TICKETS_USER, TICKETS_PASSWORD           support tickets, each checked against our data (tickets.py)
 Alerts: one Telegram message per round, through the London receiver's POST /alert (HMAC with PROBE_KEY).
 """
 import calendar
@@ -29,6 +32,7 @@ import urllib.request
 from pathlib import Path
 
 import probe
+import tickets
 
 OUR_NS = os.environ.get("OPS_OUR_NS", "aip-mlops-service")
 DATA = Path(os.environ.get("OPS_DATA", "/data"))
@@ -86,6 +90,7 @@ CREATE TABLE IF NOT EXISTS signatures (sig TEXT PRIMARY KEY, ns TEXT, workload T
 CREATE TABLE IF NOT EXISTS restarts (day TEXT, ns TEXT, wl TEXT, first INTEGER, last INTEGER, PRIMARY KEY (day, ns, wl));
 CREATE TABLE IF NOT EXISTS state_since (key TEXT PRIMARY KEY, state TEXT, since REAL);
 CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY, ts REAL, text TEXT, sent REAL);
+CREATE TABLE IF NOT EXISTS tickets (id INTEGER PRIMARY KEY, sig TEXT, data TEXT, fetched REAL, seen REAL, ai TEXT);
 CREATE INDEX IF NOT EXISTS changes_ts ON changes (ts);
 CREATE INDEX IF NOT EXISTS incidents_state ON incidents (state, scope);
 """
@@ -273,7 +278,7 @@ class Collector:
         self.integ_err, self.cache = {}, {}
         self.model_tests, self.test_fails = {}, {}  # model -> {ok, ms, detail, ts, route}
         self.states = {r["key"]: (r["state"], r["since"]) for r in self.rows("SELECT * FROM state_since")}  # liveness
-        self.bg = queue.Queue()
+        self.bg, self.tickets_busy = queue.Queue(), False
         threading.Thread(target=self._bg_loop, daemon=True).start()
 
     # --- database helpers -----------------------------------------------------------------------------------------
@@ -304,7 +309,8 @@ class Collector:
         e = os.environ.get
         return {"litellm": bool(e("LITELLM_URL") and e("LITELLM_KEY") and e("LITELLM_MODEL")),
                 "gitlab": bool(e("GITLAB_URL") and e("GITLAB_TOKEN") and e("GITLAB_PROJECTS")),
-                "grafana": bool(e("GRAFANA_URL") and e("GRAFANA_TOKEN"))}
+                "grafana": bool(e("GRAFANA_URL") and e("GRAFANA_TOKEN")), "tickets": tickets.enabled(),
+                "ai": bool(e("AI_URL") and e("AI_KEY") and e("AI_MODEL")) or bool(e("LITELLM_URL") and e("LITELLM_KEY") and e("LITELLM_MODEL"))}
 
     def cached(self, key, ttl, fn):
         hit = self.cache.get(key)
@@ -319,37 +325,52 @@ class Collector:
         self.cache[key] = (time.time(), val)
         return val
 
-    def llm(self, text):
-        url = os.environ["LITELLM_URL"].rstrip("/") + "/chat/completions"
-        r = http_json("POST", url, {"Authorization": "Bearer " + os.environ["LITELLM_KEY"]}, {
-            "model": os.environ["LITELLM_MODEL"], "temperature": 0.2, "max_tokens": 350, "messages": [
-                {"role": "system", "content": "You help the on-call MLOps engineer of AIP, a Kubernetes AI platform. Reply in at most "
-                                              "5 short sentences, plain text: what failed, the most likely cause, the next step."},
-                {"role": "user", "content": text[-6000:]}]}, timeout=120)
-        return r["choices"][0]["message"]["content"].strip()
+    def llm(self, text, system=None, max_tokens=350):
+        p = "AI_" if os.environ.get("AI_URL") and os.environ.get("AI_KEY") and os.environ.get("AI_MODEL") else "LITELLM_"
+        url = os.environ[p + "URL"].rstrip("/") + "/chat/completions"
+        models = [m.strip() for m in os.environ[p + "MODEL"].split(",") if m.strip()]
+        for i, model in enumerate(models):  # free tiers: a model can be rate-limited or not in the tier; then try the next one
+            try:
+                body = {"model": model, "temperature": 0.2, "max_tokens": max_tokens, "messages": [
+                    {"role": "system", "content": system or "You help the on-call MLOps engineer of AIP, a Kubernetes AI platform. Reply "
+                                                            "in at most 5 short sentences, plain text: what failed, the most likely cause, the next step."},
+                    {"role": "user", "content": text[-6000:]}]}
+                r = http_json("POST", url, {"Authorization": "Bearer " + os.environ[p + "KEY"]}, body, timeout=120)
+                return r["choices"][0]["message"]["content"].strip()
+            except urllib.error.HTTPError as e:
+                if e.code not in (403, 404, 429) or i == len(models) - 1:
+                    raise
+            except urllib.error.URLError:  # the host's DNS fails now and then: one more try, same model
+                time.sleep(5)
+                r = http_json("POST", url, {"Authorization": "Bearer " + os.environ[p + "KEY"]}, body, timeout=120)
+                return r["choices"][0]["message"]["content"].strip()
 
     def litellm_models(self):
         url = os.environ["LITELLM_URL"].rstrip("/") + "/models"
         return self.cached("litellm", 300, lambda: [m["id"] for m in http_json(
             "GET", url, {"Authorization": "Bearer " + os.environ["LITELLM_KEY"]})["data"]])
 
+    def prom(self, query, at=None):
+        """Instant query on Grafana's Prometheus (GET); at = epoch seconds for history, else now."""
+        g, auth = os.environ["GRAFANA_URL"].rstrip("/"), {"Authorization": "Bearer " + os.environ["GRAFANA_TOKEN"]}
+        uid = os.environ.get("GRAFANA_DATASOURCE_UID") or self.meta("grafana_uid")
+        if not uid:
+            try:
+                ds = http_json("GET", g + "/api/datasources", auth)
+            except urllib.error.HTTPError as e:
+                if e.code != 403:
+                    raise
+                ds = list(http_json("GET", g + "/api/frontend/settings", auth)["datasources"].values())  # Viewer tokens
+            uid = next(d["uid"] for d in ds if d.get("type") == "prometheus")
+            self.set_meta("grafana_uid", uid)
+        q = "query=" + urllib.parse.quote(query) + ("&time=%d" % at if at else "")
+        return http_json("GET", "%s/api/datasources/proxy/uid/%s/api/v1/query?%s" % (g, uid, q), auth)["data"]["result"]
+
     def gpu_util(self):
         """{pod name: GPU utilization %} from Grafana's Prometheus (DCGM exporter)."""
         def fetch():
-            g, auth = os.environ["GRAFANA_URL"].rstrip("/"), {"Authorization": "Bearer " + os.environ["GRAFANA_TOKEN"]}
-            uid = os.environ.get("GRAFANA_DATASOURCE_UID")
-            if not uid:
-                try:
-                    ds = http_json("GET", g + "/api/datasources", auth)
-                except urllib.error.HTTPError as e:
-                    if e.code != 403:
-                        raise
-                    ds = list(http_json("GET", g + "/api/frontend/settings", auth)["datasources"].values())  # Viewer tokens
-                uid = next(d["uid"] for d in ds if d.get("type") == "prometheus")
-            q = urllib.parse.quote("DCGM_FI_DEV_GPU_UTIL")
-            res = http_json("GET", "%s/api/datasources/proxy/uid/%s/api/v1/query?query=%s" % (g, uid, q), auth)["data"]["result"]
             out = {}
-            for s in res:
+            for s in self.prom("DCGM_FI_DEV_GPU_UTIL"):
                 pod = s["metric"].get("exported_pod") or s["metric"].get("pod")
                 out.setdefault(pod, []).append(float(s["value"][1]))
             return {p: sum(v) / len(v) for p, v in out.items() if p}
@@ -389,6 +410,11 @@ class Collector:
                     self.gitlab_enrich(arg)
                 elif kind == "litellm":
                     self.exec("UPDATE incidents SET summary=? WHERE id=?", (self.llm(self.incident_text(arg)), arg))
+                elif kind == "tickets":
+                    try:
+                        tickets.sync(self)
+                    finally:
+                        self.tickets_busy = False
                 self.integ_err.pop(kind, None)
             except Exception as e:
                 self.integ_err[kind] = probe.err(e)
@@ -464,6 +490,9 @@ class Collector:
                 step(t)
             except Exception as e:
                 errors.append("%s: %s" % (step.__name__, probe.err(e)))
+        if tickets.enabled() and not self.tickets_busy and t - float(self.meta("tickets_synced") or 0) > tickets.SYNC_S:
+            self.tickets_busy = True
+            self.bg.put(("tickets", None))
         self.flush_alerts()
         if t - float(self.meta("pruned") or 0) > 86400:
             self.prune(t)
@@ -852,7 +881,7 @@ class Collector:
             self.alerts.append("%s OPEN #%d %s · %s/%s · %s\n%s\nCause: %s\nFix: %s%s" % (
                 icon, iid, symptom, ns, obj, who, detail[:200], d["cause"][:300], d["fix"][:300],
                 "\n%s#/incident?id=%d" % (OPS_URL, iid) if OPS_URL else ""))
-        if self.integrations()["litellm"]:
+        if self.integrations()["ai"]:
             self.bg.put(("litellm", iid))
         return iid
 
@@ -1078,6 +1107,24 @@ class Collector:
                 "incidents": self.rows("SELECT id, ns, obj, symptom, owner, cause, opened, closed, state FROM incidents WHERE ns IN (%s) "
                                        "ORDER BY id DESC LIMIT 50" % q, ns_list),
                 "changes": self.rows("SELECT * FROM changes WHERE ns IN (%s) ORDER BY ts DESC LIMIT 50" % q, ns_list)}
+
+    def tickets(self):
+        """Support tickets, newest activity first, each with the six answers (computed now, against current data)."""
+        out = []
+        for r in self.rows("SELECT * FROM tickets ORDER BY id DESC"):
+            d, ai = json.loads(r["data"]), json.loads(r["ai"]) if r["ai"] else None
+            a = tickets.analyze(self, d, ai)
+            out.append({k: d.get(k) for k in ("id", "number", "subject", "requester", "assignee", "category", "status", "priority", "last", "created")}
+                       | {"fetched": r["fetched"], "seen": r["seen"], "answers": {k: {"status": v["status"], "answer": v["answer"]} for k, v in a.items()}})
+        return {"tickets": sorted(out, key=lambda x: -(x["last"] or 0)), "synced": float(self.meta("tickets_synced") or 0) or None,
+                "enabled": tickets.enabled(), "error": self.integ_err.get("tickets"), "ai": self.integrations()["ai"]}
+
+    def ticket(self, tid):
+        r = self.one("SELECT * FROM tickets WHERE id=?", (tid,))
+        if not r:
+            raise KeyError("no ticket %s" % tid)
+        d, ai = json.loads(r["data"]), json.loads(r["ai"]) if r["ai"] else None
+        return dict(d, fetched=r["fetched"], seen=r["seen"], ai=ai, answers=tickets.analyze(self, d, ai))
 
     def capacity(self):
         """Per namespace: CPU/RAM used vs requested, GPUs held. Pods near their memory limit, idle pods that hold resources."""

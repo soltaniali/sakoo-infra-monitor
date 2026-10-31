@@ -61,9 +61,9 @@ function showLogin(msg) {
 }
 
 const TABS = [['overview', 'Overview'], ['incidents', 'Incidents'], ['changes', 'Changes'], ['models', 'Models'],
-  ['services', 'Services'], ['logs', 'Logs'], ['infra', 'Infra or us'], ['users', 'Users'], ['capacity', 'Capacity'], ['trends', 'Trends']];
+  ['services', 'Services'], ['logs', 'Logs'], ['infra', 'Infra or us'], ['users', 'Users'], ['tickets', 'Tickets'], ['capacity', 'Capacity'], ['trends', 'Trends']];
 function nav(page) {
-  document.getElementById('tabs').replaceChildren(...TABS.map(([k, t]) => h('a', {href: '#/' + k, class: page === k || (page === 'incident' && k === 'incidents') ? 'on' : ''}, t)));
+  document.getElementById('tabs').replaceChildren(...TABS.map(([k, t]) => h('a', {href: '#/' + k, class: page === k || (page === 'incident' && k === 'incidents') || (page === 'ticket' && k === 'tickets') ? 'on' : ''}, t)));
   document.getElementById('who').replaceChildren(me.user + ' · ', h('a', {href: '#', onclick: async ev => { ev.preventDefault(); await post('/api/logout', {}); showLogin(); }}, 'log out'));
 }
 function route() {
@@ -120,8 +120,8 @@ const VIEWS = {};
 VIEWS.overview = async () => {
   const s = await api('/api/state');
   const st = s.status || {}, ig = s.integrations || {};
-  const chips = ['litellm', 'gitlab', 'grafana'].map(k => h('span', {class: 'chip ' + (ig[k] ? (ig.errors[k] ? 'warn' : 'ok') : ''),
-    title: ig.errors[k] || (ig[k] ? 'on' : 'off: set its env in secrets/ops.env')}, {litellm: 'log summaries', gitlab: 'who changed it', grafana: 'GPU %'}[k]));
+  const chips = ['ai', 'litellm', 'gitlab', 'grafana', 'tickets'].map(k => h('span', {class: 'chip ' + (ig[k] ? (ig.errors[k] ? 'warn' : 'ok') : ''),
+    title: ig.errors[k] || (ig[k] ? 'on' : 'off: set its env in secrets/ops.env')}, {ai: 'AI summaries', litellm: 'model test calls', gitlab: 'who changed it', grafana: 'GPU %', tickets: 'ticket site'}[k]));
   return h('div', {},
     h('div', {class: 'row mut small'}, 'Last round ' + ago(st.last) + (st.took != null ? ' (' + st.took + ' s)' : '') + ' · ' +
       (st.namespaces || 0) + ' namespaces read · full read ' + ago(st.slow_last) + ' · probe report ' + ago(s.probe_ts), ' ', chips,
@@ -161,7 +161,7 @@ VIEWS.incident = async q => {
     h('p', {}, h('a', {href: '#/incidents'}, '← incidents')),
     h('h1', {}, '#' + i.id + ' ' + (SYM[i.symptom] || i.symptom) + ' · ' + (i.ns === '-' ? '' : i.ns + ' / ') + i.obj),
     h('div', {class: 'card kv'}, kv.flatMap(([k, v]) => [h('div', {}, k), h('div', {}, v)])),
-    h('h2', {}, 'Summary'), h('div', {class: 'card'}, sum, me.integrations.litellm ? h('button', {onclick: async e => {
+    h('h2', {}, 'Summary'), h('div', {class: 'card'}, sum, me.integrations.ai ? h('button', {onclick: async e => {
       e.target.disabled = true; e.target.textContent = 'Asking the LLM…';
       try { sum.replaceChildren(h('pre', {}, (await post('/api/summarize', {incident: i.id})).summary)); } catch (x) { sum.replaceChildren(h('span', {class: 'err'}, x.message)); }
       e.target.disabled = false; e.target.textContent = 'Summarize again';
@@ -255,7 +255,7 @@ VIEWS.logs = async q => {
       h('select', {onchange: e => go({container: e.target.value})}, (p ? p.containers : []).map(c => h('option', {value: c, selected: c === container}, c))),
       h('label', {}, 'lines ', tail), h('label', {}, prev, ' previous container'), h('label', {}, only, ' errors only'),
       h('button', {class: 'primary', onclick: load}, 'Load'),
-      me.integrations.litellm ? h('button', {onclick: async e => {
+      me.integrations.ai ? h('button', {onclick: async e => {
         e.target.disabled = true; sum.replaceChildren(h('span', {class: 'mut'}, 'Asking the LLM…'));
         try { sum.replaceChildren(h('div', {class: 'card'}, h('pre', {}, (await post('/api/summarize', {ns, pod, container, previous: prev.checked})).summary))); }
         catch (x) { sum.replaceChildren(h('span', {class: 'err'}, x.message)); }
@@ -310,6 +310,70 @@ VIEWS.user = async q => {
     h('h2', {}, 'Changes'), h('div', {class: 'card'}, changeTable(u.changes.map(c => Object.assign(c, {info: JSON.parse(c.info || '{}')})))),
     h('h2', {class: 'locked-title'}, 'Activity · not visible yet'),
     h('div', {class: 'locked-grid'}, LOCKED_USER.map(lockedCard)));
+};
+
+// --- support tickets: six questions per ticket, answered from our data ------------------------------------------------
+const TQ = [['q1', '1 · Filed correctly?'], ['q2', '2 · How used · logs'], ['q3', '3 · Infra used'], ['q4', '4 · Services used'],
+  ['q5', '5 · Down / problems then'], ['q6', '6 · Used for']];
+const TSTATUS = {open: 'open', pending: 'waiting for staff', answered: 'answered', closed: 'closed'};
+const qChip = a => h('span', {class: 'chip ' + ({ok: 'ok', bad: 'bad', warn: 'warn'}[a.status] || '')}, a.answer);
+// list view: short chip, full answer on hover (the detail page shows everything)
+const shortChip = (k, a) => {
+  const n = a.answer.split('; ').length;
+  const label = k === 'q1' ? (a.status === 'ok' ? 'complete' : n + (n === 1 ? ' issue' : ' issues'))
+    : a.answer.length > 22 ? a.answer.slice(0, 20) + '…' : a.answer;
+  return h('span', {class: 'chip ' + ({ok: 'ok', bad: 'bad', warn: 'warn'}[a.status] || ''), title: a.answer}, label);
+};
+const lockedNote = why => !why ? '' : h('div', {class: 'small locked-cell', title: 'Needs ' + why}, 'The user\'s own part: not visible yet. Needs ' + why);
+
+VIEWS.tickets = async () => {
+  const r = await api('/api/tickets');
+  if (!r.enabled) return h('div', {}, h('h1', {}, 'Tickets'), h('div', {class: 'card locked'}, h('b', {}, 'Ticket site not connected'),
+    h('div', {class: 'small'}, 'Set TICKETS_URL, TICKETS_USER and TICKETS_PASSWORD on the station: ssh -t AIP-IRAN sh station/set-ticket-login.sh')));
+  return h('div', {}, h('h1', {}, 'Tickets · ' + r.tickets.length),
+    h('p', {class: 'mut'}, 'Read from the ticket site every 10 min (', live('synced', null, r.synced), '). Each ticket is checked against our monitoring at the time it was filed. ',
+      r.ai ? 'AI check: on.' : 'AI check: off (set AI_URL, AI_KEY, AI_MODEL: sh station/set-ai-key.sh).'),
+    r.error ? h('div', {class: 'card err small'}, 'Last sync failed: ' + r.error) : '',
+    h('div', {class: 'card'}, table([
+      ['Ticket', t => h('div', {style: 'max-width:260px'}, h('b', {dir: 'auto'}, t.subject), h('div', {class: 'small mut'}, t.number + ' · ' + t.requester))],
+      ['Status', t => [TSTATUS[t.status] || t.status, h('div', {class: 'small mut'}, t.priority + ' · ' + ago(t.last))]],
+      ...TQ.map(([k, title]) => [title, t => shortChip(k, t.answers[k])])], r.tickets, t => { location.hash = '#/ticket?id=' + t.id; })));
+};
+
+// incidents next to a ticket: open at the moment the user wrote, or how close before/after it
+const whenTable = rows => table([['#', r => r.id], ['When vs ticket', r => h('span', {class: r.when === 'active' ? 'err' : 'mut'},
+  r.when === 'active' ? 'open at ' + fmt(r.at) : r.when)], ['What', r => SYM[r.symptom] || r.symptom], ['Where', r => r.ns + ' / ' + r.obj],
+  ['Owner', r => OWNER(r.owner)], ['Opened → closed', r => fmt(r.opened) + ' → ' + (r.closed ? fmt(r.closed) : 'open')]],
+  rows, r => { location.hash = '#/incident?id=' + r.id; });
+
+VIEWS.ticket = async q => {
+  const t = await api('/api/ticket?' + qs({id: q.id})), a = t.answers;
+  return h('div', {}, h('p', {}, h('a', {href: '#/tickets'}, '← tickets')), h('h1', {}, t.subject),
+    h('p', {class: 'mut'}, t.number + ' · ' + t.requester + ' · ' + (TSTATUS[t.status] || t.status) + ' · ' + t.priority + ' · filed ' + fmt(t.created) +
+      ' · assigned: ' + (t.assignee || '–') + ' · read ' + ago(t.seen)),
+    h('h2', {}, TQ[0][1]), h('div', {class: 'card'}, h('ul', {}, a.q1.answer.split('; ').map(x => h('li', {class: a.q1.status === 'ok' ? '' : 'err'}, x))), h('p', {}, a.q1.check), a.q1.ai ? h('p', {class: 'small'}, 'AI: ' + a.q1.ai) : ''),
+    h('h2', {}, TQ[1][1]), h('div', {class: 'card'}, qChip(a.q2),
+      a.q2.model_pods.length ? h('p', {}, 'Logs of the model pods: ', a.q2.model_pods.map(p => [h('a', {href: '#/logs?' + qs(p)}, p.pod), ' '])) : '',
+      lockedNote(a.q2.locked)),
+    h('h2', {}, TQ[2][1]), h('div', {class: 'card'}, qChip(a.q3),
+      a.q3.pods.length ? table([['Model', p => p.model], ['Pod', p => p.pod], ['Ready', p => live(p.ready ? 'ready' : 'not ready', p.since, null, !p.ready)],
+        ['GPU', p => p.gpu], ['CPU now', p => p.cpu_use == null ? '–' : p.cpu_use.toFixed(2)], ['Node', p => p.node]], a.q3.pods) : '',
+      lockedNote(a.q3.locked)),
+    h('h2', {}, TQ[3][1]), h('div', {class: 'card'}, qChip(a.q4), h('p', {class: 'small'}, 'Named in the ticket: ' + a.q4.named),
+      a.q4.usage.length ? table([['Period', u => u.period], ['Model', u => u.model], ['What', u => u.metric], ['Amount', u => u.value],
+        ['Key', u => h('span', {class: 'small mut'}, 'sha256 ' + u.key + '…')]], a.q4.usage) : '',
+      a.q4.models.length ? table([['Model', m => m.name], ['Namespace', m => m.ns], ['Match', m => m.exact ? 'name' : 'family'],
+        ['Now', m => live(m.state || '–', m.since, m.checked, m.state !== 'ready')]], a.q4.models) : '',
+      lockedNote(a.q4.locked)),
+    h('h2', {}, TQ[4][1]), h('div', {class: 'card'}, qChip(a.q5),
+      h('p', {class: 'small mut'}, 'Matched at the moments the user wrote: ' + a.q5.moments.map(fmt).join(', ') +
+        ' · our data starts ' + fmt(a.q5.data_from) +
+        (a.q5.first_answer_h != null ? ' · first staff answer after ' + a.q5.first_answer_h + ' h' : ' · no staff answer yet')),
+      h('b', {}, 'On what the user uses'), whenTable(a.q5.incidents), h('b', {}, 'Platform-wide (ours or infra)'), whenTable(a.q5.platform)),
+    h('h2', {}, TQ[5][1]), h('div', {class: 'card'}, qChip(a.q6)),
+    h('h2', {}, 'Conversation · ' + t.messages.length), h('div', {class: 'card'}, t.messages.map(m =>
+      h('div', {style: 'margin-bottom:12px'}, h('div', {class: 'small mut'}, m.name + ' · ' + m.role + ' · ' + fmt(m.ts)),
+        h('div', {dir: 'auto', style: 'white-space:pre-wrap'}, m.text)))));
 };
 
 VIEWS.capacity = async () => {

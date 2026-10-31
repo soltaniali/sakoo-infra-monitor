@@ -20,6 +20,7 @@ services:
       - ./ops_web.py:/app/ops_web.py:ro
       - ./ops.html:/app/ops.html:ro
       - ./ops.js:/app/ops.js:ro
+      - ./tickets.py:/app/tickets.py:ro
     extra_hosts:                  # internal names, not in public DNS; reached through the cluster VPN (tun0)
       - "gitprod.aip.sharif.ir:172.30.153.10"
       - "monitoringprod.aip.sharif.ir:172.30.153.10"
