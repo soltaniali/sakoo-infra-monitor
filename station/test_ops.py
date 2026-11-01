@@ -1,5 +1,6 @@
 """Self-check for the ops collector and its web API, against a fake Kubernetes API. Run: python3 station/test_ops.py
 (station/probe.py must be the build copy of k8s/probe.py.)"""
+import io
 import json
 import os
 import sys
@@ -490,6 +491,22 @@ class FakeSite:
     def ticket(self, tid): FakeSite.opened.append(tid); return d
 
 
+# the site's own 500 (a Django debug page): only the error's first line reaches the dashboard, and the sync is not marked done
+class DownSite(FakeSite):
+    def login(self):
+        page = b'<title>OperationalError</title><pre class="exception_value">connection failed: database is in recovery mode\nSECRET_LINE</pre>'
+        raise urllib.error.HTTPError("https://t/login/", 500, "err", {}, io.BytesIO(page))
+
+
+tickets.Site = DownSite
+os.environ.update(TICKETS_URL="https://t", TICKETS_USER="u", TICKETS_PASSWORD="p")
+col.set_meta("tickets_synced", "0")
+try:
+    tickets.sync(col)
+    raise AssertionError("sync should fail")
+except RuntimeError as e:
+    assert "HTTP 500 (connection failed: database is in recovery mode)" in str(e) and "SECRET_LINE" not in str(e), e
+assert not float(col.meta("tickets_synced") or 0)
 tickets.Site = FakeSite
 os.environ.update(TICKETS_URL="https://t", TICKETS_USER="u", TICKETS_PASSWORD="p")
 tickets.sync(col); tickets.sync(col)

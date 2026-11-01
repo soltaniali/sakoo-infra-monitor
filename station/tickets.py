@@ -9,6 +9,7 @@ at that time, 6 what for (fine-tune, LLM inference, ...). Answers that need acce
 import calendar
 import hashlib
 import html
+import http.client
 import http.cookiejar
 import json
 import os
@@ -187,9 +188,28 @@ def enabled():
     return bool(e("TICKETS_URL") and e("TICKETS_USER") and e("TICKETS_PASSWORD"))
 
 
+def site_error(e):
+    """Text for a failed request to the ticket site. Its error pages are Django debug pages: keep the error's first line, never the page."""
+    try:
+        body = e.read()
+    except http.client.IncompleteRead as x:
+        body = x.partial
+    m = re.search(r'class="exception_value">(.*?)</pre>', body.decode("utf-8", "replace"), re.S)
+    why = html.unescape(m.group(1)).strip().splitlines()[0][:160] if m else ""
+    return "the ticket site itself answered HTTP %d%s. The problem is on that site; the page shows the last synced data" % (
+        e.code, " (%s)" % mask(why) if why else "")
+
+
 def sync(col):
     """Read the list; open only new or changed tickets; ask the LLM once per changed ticket. Runs on the collector's
     background thread."""
+    try:
+        read_site(col)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(site_error(e)) from e
+
+
+def read_site(col):
     site = Site(os.environ["TICKETS_URL"], os.environ["TICKETS_USER"], os.environ["TICKETS_PASSWORD"])
     site.login()
     t = time.time()

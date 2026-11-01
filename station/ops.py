@@ -291,7 +291,7 @@ class Collector:
         self.integ_err, self.cache = {}, {}
         self.model_tests, self.test_fails = {}, {}  # model -> {ok, ms, detail, ts, route}
         self.states = {r["key"]: (r["state"], r["since"]) for r in self.rows("SELECT * FROM state_since")}  # liveness
-        self.bg, self.tickets_busy = queue.Queue(), False
+        self.bg, self.tickets_busy, self.tickets_tried = queue.Queue(), False, 0
         threading.Thread(target=self._bg_loop, daemon=True).start()
 
     # --- database helpers -----------------------------------------------------------------------------------------
@@ -670,8 +670,9 @@ class Collector:
                 step(t)
             except Exception as e:
                 errors.append("%s: %s" % (step.__name__, probe.err(e)))
-        if tickets.enabled() and not self.tickets_busy and t - float(self.meta("tickets_synced") or 0) > tickets.SYNC_S:
-            self.tickets_busy = True
+        # tried, not only synced: while the site is down, one login every SYNC_S and not one per round
+        if tickets.enabled() and not self.tickets_busy and t - max(float(self.meta("tickets_synced") or 0), self.tickets_tried) > tickets.SYNC_S:
+            self.tickets_busy, self.tickets_tried = True, t
             self.bg.put(("tickets", None))
         self.flush_alerts()
         if t - float(self.meta("pruned") or 0) > 86400:
