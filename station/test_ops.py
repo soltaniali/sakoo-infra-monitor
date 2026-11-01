@@ -410,7 +410,7 @@ assert a["q3"]["user"] == "uni" and a["q4"]["answer"].startswith("5 requests") a
 # the team's name list: real names, one person with several accounts, ticket requester matched by name
 (ops.DATA / "people.json").write_text(json.dumps([{"name": "دانشگاه دانشکده نمونه", "account": None, "users": [], "keys": ["uni-k2"]},
                                                   {"name": "Uni Co", "account": "uni", "users": ["uni", "uni2"], "keys": []}]), encoding="utf-8")
-assert next(r for r in col.users() if r["user"] == "uni")["person"] == {"name": "Uni Co", "users": ["uni", "uni2"]}
+assert next(r for r in col.users() if r["user"] == "uni")["person"] == {"name": "Uni Co", "users": ["uni", "uni2"], "remove": False}
 assert col.user("uni")["key_people"] == {"uni-k2": "دانشگاه دانشکده نمونه"}
 a = tickets.analyze(col, dict(rows[0], **dict(d, key_hashes=[], requester="کاربر نمونه - دانشکده نمونه")))
 assert a["q3"]["user_found"] == "name list" and a["q4"]["usage"][0]["key"] == "uni-k2", a["q4"]
@@ -431,11 +431,52 @@ assert seen[0][0]["operator"] == "=" and seen[0][0]["value"] == "uni-k2", seen
 assert a["q2"]["answer"].startswith("10 LLM requests within 2 h of the ticket (2 failed)") and a["q2"]["locked"] is None, a["q2"]
 e = a["q5"]["user_errors"]
 assert len(e) == 1 and e[0]["count"] == 2 and "sk-TESTkey" not in e[0]["error"] and "1234567" not in e[0]["error"], e
-assert a["q5"]["answer"].endswith("2 of 10 failed") and a["q5"]["status"] in ("warn", "bad"), a["q5"]
+assert "the user's own LLM calls then: 2 of 10 failed" in a["q5"]["answer"] and a["q5"]["status"] in ("warn", "bad"), a["q5"]
+# platform-wide at filing time (same fake: m1 10 calls, 2 failed = 20 %: not "failing"); Q6 from the calls: chat
+assert "platform LLM calls ±30 min: 20% of 10 failed" in a["q5"]["answer"] and a["q5"]["platform_llm"][0]["ticket"], a["q5"]
+assert a["q6"]["answer"].startswith("from real use: chat 10") and a["q6"]["calls"] == {"chat": 10}, a["q6"]
+assert [tickets.llm_kind(m) for m in ("rayen-bge-m3", "rayen-dots-ocr", "rayen-qwen3.6-27b", "whisper-1", "multilingual-e5")] == \
+    ["embedding", "OCR", "chat", "speech", "embedding"]
 col.cache = {}
 assert col.user("uni")["llm_log"]["recent"][0]["model"] == "m1" and seen[-1][0]["operator"] == "starts with"
 for k in ("LANGFUSE_URL", "LANGFUSE_PK", "LANGFUSE_SK"):
     os.environ.pop(k)
+
+# a user's LLM calls failing: incident on the dashboard (scope llm), never sent to Telegram; 5xx = our model, 4xx = the user
+def fail_prom(q, at=None):
+    if "proxy_total_requests" in q:
+        return [{"metric": {"api_key_alias": "uni-k1", "user_email": "uni@x"}, "value": [0, "100"]},
+                {"metric": {"api_key_alias": "kaf_prd", "user_email": "nilva@x"}, "value": [0, "50"]},
+                {"metric": {"api_key_alias": "uni-k2"}, "value": [0, "100"]}]
+    if "proxy_failed_requests" in q:
+        return [{"metric": {"api_key_alias": "uni-k1", "exception_status": "502", "requested_model": "rayen-qwen"}, "value": [0, "60"]},
+                {"metric": {"api_key_alias": "kaf_prd", "exception_status": "400", "requested_model": "None"}, "value": [0, "40"]},
+                {"metric": {"api_key_alias": "uni-k2", "exception_status": "502", "requested_model": "m"}, "value": [0, "5"]}]
+    return []
+col.prom, n_alerts = fail_prom, len(col.alerts)
+col.check_llm_keys(time.time())   # Grafana env is still set from the usage test above
+lf_inc = {r["obj"]: r for r in col.rows("SELECT * FROM incidents WHERE scope='llm' AND state='open'")}
+assert set(lf_inc) == {"uni-k1", "kaf_prd"}, lf_inc   # uni-k2: 5 % failed, below the line
+assert lf_inc["uni-k1"]["owner"] == "us" and "60 of 100 calls failed" in lf_inc["uni-k1"]["detail"] and lf_inc["uni-k1"]["ns"] == "user-uni"
+assert lf_inc["kaf_prd"]["ns"] == "user-nilva" and lf_inc["kaf_prd"]["owner"] == "user-nilva" and "rejects" in lf_inc["kaf_prd"]["cause"]
+assert len(col.alerts) == n_alerts and not any(r["alerted"] for r in lf_inc.values()), col.alerts   # never Telegram
+
+# Casdoor log: last activity per user of the platform organisation; anonymous / built-in admins are skipped
+log = "\n".join([
+    "2026/10/30 09:16:44.793 [I]  (10.0.0.210) subOwner = anonymous, subName = anonymous, method = POST, urlPath = /api/login, obj.Owner = , obj.Name = , result = allow",
+    "2026/10/30 09:17:00.100 [I]  (10.0.0.210) subOwner = organization_sharif, subName = uni, method = GET, urlPath = /api/userinfo, obj.Owner = , obj.Name = , result = allow",
+    "2026/10/30 10:00:00.000 [I]  (10.0.0.210) subOwner = organization_sharif, subName = uni, method = POST, urlPath = /api/logout, obj.Owner = , obj.Name = , result = deny",
+    "2026/10/30 11:00:00.000 [I]  (10.0.0.210) subOwner = built-in, subName = admin, method = GET, urlPath = /api/userinfo, obj.Owner = , obj.Name = , result = allow"])
+col.pods["casdoor"], ops_kget, col.cache = [{"name": "casdoor-1", "workload": "casdoor"}], ops.kget, {}
+ops.kget = lambda path, raw=False: log
+sso = col.sso()
+ops.kget = ops_kget
+assert sso["users"] == {"uni": {"last": ops.calendar.timegm((2026, 10, 30, 10, 0, 0)), "requests": 2, "logouts": 1, "denied": 1}}, sso
+assert sso["from"] == ops.calendar.timegm((2026, 10, 30, 9, 16, 44)) and col.user("uni")["sso"]["requests"] == 2
+# the name list says "to delete": off the Users list, its own page still opens (a ticket can link to it)
+assert any(r["user"] == "uni" for r in col.users())
+(ops.DATA / "people.json").write_text(json.dumps([{"name": "uni", "account": "uni", "users": ["uni"], "keys": [], "remove": True}]), encoding="utf-8")
+assert not any(r["user"] == "uni" for r in col.users()) and col.user("uni")["person"]["remove"] is True
 (ops.DATA / "people.json").unlink()
 for k in ("GRAFANA_URL", "GRAFANA_TOKEN"):
     os.environ.pop(k)

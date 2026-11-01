@@ -55,6 +55,10 @@ LEVEL_ZONE = 160  # only the start of a line holds its level; the rest is the me
 probe.TIMEOUT = 25  # the VPN path is slow: 8 s timed out on big lists
 
 # symptom: (cause, suggested fix, playbook section)
+SSO_ORG = "organization_sharif"  # Casdoor organisation of the platform's users (built-in = admins, app = applications)
+SSO_RE = re.compile(r"^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d)\.\d+ .*?subOwner = ([^,]*), subName = ([^,]*), method = \w+, "
+                    r"urlPath = ([^,]*),.*?result = (\w+)", re.M)
+LLM_FAIL_MIN, LLM_FAIL_RATE = 20, 0.3  # a key with >= 20 calls in the last hour of which >= 30 % failed: incident (dashboard only)
 RULES = {
     "crashloop": ("the container exits right after it starts", "read the previous container's log below and fix that error",
                   "Pipeline A: service is down"),
@@ -70,6 +74,8 @@ RULES = {
              "Pipeline A: service is down"),
     "model-down": ("the model has fewer ready replicas than minReplicas", "look at the model pod and events below",
                    "Pipeline A: service is down"),
+    "llm-failing": ("many of this user's LLM calls fail", "open the user's page: Langfuse shows the error messages and models",
+                    "Pipeline B: service is up but broken"),
     "new-error": ("a new error message appeared in the log", "read the sample; if it started after a release, roll back",
                   "Pipeline B: service is up but broken"),
     "endpoint": ("a probe check of our endpoint or asset fails", "check the service behind it (pods, logs)",
@@ -147,6 +153,12 @@ def owner_of(ns, obj):
     if ns == OUR_NS or (ns.startswith("user-") and obj.endswith("clearml-agent")):  # per-user mlops-core agents are ours
         return "us"
     return ns
+
+
+def key_user(m):
+    """AIP username of a LiteLLM key from its Prometheus labels: alias '<user>-<key name>', else the key's user email."""
+    alias, mail = m.get("api_key_alias") or "None", m.get("user_email") or "None"
+    return alias.split("-", 1)[0] if "-" in alias else mail.split("@")[0] if "@" in mail else None
 
 
 def alertable(ns, owner):
@@ -423,6 +435,74 @@ class Collector:
                     "recent": [slim(o) for o in obs()[:20]], "from": frm, "to": to}
         return self.cached("lf:%s:%d:%d" % (who, frm // 300, to // 300), 300, fetch)
 
+    def llm_platform(self, frm, to):
+        """All LLM calls through the gateway between frm and to, per model: {model, kind, count, failed} (Langfuse)."""
+        if not self.integrations()["langfuse"]:
+            return None
+        iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+        def fetch():
+            q = {"view": "observations", "dimensions": [{"field": "providedModelName"}, {"field": "level"}], "filters": [],
+                 "metrics": [{"measure": "count", "aggregation": "count"}], "fromTimestamp": iso(frm), "toTimestamp": iso(to)}
+            out = {}
+            for r in self.lf("/api/public/metrics", query=json.dumps(q))["data"]:
+                m = r["providedModelName"] or "(no model)"
+                o = out.setdefault(m, {"model": m, "kind": tickets.llm_kind(m), "count": 0, "failed": 0})
+                n = int(float(r["count_count"]))
+                o["count"] += n
+                o["failed"] += n if r["level"] == "ERROR" else 0
+            return sorted(out.values(), key=lambda o: -o["failed"])
+        return self.cached("lfp:%d:%d" % (frm // 300, to // 300), 3600, fetch)
+
+    def sso(self):
+        """{"from": epoch, "users": {user: {last, requests, logouts, denied}}} from the Casdoor log (GET pods/log, the
+        running pod only, so it covers the time since that pod started). Every request names the signed-in user
+        (subName); failed logins are anonymous there, so they cannot be counted per user."""
+        def fetch():
+            pod = next((p for p in self.pods.get("casdoor", []) if p["workload"] == "casdoor"), None)
+            if not pod:
+                return {}
+            text = kget("/api/v1/namespaces/casdoor/pods/%s/log?tailLines=80000" % pod["name"], raw=True)
+            users, first = {}, None
+            for m in SSO_RE.finditer(text):
+                t = calendar.timegm(time.strptime(m.group(1), "%Y/%m/%d %H:%M:%S"))  # Casdoor logs in UTC
+                first = first or t
+                if m.group(2) != SSO_ORG:
+                    continue
+                u = users.setdefault(m.group(3).lower(), {"last": 0, "requests": 0, "logouts": 0, "denied": 0})
+                u["last"], u["requests"] = max(u["last"], t), u["requests"] + 1
+                u["logouts"] += m.group(4) == "/api/logout"
+                u["denied"] += m.group(5) == "deny"
+            return {"from": first, "users": users}
+        return self.cached("sso", 600, fetch) or {}
+
+    def check_llm_keys(self, t):
+        """A user's LLM calls failing: at least LLM_FAIL_MIN calls and LLM_FAIL_RATE of them failed in the last hour, per key
+        (LiteLLM counters in Prometheus). Dashboard only, never Telegram: users' keys fail often, and many at once."""
+        if not self.integrations()["grafana"]:
+            return
+        total, fail = {}, {}
+        for s in self.prom("sum by (api_key_alias, user_email) (increase(litellm_proxy_total_requests_metric_total[1h]))"):
+            total[s["metric"].get("api_key_alias")] = (float(s["value"][1]), s["metric"])
+        for s in self.prom("sum by (api_key_alias, exception_status, requested_model) (increase(litellm_proxy_failed_requests_metric_total[1h]))"):
+            f = fail.setdefault(s["metric"].get("api_key_alias"), {"codes": {}, "models": {}})
+            v = float(s["value"][1])
+            c, m = s["metric"].get("exception_status") or "?", s["metric"].get("requested_model") or "?"
+            f["codes"][c] = f["codes"].get(c, 0) + v
+            f["models"][m] = f["models"].get(m, 0) + v
+        sym = {}
+        for alias, f in fail.items():
+            n, (tot, labels) = sum(f["codes"].values()), total.get(alias, (0, {}))
+            who = key_user(dict(labels, api_key_alias=alias))
+            if not who or tot < LLM_FAIL_MIN or n < LLM_FAIL_RATE * tot:
+                continue
+            codes = {c: round(v) for c, v in sorted(f["codes"].items(), key=lambda x: -x[1]) if round(v)}
+            models = [m for m, _ in sorted(f["models"].items(), key=lambda x: -x[1])]
+            detail = "%d of %d calls failed in the last hour (%d%%): %s · models: %s" % (
+                n, tot, 100 * n / tot, ", ".join("%s×%d" % kv for kv in codes.items()), ", ".join(models[:3]))
+            sym["llm:" + alias] = ("llm-failing", "user-" + who, alias, detail, {"codes": codes, "models": models})
+        self.observe("llm", sym, t, alert=False)
+
     def usage(self):
         """Per user, last 30 days (Prometheus history starts later: see "from"), from Grafana's Prometheus:
         LiteLLM requests/tokens/spend/failures per key (key alias = '<user>-<key name>') and CPU core-hours,
@@ -436,17 +516,30 @@ class Collector:
                                                      "keys": {}, "models": {}})
             for what, metric in (("requests", "litellm_requests_metric_total"), ("tokens", "litellm_total_tokens_metric_total"),
                                  ("spend", "litellm_spend_metric_total"), ("failed", "litellm_proxy_failed_requests_metric_total")):
-                for s in self.prom("sum by (api_key_alias, hashed_api_key, model) (increase(%s[30d]))" % metric):
+                for s in self.prom("sum by (api_key_alias, hashed_api_key, model, user_email) (increase(%s[30d]))" % metric):
                     m, v = s["metric"], float(s["value"][1])
-                    alias = m.get("api_key_alias") or ""
-                    if not v or "-" not in alias:  # 'None' = master key or no alias: no user to put it on
+                    alias, who = m.get("api_key_alias") or "None", key_user(m)
+                    if not v or not who:  # master key, or no alias and no email: no user to put it on
                         continue
-                    r = row(alias.split("-", 1)[0])
+                    r = row(who)
                     r[what] += v
                     k = r["keys"].setdefault(alias, {"hash": m.get("hashed_api_key", ""), "requests": 0, "tokens": 0, "spend": 0, "failed": 0})
                     k[what] += v
                     if what == "requests" and m.get("model"):
                         r["models"][m["model"]] = r["models"].get(m["model"], 0) + v
+            for s in self.prom("sum by (api_key_alias, user_email, route) (increase(litellm_proxy_total_requests_metric_total[30d]))"):
+                who, v = key_user(s["metric"]), round(float(s["value"][1]))
+                if who and v:
+                    rt = row(who).setdefault("routes", {})
+                    rt[s["metric"].get("route", "?")] = rt.get(s["metric"].get("route", "?"), 0) + v
+            # LiteLLM key budgets (USD): max and what is left; +Inf / missing = no limit
+            for field, q in (("budget", "max by (api_key_alias) (litellm_api_key_max_budget_metric)"),
+                             ("left", "min by (api_key_alias) (litellm_remaining_api_key_budget_metric)")):
+                for s in self.prom(q):
+                    alias, v = s["metric"].get("api_key_alias") or "None", float(s["value"][1])
+                    who = key_user(s["metric"])
+                    if who and who in users and alias in users[who]["keys"] and v != float("inf"):
+                        users[who]["keys"][alias][field] = round(v, 2)
             for what, q in (("cpu_h", 'sum by (namespace) (increase(container_cpu_usage_seconds_total{namespace=~"user-.*",container!=""}[30d])) / 3600'),
                             ("gpu_h", 'sum by (namespace) (sum_over_time((sum by (namespace) (kube_pod_container_resource_requests'
                                       '{resource="nvidia_com_gpu",namespace=~"user-.*"}))[30d:1h]))')):
@@ -572,7 +665,7 @@ class Collector:
                 except Exception as e:
                     errors.append("%s: %s" % (ns, probe.err(e)))
         self.hosts = {h: ns for ns, inv in self.inv.items() for k, v in inv.items() if v["kind"] == "Ingress" for h in v["hosts"]}
-        for step in ([self.check_probe] + ([self.scan_logs, self.test_models] if slow else []) + [self.judge_changes]):
+        for step in ([self.check_probe] + ([self.scan_logs, self.test_models, self.check_llm_keys] if slow else []) + [self.judge_changes]):
             try:
                 step(t)
             except Exception as e:
@@ -905,6 +998,15 @@ class Collector:
                 cause, fix, owner = "Harbor (the registry) is unreachable", "send the event below to the infra team", "infra"
             elif any(k in low for k in ("not found", "manifest unknown", "unauthorized", "denied")):
                 cause, fix = "the image tag does not exist, or the pull secret is wrong", "push the image to Harbor or fix the tag / pull secret"
+        elif symptom == "llm-failing":
+            codes = ctx.get("codes", {})
+            five = sum(n for c, n in codes.items() if c.startswith("5"))
+            if five > sum(codes.values()) / 2:
+                owner, cause = "us", "the model server answers 5xx (%s): our model behind the gateway is failing" % ", ".join(ctx.get("models", [])[:3])
+                fix = "check the model pods in aip-mlops-service (Models page) and LiteLLM; the user's request is not the cause"
+            else:
+                cause = "the gateway rejects the user's requests (%s): wrong model name, bad request or rate limit" % ", ".join(sorted(codes))
+                fix = "tell the user the error from their page (Langfuse); nothing to fix on our side"
         elif symptom == "oomkilled":
             fix = fix.format(limit=ctx.get("limit") or "not set")
         elif symptom == "endpoint":
@@ -1187,17 +1289,19 @@ class Collector:
             rows.append({"user": who, "namespaces": [], "pods": 0, "running": 0, "pending": 0, "kinds": ["API key"], "cpu_use": 0,
                          "cpu_req": 0, "mem_use_gib": 0, "gpu": "", "restarts": 0, "open": 0, "changes_7d": 0, "last_change": None,
                          "started": None})
-        people = self.people()
+        people, sso = self.people(), self.sso().get("users", {})
         for r in rows:
-            r["use"] = use.get(r["user"])
+            r["use"], r["sso"] = use.get(r["user"]), sso.get(r["user"])
             p = next((p for p in people if r["user"] in p["users"]), None)
-            r["person"] = p and {"name": p["name"], "users": p["users"]}
+            r["person"] = p and {"name": p["name"], "users": p["users"], "remove": bool(p.get("remove"))}
         # one person's namespaces next to each other (Avir: aviraip, aviraip2)
+        rows = [r for r in rows if not (r["person"] and r["person"]["remove"])]  # the name list says "to delete": off this list
         return sorted(rows, key=lambda r: (r["person"]["users"][0] if r["person"] else r["user"], r["user"]))
 
     @staticmethod
     def people():
-        """[{name, account, users, keys}]: real names of accounts, from the team's name list (data/people.json, not in git)."""
+        """[{name, account, users, keys, remove}]: real names of accounts, from the team's name list (data/people.json, not in git).
+        remove = the list says "to delete": hidden from the Users list, but we never delete anything."""
         try:
             return json.loads((DATA / "people.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -1212,7 +1316,8 @@ class Collector:
         q = ",".join("?" * len(ns_list))
         return {"user": who, "namespaces": ns_list, "pods": [dict(p, ns=ns) for ns, p in items],
                 "use": use.get("users", {}).get(who), "use_from": use.get("from"),
-                "person": next(({"name": p["name"], "users": p["users"]} for p in self.people() if who in p["users"]), None),
+                "sso": self.sso().get("users", {}).get(who), "sso_from": self.sso().get("from"),
+                "person": next(({"name": p["name"], "users": p["users"], "remove": bool(p.get("remove"))} for p in self.people() if who in p["users"]), None),
                 "key_people": {k: p["name"] for p in self.people() for k in p["keys"]},
                 "llm_log": self.llm_log(who, now - 7 * 86400, now), "llm_error": self.integ_err.get(
                     "lf:%s:%d:%d" % (who, (now - 7 * 86400) // 300, now // 300)),

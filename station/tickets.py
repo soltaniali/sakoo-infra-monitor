@@ -40,7 +40,18 @@ LOCKED = {
 # LiteLLM's Prometheus counters, per API key (label hashed_api_key = sha256 of the key); names differ between versions
 USAGE_Q = ('sum by (__name__, model) (increase({__name__=~"litellm_(requests|total_tokens|spend|proxy_failed_requests)_metric(_total)?'
            '|litellm_total_tokens(_total)?", %s}[%s]))')
+PLATFORM_S, PLATFORM_BAD = 1800, 0.3  # platform-wide: 30 min each side of the filing time; a model with >= 30 % failed is "failing"
 USERS_FILE = "ticket-users.json"  # in OPS_DATA, edited by hand: {"requester name on the ticket site": "AIP username" or "key alias"}
+
+
+def llm_kind(model):
+    """What a model is for, from its name (LiteLLM model groups: rayen-bge-m3, rayen-dots-ocr, rayen-qwen3.6-27b...)."""
+    m = (model or "").lower()
+    for kind, rx in (("embedding", r"bge|\be5\b|e5-|embed"), ("rerank", r"rerank"), ("OCR", r"ocr"),
+                     ("speech", r"whisper|stt|transcri|tts|audio")):
+        if re.search(rx, m):
+            return kind
+    return "chat"
 
 
 def key_usage(col, selectors, at):
@@ -370,10 +381,35 @@ def analyze(col, d, ai=None):
           "incidents": mine, "platform": platform[:20], "moments": moments, "data_from": first_data, "first_answer_h": wait_h}
     if log:  # Langfuse keeps older history than our incidents: the user's own failed calls still answer "was it broken"
         q5["answer"] += "; the user's own LLM calls then: %d of %d failed" % (n_err, n_req)
+    # every LLM call through the gateway 30 min around the filing time: was the whole platform failing then?
+    plat = col.llm_platform(created - PLATFORM_S, created + PLATFORM_S)
+    if plat:
+        tot, bad = sum(m["count"] for m in plat), sum(m["failed"] for m in plat)
+        names = [m["name"].lower() for m in models]
+        for m in plat:
+            m["ticket"] = any(n in m["model"].lower() for n in names)
+        hot = [m for m in plat if m["count"] >= 10 and m["failed"] >= PLATFORM_BAD * m["count"]]
+        q5["answer"] += "; platform LLM calls ±30 min: %d%% of %d failed%s" % (
+            100 * bad / tot if tot else 0, tot, " (%s)" % ", ".join("%s %d%%" % (m["model"], 100 * m["failed"] / m["count"]) for m in hot[:3]) if hot else "")
+        if any(m["ticket"] for m in hot):
+            q5["status"] = "bad"
+        elif hot and q5["status"] in ("ok", "info"):
+            q5["status"] = "warn"
+        q5["platform_llm"] = [m for m in plat if m["count"]][:15]
 
     # 6. what for
     purpose = next((p for p, rx in PURPOSES if re.search(rx, low)), "other")
     if ai and ai.get("purpose"):
         purpose = ai["purpose"] if purpose == "other" or ai["purpose"] == purpose else "%s (AI: %s)" % (purpose, ai["purpose"])
-    q6 = {"status": "info", "answer": purpose}
+    # from what the user really ran: training agents in their namespace, and the kinds of models they called
+    calls = {}
+    for m in (log or {}).get("models", []) or [{"model": k, "count": v} for k, v in own.get("models", {}).items()]:
+        k = llm_kind(m["model"])
+        calls[k] = calls.get(k, 0) + m["count"]
+    agents = [p["name"] for ns, p in col.user_pods().get(who, []) if p["workload"].endswith("clearml-agent")] if who else []
+    seen = (["fine-tune (ClearML agent in user-%s)" % who] if agents else []) + [
+        "%s %d" % kv for kv in sorted(calls.items(), key=lambda x: -x[1]) if kv[1]]
+    if seen:
+        purpose = "from real use: " + ", ".join(seen) + (" · ticket says: %s" % purpose if purpose != "other" else "")
+    q6 = {"status": "info", "answer": purpose, "calls": calls, "agents": agents}
     return {"q1": q1, "q2": q2, "q3": q3, "q4": q4, "q5": q5, "q6": q6}

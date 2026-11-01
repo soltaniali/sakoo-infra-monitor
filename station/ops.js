@@ -18,14 +18,24 @@ function h(tag, attrs, ...kids) {
 }
 const fmtT = new Intl.DateTimeFormat('en-GB', {timeZone: TZ, month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false});
 const fmt = t => t ? fmtT.format(new Date(t * 1000)) : '–';
+const fmtFull = new Intl.DateTimeFormat('en-GB', {timeZone: TZ, weekday: 'short', year: 'numeric', month: 'short', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', hour12: false});
+// a time made easy to see: how long ago in bold (green under 1 h, grey after 7 d), the Tehran clock time next to it
+function T(t) {
+  if (!t) return h('span', {class: 'mut'}, '–');
+  const s = Date.now() / 1000 - t;
+  return h('span', {class: 't' + (s < 3600 ? ' fresh' : s > 7 * 86400 ? ' old' : ''), title: fmtFull.format(new Date(t * 1000)) + ' · Tehran time'},
+    h('b', {}, ago(t)), h('span', {class: 'abs'}, fmt(t)));
+}
 function ago(t) {
   if (!t) return '–';
   const s = Date.now() / 1000 - t;
+  if (s < 0) return 'in ' + ago(t + 2 * s).replace(' ago', '');
   return s < 90 ? Math.round(s) + ' s ago' : s < 5400 ? Math.round(s / 60) + ' min ago' : s < 172800 ? Math.round(s / 3600) + ' h ago' : Math.round(s / 86400) + ' d ago';
 }
 const OWNER = o => o === 'us' ? 'MLOps (us)' : o === 'infra' ? 'Infra team' : o === 'asset' ? 'MLOps asset' : o === 'monitor' ? 'Probe' : 'Team ' + o;
 const SYM = {crashloop: 'Crash loop', oomkilled: 'Out of memory', 'image-pull': 'Image pull', pending: 'Pending', flapping: 'Restarting',
-  'probe-failing': 'Probe failing', down: 'Down', 'model-down': 'Model down', 'new-error': 'New error', endpoint: 'Endpoint check', infra: 'Infra check'};
+  'probe-failing': 'Probe failing', down: 'Down', 'model-down': 'Model down', 'new-error': 'New error', endpoint: 'Endpoint check', infra: 'Infra check', 'llm-failing': 'LLM calls failing'};
 const CHG = {release: 'Release', config: 'Config change', 'new-service': 'New service', 'new-host': 'New hostname', 'new-namespace': 'New namespace',
   removed: 'Removed', 'removed-namespace': 'Namespace removed', 'new-model': 'New model', 'model-changed': 'Model changed', 'model-removed': 'Model removed'};
 const verdictChip = v => v ? h('span', {class: 'chip ' + ({bad: 'bad', 'not ready': 'bad', healthy: 'ok', ready: 'ok', watching: 'warn'}[v] || '')}, v) : '';
@@ -62,9 +72,10 @@ function showLogin(msg) {
 
 const TABS = [['overview', 'Overview'], ['incidents', 'Incidents'], ['changes', 'Changes'], ['models', 'Models'],
   ['services', 'Services'], ['logs', 'Logs'], ['infra', 'Infra or us'], ['users', 'Users'], ['tickets', 'Tickets'], ['capacity', 'Capacity'], ['trends', 'Trends']];
+setInterval(() => { const c = document.getElementById('clock'); if (c) c.textContent = 'Tehran ' + fmt(Date.now() / 1000); }, 15000);
 function nav(page) {
   document.getElementById('tabs').replaceChildren(...TABS.map(([k, t]) => h('a', {href: '#/' + k, class: page === k || (page === 'incident' && k === 'incidents') || (page === 'ticket' && k === 'tickets') ? 'on' : ''}, t)));
-  document.getElementById('who').replaceChildren(me.user + ' · ', h('a', {href: '#', onclick: async ev => { ev.preventDefault(); await post('/api/logout', {}); showLogin(); }}, 'log out'));
+  document.getElementById('who').replaceChildren(h('span', {id: 'clock'}, 'Tehran ' + fmt(Date.now() / 1000)), ' · ' + me.user + ' · ', h('a', {href: '#', onclick: async ev => { ev.preventDefault(); await post('/api/logout', {}); showLogin(); }}, 'log out'));
 }
 function route() {
   const [p, q] = (location.hash.slice(2) || 'overview').split('?');
@@ -84,18 +95,18 @@ window.addEventListener('hashchange', render);
 // --- shared pieces -------------------------------------------------------------------------------------------------
 // Liveness: a status, since when it has been so, and when it was last checked.
 function live(state, since, checked, bad) {
-  return h('span', {title: (since ? 'since ' + fmt(since) : '') + (checked ? ', checked ' + fmt(checked) : '')},
-    h('span', {class: bad ? 'err' : ''}, state), h('span', {class: 'small mut'}, (since ? ' · since ' + ago(since) : '') + (checked ? ' · checked ' + ago(checked) : '')));
+  return h('span', {}, h('span', {class: bad ? 'err' : ''}, state),
+    since ? h('span', {class: 'small'}, ' · since ', T(since)) : '', checked ? h('span', {class: 'small'}, ' · checked ', T(checked)) : '');
 }
 const incidentCols = [
-  ['#', r => r.id], ['Opened', r => h('span', {title: fmt(r.opened)}, ago(r.opened))], ['What', r => SYM[r.symptom] || r.symptom],
+  ['#', r => r.id], ['Opened', r => T(r.opened)], ['What', r => SYM[r.symptom] || r.symptom],
   ['Where', r => (r.ns === '-' ? '' : r.ns + ' / ') + r.obj], ['Owner', r => OWNER(r.owner)],
-  ['Last seen', r => r.closed ? h('span', {class: 'mut'}, 'closed ' + ago(r.closed)) : h('span', {title: fmt(r.last_seen)}, ago(r.last_seen))],
+  ['Last seen', r => r.closed ? h('span', {class: 'mut'}, 'closed ', T(r.closed)) : T(r.last_seen)],
   ['Cause', r => h('span', {class: 'small'}, r.cause)]];
 const incidentTable = rows => table(incidentCols, rows, r => { location.hash = '#/incident?id=' + r.id; });
 function changeTable(rows) {
   return table([
-    ['Time', r => h('span', {title: fmt(r.ts)}, fmt(r.ts))], ['Change', r => CHG[r.type] || r.type], ['Where', r => r.ns + ' / ' + r.name],
+    ['Time', r => T(r.ts)], ['Change', r => CHG[r.type] || r.type], ['Where', r => r.ns + ' / ' + r.name],
     ['Before → after', r => h('span', {class: 'small'}, r.before && r.after ? r.before + ' → ' + r.after : (r.after || r.before))],
     ['Result', r => verdictChip(r.verdict)],
     ['Who', r => { const i = r.info || {};
@@ -268,33 +279,16 @@ VIEWS.logs = async q => {
 
 const bar = (v, max) => h('span', {style: 'display:inline-block;height:8px;border-radius:4px;background:var(--info);width:' + Math.round(80 * Math.min(v / (max || 1), 1)) + 'px'});
 // What we cannot see yet: shown greyed, with what unlocks it, so it is not forgotten.
-const LOCKED_USER = [
-  {key: 'login', title: 'Logins', shows: 'last login, failed logins, IP', needs: 'access request 45 (Casdoor login records)'},
-  {key: 'requests', title: 'API requests', shows: 'requests per service, errors, slowest calls', needs: 'access request 46 (user in gateway/Traefik access log) + audit line in our services'},
-  {key: 'llm', title: 'LLM usage', shows: 'models used, tokens, LLM errors', needs: 'access request 47 (LiteLLM spend logs, Langfuse)'},
-  {key: 'train', title: 'Trainings', shows: 'queued, running and failed mlops-core tasks', needs: 'a read-only mlops-core API key (our own service)'},
-  {key: 'quota', title: 'Quota', shows: 'quota used vs limit', needs: 'access request 41 (RMG read-only)'},
-  {key: 'org', title: 'Organisation', shows: 'university or company, contact, service level', needs: 'access request 26 (customer list)'},
-  {key: 'history', title: 'Log history', shows: 'logs of pods that are gone, 30 days', needs: 'access requests 7 and 12 (central log store)'},
+const LOCKED_USER = [  // what our access still cannot show (2026-10-31: kubeconfig, Grafana Viewer, Langfuse, Casdoor log)
+  {key: 'llm', title: 'LLM usage', shows: 'models used, tokens, LLM errors', needs: 'a Grafana login on the station: sh station/set-grafana-login.sh'},
+  {key: 'train', title: 'Trainings', shows: 'queued, running and failed mlops-core tasks', needs: 'a read-only mlops-core API key (tasks are in its Elasticsearch; its logs show only hashed user ids)'},
+  {key: 'history', title: 'Log history', shows: 'logs of pods that are gone, 30 days', needs: 'access requests 7 and 12 (central log store); today only the running pods\' logs are readable'},
+  {key: 'failed-login', title: 'Failed logins', shows: 'wrong passwords per user', needs: 'Casdoor writes failed logins as anonymous; only its database has them (access request 45)'},
 ];
 // LLM usage comes from Grafana's Prometheus (LiteLLM counters per key) once a Grafana login is set
-// real name from the team's name list; a person with several accounts: first row shows the name, the others "↳ same"
-const personCell = (u, i, rows) => !u.person ? h('span', {class: 'mut'}, '–') : u.person.users.length < 2 ? h('span', {dir: 'auto'}, u.person.name)
-  : u.person.users[0] === u.user || !u.person.users.includes((rows[i - 1] || {}).user) ? h('span', {dir: 'auto', title: u.person.users.join(', ')},
-    h('b', {}, u.person.name), h('div', {class: 'small mut'}, u.person.users.length + ' namespaces: ' + u.person.users.join(', ')))
-  : h('span', {class: 'mut small', title: u.person.name}, '↳ same as above');
-// LLM requests from Langfuse: per model/level, grouped errors, last requests (never prompts or answers)
-const llmLog = (lg, err) => !lg ? (err ? h('div', {class: 'card err small'}, 'Langfuse: ' + err) : '') : [
-  h('div', {class: 'card'}, h('b', {}, 'Per model'), table([['Model', m => m.model], ['Level', m => m.level === 'ERROR' ? h('span', {class: 'err'}, 'error') : 'ok'],
-    ['Requests', m => m.count], ['Tokens', m => m.tokens], ['p95 latency', m => (m.p95_ms / 1000).toFixed(1) + ' s']], lg.models),
-    h('b', {}, 'Errors · ' + lg.errors.reduce((n, e) => n + e.count, 0) + (lg.errors.length ? ' (last 50 grouped)' : '')),
-    table([['Error', e => h('span', {class: 'small', dir: 'auto'}, e.error)], ['Times', e => e.count], ['Model', e => e.model || '–'], ['Key', e => e.key || '–'],
-      ['Last', e => fmt(e.last)]], lg.errors),
-    h('b', {}, 'Last requests'), table([['Time', r => fmt(r.ts)], ['Model', r => r.model || '–'], ['Key', r => r.key || '–'],
-      ['Result', r => r.level === 'ERROR' ? h('span', {class: 'err small'}, r.status || 'error') : 'ok'], ['Latency', r => r.latency_s == null ? '–' : r.latency_s.toFixed(1) + ' s'],
-      ['Tokens', r => r.tokens == null ? '–' : r.tokens]], lg.recent))];
 const userLocked = () => LOCKED_USER.filter(l => !(l.key === 'llm' && me.integrations.grafana));
-const llmCell = u => !u || !u.requests ? '–' : [u.requests + ' req · ' + u.tokens + ' tok · $' + u.spend,
+const big = n => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e4 ? Math.round(n / 1e3) + 'k' : String(n);
+const llmCell = u => !u || !u.requests ? '–' : [big(u.requests) + ' calls · ' + big(u.tokens) + ' tok · $' + u.spend,
   u.failed ? h('span', {class: 'err'}, ' · ' + u.failed + ' failed') : ''];
 const lockedCell = l => h('span', {class: 'locked-cell', title: l.title + ': not visible yet. Needs ' + l.needs}, '—');
 const lockedCard = l => h('div', {class: 'card locked'}, h('div', {}, h('b', {}, l.title), h('span', {class: 'chip'}, 'not visible yet')),
@@ -302,37 +296,72 @@ const lockedCard = l => h('div', {class: 'card locked'}, h('div', {}, h('b', {},
 
 VIEWS.users = async () => {
   const us = await api('/api/users');
-  const locked = userLocked(), lockedCols = locked.slice(0, 3).map(l => [h('span', {class: 'locked-cell', title: 'Needs ' + l.needs}, l.title), () => lockedCell(l)]);
-  return h('div', {}, h('h1', {}, 'Users · ' + us.length),
-    h('p', {class: 'mut'}, 'What each user runs now (user-* namespaces and JupyterHub notebooks), what it uses, what is broken. Grey = not visible yet; hover to see what unlocks it.'),
-    h('div', {class: 'card'}, table([
-      ['Name', personCell], ['User', u => h('a', {href: '#/user?' + qs({name: u.user})}, u.user)], ['Runs', u => u.kinds.join(', ')],
-      ['Pods', u => u.running + ' running' + (u.pending ? ', ' + u.pending + ' pending' : '')],
-      ['CPU used / reserved', u => u.cpu_use + ' / ' + u.cpu_req], ['RAM', u => u.mem_use_gib + ' GiB'], ['GPU', u => u.gpu],
-      ['Restarts', u => u.restarts], ['Open incidents', u => u.open ? h('span', {class: 'err'}, u.open) : 0],
-      ['Changes (7 d)', u => u.changes_7d ? u.changes_7d + ' · ' + ago(u.last_change) : 0], ['Running since', u => ago(u.started)],
-      ...(me.integrations.grafana ? [['LLM 30 d', u => llmCell(u.use)], ['CPU-h · GPU-h 30 d', u => u.use ? u.use.cpu_h + ' · ' + u.use.gpu_h : '–']] : []),
-      ...lockedCols], us)),
-    h('h2', {class: 'locked-title'}, 'Not visible yet · ' + locked.length),
-    h('div', {class: 'locked-grid'}, locked.map(lockedCard)));
+  const groups = [];  // one card per person from the name list (several namespaces), or per account not in the list
+  for (const u of us) {
+    const k = u.person ? 'p:' + u.person.name : 'u:' + u.user;
+    let g = groups.find(x => x.k === k);
+    if (!g) groups.push(g = {k, name: u.person && u.person.name, rows: []});
+    g.rows.push(u);
+  }
+  const sum = (g, f) => g.rows.reduce((n, u) => n + (f(u) || 0), 0);
+  for (const g of groups) Object.assign(g, {open: sum(g, u => u.open), running: sum(g, u => u.running), restarts: sum(g, u => u.restarts),
+    req: sum(g, u => u.use && u.use.requests), failed: sum(g, u => u.use && u.use.failed), spend: sum(g, u => u.use && u.use.spend),
+    cpu_h: sum(g, u => u.use && u.use.cpu_h), gpu_h: sum(g, u => u.use && u.use.gpu_h), seen: Math.max(0, ...g.rows.map(u => u.sso ? u.sso.last : 0))});
+  groups.sort((a, b) => b.open - a.open || b.seen - a.seen || b.req - a.req);
+  const stat = (k, ...v) => h('div', {class: 'stat'}, h('span', {class: 'k'}, k), h('span', {class: 'v'}, ...v));
+  const num = n => Math.round(n).toLocaleString('en');
+  const cards = groups.map(g => [g, h('div', {class: 'card person' + (g.open ? ' bad' : g.running || g.req ? '' : ' idle')},
+    h('div', {class: 'ph'}, h('span', {class: 'name', dir: 'auto'}, g.name || g.rows[0].user),
+      g.rows.length > 1 ? h('span', {class: 'chip group'}, 'one person · ' + g.rows.length + ' namespaces') : '',
+      g.name ? '' : h('span', {class: 'small mut'}, 'not in the name list')),
+    h('div', {class: 'stats'},
+      stat('Last active (SSO)', T(g.seen || null)), stat('Open incidents', g.open ? h('span', {class: 'err'}, g.open) : '0'),
+      stat('Running pods', g.running), stat('LLM calls · 30 d', num(g.req), g.failed ? h('span', {class: 'err'}, ' · ' + num(g.failed) + ' failed') : ''),
+      stat('Spend · 30 d', '$' + g.spend.toFixed(2)), stat('CPU-h · GPU-h · 30 d', num(g.cpu_h) + ' · ' + num(g.gpu_h))),
+    table([['Namespace / account', u => h('a', {href: '#/user?' + qs({name: u.user})}, h('b', {}, u.user))], ['Runs', u => u.kinds.join(', ')],
+      ['Pods', u => u.running + ' running' + (u.pending ? ', ' + u.pending + ' pending' : '')], ['CPU used / reserved', u => u.cpu_use + ' / ' + u.cpu_req],
+      ['RAM', u => u.mem_use_gib + ' GiB'], ['GPU', u => u.gpu || '–'], ['Restarts', u => u.restarts ? h('span', {class: 'err'}, u.restarts) : 0],
+      ['Incidents', u => u.open ? h('span', {class: 'err'}, u.open) : 0], ['LLM 30 d', u => llmCell(u.use)],
+      ['CPU-h · GPU-h', u => u.use ? u.use.cpu_h + ' · ' + u.use.gpu_h : '–'], ['Last active (SSO)', u => T(u.sso && u.sso.last)],
+      ['Changes 7 d', u => u.changes_7d ? [u.changes_7d + ' · ', T(u.last_change)] : 0], ['Running since', u => T(u.started)]], g.rows))]);
+  const search = h('input', {type: 'search', placeholder: 'Search name or namespace…', oninput: () => {
+    const v = search.value.trim().toLowerCase();
+    for (const [g, el] of cards) el.hidden = !!v && !(g.name || '').toLowerCase().includes(v) && !g.rows.some(u => u.user.includes(v));
+  }});
+  const today = groups.filter(g => g.seen && Date.now() / 1000 - g.seen < 86400).length, locked = userLocked();
+  return h('div', {}, h('h1', {}, 'Users'),
+    h('div', {class: 'stats'}, stat('People', groups.length), stat('Namespaces / accounts', us.length), stat('Active in SSO last 24 h', today),
+      stat('With open incidents', groups.filter(g => g.open).length)),
+    h('p', {class: 'mut small'}, 'One card per person: all their namespaces are inside it. Red edge = open incident, grey = nothing running and no LLM use. ' +
+      'Real names: the team\'s name list. LLM and CPU/GPU: Grafana (30 d, Prometheus data from 21 Oct). Last active: Casdoor log.'),
+    h('div', {class: 'row'}, search), cards.map(c => c[1]),
+    locked.length ? [h('h2', {class: 'locked-title'}, 'Not visible yet · ' + locked.length), h('div', {class: 'locked-grid'}, locked.map(lockedCard))] : '');
 };
 
 VIEWS.user = async q => {
   const u = await api('/api/user?' + qs({name: q.name}));
-  return h('div', {}, h('p', {}, h('a', {href: '#/users'}, '← users')), h('h1', {}, u.user),
-    u.person ? h('p', {}, h('b', {dir: 'auto'}, u.person.name), u.person.users.length > 1 ? [' · same person: ',
-      u.person.users.filter(x => x !== u.user).map(x => [h('a', {href: '#/user?' + qs({name: x})}, x), ' '])] : '') : '',
+  return h('div', {}, h('p', {}, h('a', {href: '#/users'}, '← users')),
+    h('h1', {dir: 'auto'}, u.person ? u.person.name : u.user, u.person ? h('span', {class: 'mut'}, ' · ' + u.user) : '', u.person && u.person.remove ? [' ', h('span', {class: 'chip warn'}, 'marked to delete')] : ''),
+    u.person && u.person.users.length > 1 ? h('p', {}, h('span', {class: 'chip group'}, 'one person · ' + u.person.users.length + ' namespaces'), ' other namespaces: ',
+      u.person.users.filter(x => x !== u.user).map(x => [h('a', {href: '#/user?' + qs({name: x})}, x), ' '])) : '',
+    h('h2', {}, 'Sign-in activity (Casdoor)'), h('div', {class: 'card'}, u.sso ? h('div', {class: 'stats'},
+      h('div', {class: 'stat'}, h('span', {class: 'k'}, 'Last active'), h('span', {class: 'v'}, T(u.sso.last))),
+      h('div', {class: 'stat'}, h('span', {class: 'k'}, 'SSO requests'), h('span', {class: 'v'}, u.sso.requests)),
+      h('div', {class: 'stat'}, h('span', {class: 'k'}, 'Log-outs'), h('span', {class: 'v'}, u.sso.logouts)),
+      h('div', {class: 'stat'}, h('span', {class: 'k'}, 'Denied requests'), h('span', {class: 'v'}, u.sso.denied ? h('span', {class: 'err'}, u.sso.denied) : 0)))
+      : h('span', {class: 'mut'}, 'No sign-in in the Casdoor log'), h('div', {class: 'small mut'}, 'The log covers ', T(u.sso_from), ' until now (the running Casdoor pod).')),
     h('p', {class: 'mut'}, 'Namespaces: ' + (u.namespaces.join(', ') || 'none (API key only)')),
-    u.use ? [h('h2', {}, 'LLM and compute · 30 d' + (u.use_from ? ' (Prometheus data from ' + fmt(u.use_from) + ')' : '')),
+    u.use ? [h('h2', {}, 'LLM and compute · 30 d' + (u.use_from ? ' (Prometheus data from ' + fmt(u.use_from) + ', Tehran)' : '')),
       h('div', {class: 'card'}, h('p', {}, llmCell(u.use), ' · CPU ' + u.use.cpu_h + ' core-h · GPU ' + u.use.gpu_h + ' h'),
-        table([['Key', k => k[0]], ['Used by', k => h('span', {dir: 'auto'}, u.key_people[k[0]] || '–')], ['Requests', k => k[1].requests], ['Tokens', k => k[1].tokens], ['Spend $', k => k[1].spend],
+        table([['Key', k => k[0]], ['Used by', k => h('span', {dir: 'auto'}, u.key_people[k[0]] || '–')], ['Requests', k => k[1].requests], ['Tokens', k => k[1].tokens], ['Spend $', k => k[1].spend], ['Budget', k => k[1].budget == null ? h('span', {class: 'mut'}, 'no limit') : '$' + (k[1].left == null ? '?' : k[1].left) + ' left of $' + k[1].budget],
           ['Failed', k => k[1].failed ? h('span', {class: 'err'}, k[1].failed) : 0], ['Key hash', k => h('span', {class: 'small mut'}, k[1].hash.slice(0, 8) + '…')]],
           Object.entries(u.use.keys)),
-        h('p', {class: 'small'}, 'Requests per model: ' + (Object.entries(u.use.models).map(([m, n]) => m + ' ' + n).join(', ') || '–')))] : '',
+        h('p', {class: 'small'}, 'Requests per model: ' + (Object.entries(u.use.models).map(([m, n]) => m + ' ' + n).join(', ') || '–')),
+        h('p', {class: 'small'}, 'API routes on the LLM gateway: ' + (Object.entries(u.use.routes || {}).sort((a, b) => b[1] - a[1]).map(([r, n]) => r + ' ' + n).join(', ') || '–')))] : '',
     h('h2', {}, 'Pods · ' + u.pods.length), h('div', {class: 'card'}, table([['Namespace', p => p.ns], ['Pod', p => p.name], ['Phase', p => p.phase],
       ['Ready', p => live(p.ready ? 'ready' : 'not ready', p.since, null, !p.ready)], ['Restarts', p => p.restarts],
       ['CPU / RAM now', p => p.use_cpu == null ? '–' : p.use_cpu.toFixed(2) + ' cores / ' + (p.use_mem / 1073741824).toFixed(1) + ' GiB'],
-      ['Problem', p => p.waiting.join(', ')], ['Age', p => ago(p.created)],
+      ['Problem', p => p.waiting.join(', ')], ['Started', p => T(p.created)],
       ['', p => p.bad ? h('a', {href: '#/logs?' + qs({ns: p.ns, pod: p.name, container: p.bad})}, 'logs') : '']], u.pods)),
     me.integrations.langfuse ? [h('h2', {}, 'LLM requests · last 7 days (Langfuse)'), llmLog(u.llm_log, u.llm_error)] : '',
     h('h2', {}, 'Incidents'), h('div', {class: 'card'}, incidentTable(u.incidents)),
@@ -365,14 +394,14 @@ VIEWS.tickets = async () => {
     r.error ? h('div', {class: 'card err small'}, 'Last sync failed: ' + r.error) : '',
     h('div', {class: 'card'}, table([
       ['Ticket', t => h('div', {style: 'max-width:260px'}, h('b', {dir: 'auto'}, t.subject), h('div', {class: 'small mut'}, t.number + ' · ' + t.requester))],
-      ['Status', t => [TSTATUS[t.status] || t.status, h('div', {class: 'small mut'}, t.priority + ' · ' + ago(t.last))]],
+      ['Status', t => [TSTATUS[t.status] || t.status, h('div', {class: 'small'}, t.priority + ' · last message ', T(t.last))]],
       ...TQ.map(([k, title]) => [title, t => shortChip(k, t.answers[k])])], r.tickets, t => { location.hash = '#/ticket?id=' + t.id; })));
 };
 
 // incidents next to a ticket: open at the moment the user wrote, or how close before/after it
 const whenTable = rows => table([['#', r => r.id], ['When vs ticket', r => h('span', {class: r.when === 'active' ? 'err' : 'mut'},
-  r.when === 'active' ? 'open at ' + fmt(r.at) : r.when)], ['What', r => SYM[r.symptom] || r.symptom], ['Where', r => r.ns + ' / ' + r.obj],
-  ['Owner', r => OWNER(r.owner)], ['Opened → closed', r => fmt(r.opened) + ' → ' + (r.closed ? fmt(r.closed) : 'open')]],
+  r.when === 'active' ? ['open at ', T(r.at)] : r.when)], ['What', r => SYM[r.symptom] || r.symptom], ['Where', r => r.ns + ' / ' + r.obj],
+  ['Owner', r => OWNER(r.owner)], ['Opened → closed', r => [T(r.opened), ' → ', r.closed ? T(r.closed) : 'open']]],
   rows, r => { location.hash = '#/incident?id=' + r.id; });
 
 VIEWS.ticket = async q => {
@@ -402,11 +431,15 @@ VIEWS.ticket = async q => {
         ' · our data starts ' + fmt(a.q5.data_from) +
         (a.q5.first_answer_h != null ? ' · first staff answer after ' + a.q5.first_answer_h + ' h' : ' · no staff answer yet')),
       a.q5.user_errors && a.q5.user_errors.length ? [h('b', {}, 'Failed calls of the user then'), table([['Error', e => h('span', {class: 'small', dir: 'auto'}, e.error)],
-        ['Times', e => e.count], ['Model', e => e.model || '–'], ['Last', e => fmt(e.last)]], a.q5.user_errors)] : '',
+        ['Times', e => e.count], ['Model', e => e.model || '–'], ['Last', e => T(e.last)]], a.q5.user_errors)] : '',
+      a.q5.platform_llm ? [h('b', {}, 'All LLM calls on the platform, 30 min around the filing time (Langfuse)'),
+        table([['Model', m => m.ticket ? h('b', {}, m.model + ' ← in the ticket') : m.model], ['Kind', m => m.kind], ['Calls', m => m.count],
+          ['Failed', m => m.failed ? h('span', {class: m.count >= 10 && m.failed >= 0.3 * m.count ? 'err' : ''}, m.failed + ' (' + Math.round(100 * m.failed / m.count) + ' %)') : 0]],
+          a.q5.platform_llm)] : '',
       h('b', {}, 'On what the user uses'), whenTable(a.q5.incidents), h('b', {}, 'Platform-wide (ours or infra)'), whenTable(a.q5.platform)),
     h('h2', {}, TQ[5][1]), h('div', {class: 'card'}, qChip(a.q6)),
     h('h2', {}, 'Conversation · ' + t.messages.length), h('div', {class: 'card'}, t.messages.map(m =>
-      h('div', {style: 'margin-bottom:12px'}, h('div', {class: 'small mut'}, m.name + ' · ' + m.role + ' · ' + fmt(m.ts)),
+      h('div', {style: 'margin-bottom:12px'}, h('div', {class: 'small mut'}, m.name + ' · ' + m.role + ' · ', T(m.ts)),
         h('div', {dir: 'auto', style: 'white-space:pre-wrap'}, m.text)))));
 };
 
