@@ -157,6 +157,8 @@ class Handler(BaseHTTPRequestHandler):
             return COL.users()
         if what == "user":
             return COL.user(name(q, "name"))
+        if what == "keys":
+            return COL.keys()
         if what == "tickets":
             return COL.tickets()
         if what == "ticket":

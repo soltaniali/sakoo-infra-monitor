@@ -7,6 +7,7 @@ Rounds: every ROUND_S our namespace; every SLOW_EVERY rounds all readable namesp
 Data: SQLite $OPS_DATA/ops.db (default /data). Probe results: $PROBE_RESULTS (written by probe.py on this station).
 Optional integrations, each on when its env is set (secrets/ops.env):
   LITELLM_URL (…/v1), LITELLM_KEY, LITELLM_MODEL     model test calls, "registered in litellm?" for models
+  LITELLM_READ_URL, LITELLM_READ_KEY                 read-only key (Admin Viewer): key owners, limits, old spend logs
   AI_URL (…/v1), AI_KEY, AI_MODEL                     any OpenAI-compatible LLM (free tier: Mistral, OpenRouter, ...) for log,
                                                        incident and ticket summaries; without it the LITELLM_* model is used
   GITLAB_URL, GITLAB_TOKEN, GITLAB_PROJECTS            author and MR of a change (comma-separated project paths)
@@ -161,6 +162,23 @@ def key_user(m):
     return alias.split("-", 1)[0] if "-" in alias else mail.split("@")[0] if "@" in mail else None
 
 
+def slim_key(k, u, t):
+    """What the dashboard shows of a LiteLLM key: owner, limits, warnings. Never the key itself, not even its hash."""
+    alias, mail = k.get("key_alias") or "(no alias)", u.get("user_email") or "None"
+    spend, budget, exp, active = k.get("spend") or 0, k.get("max_budget"), ts(k.get("expires")), ts(k.get("last_active"))
+    flags = (["blocked"] if k.get("blocked") else []) + (["expired"] if exp and exp < t else ["expires soon"] if exp and exp < t + 14 * 86400 else [])
+    if budget is not None:
+        flags += ["over budget"] if spend >= budget else ["near budget"] if spend >= 0.8 * budget else []
+    created = ts(k.get("created_at"))
+    if "expired" not in flags and (not active or active < t - 30 * 86400) and created and created < t - 30 * 86400:
+        flags.append("unused 30 d")
+    # the owner LiteLLM records (ham-prd belongs to nilva); no owner record: the alias prefix
+    name = re.split(r"[\s(]", (u.get("user_alias") or "").strip())[0].lower()
+    return {"alias": alias, "user": name or key_user({"api_key_alias": alias, "user_email": mail}) or "?", "email": mail if "@" in mail else None,
+            "spend": round(spend, 2), "budget": budget, "rpm": k.get("rpm_limit"), "tpm": k.get("tpm_limit"), "models": k.get("models") or [],
+            "expires": exp, "active": active, "created": created, "flags": flags}
+
+
 def alertable(ns, owner):
     return not ns.startswith("user-") or owner == "us"  # users' own workloads: dashboard only
 
@@ -292,6 +310,7 @@ class Collector:
         self.model_tests, self.test_fails = {}, {}  # model -> {ok, ms, detail, ts, route}
         self.states = {r["key"]: (r["state"], r["since"]) for r in self.rows("SELECT * FROM state_since")}  # liveness
         self.bg, self.tickets_busy, self.tickets_tried = queue.Queue(), False, 0
+        self.key_rows = {"at": None, "rows": []}  # last good read: the VPN path to LiteLLM drops every few minutes
         threading.Thread(target=self._bg_loop, daemon=True).start()
 
     # --- database helpers -----------------------------------------------------------------------------------------
@@ -323,6 +342,7 @@ class Collector:
         return {"litellm": bool(e("LITELLM_URL") and e("LITELLM_KEY") and e("LITELLM_MODEL")),
                 "gitlab": bool(e("GITLAB_URL") and e("GITLAB_TOKEN") and e("GITLAB_PROJECTS")),
                 "grafana": bool(e("GRAFANA_URL") and (e("GRAFANA_TOKEN") or e("GRAFANA_USER") and e("GRAFANA_PASSWORD"))),
+                "keys": bool(e("LITELLM_READ_URL") and e("LITELLM_READ_KEY")),
                 "tickets": tickets.enabled(), "langfuse": bool(e("LANGFUSE_URL") and e("LANGFUSE_PK") and e("LANGFUSE_SK")),
                 "ai": bool(e("AI_URL") and e("AI_KEY") and e("AI_MODEL")) or bool(e("LITELLM_URL") and e("LITELLM_KEY") and e("LITELLM_MODEL"))}
 
@@ -476,6 +496,80 @@ class Collector:
             return {"from": first, "users": users}
         return self.cached("sso", 600, fetch) or {}
 
+    def key_owner(self, m):
+        """AIP username for a key's Prometheus labels: LiteLLM's owner record when we have it, else from the labels."""
+        return next((k["user"] for k in self.key_rows["rows"] if k["alias"] == m.get("api_key_alias")), None) or key_user(m)
+
+    def lread(self, path):
+        """GET on LiteLLM with the read-only key. The VPN path drops now and then: try again; an HTTP error is final."""
+        url = os.environ["LITELLM_READ_URL"].rstrip("/") + path
+        for i in range(3):
+            try:
+                return http_json("GET", url, {"Authorization": "Bearer " + os.environ["LITELLM_READ_KEY"]}, timeout=25)
+            except urllib.error.HTTPError:
+                raise
+            except OSError:
+                if i == 2:
+                    raise
+                time.sleep(5)
+
+    def refresh_keys(self, t):
+        """Every 5 min: all LiteLLM keys with owner, limits and warnings. Never keeps the key itself."""
+        if not self.integrations()["keys"]:
+            return
+        users = {}
+        for page in range(1, 51):
+            r = self.lread("/user/list?page=%d&page_size=100" % page)
+            users.update({u["user_id"]: u for u in r.get("users", [])})
+            if page >= (r.get("total_pages") or 1):
+                break
+        rows = []
+        for page in range(1, 51):
+            r = self.lread("/key/list?size=100&page=%d&return_full_object=true" % page)
+            rows += [slim_key(k, users.get(k.get("user_id")) or {}, t) for k in r.get("keys", []) if not (k.get("key_alias") or "").startswith("ops-dashboard")]
+            if page >= (r.get("total_pages") or 1):
+                break
+        self.key_rows = {"at": t, "rows": rows}
+
+    def keys(self):
+        """The Keys tab: every key, its real owner name, and a warning if the name list marks the account to delete."""
+        people = self.people()
+        out = []
+        for k in self.key_rows["rows"]:
+            p = next((p for p in people if k["alias"] in p["keys"] or k["user"] in p["users"]), None)
+            out.append(dict(k, person=p and p["name"], flags=k["flags"] + (["account to delete"] if p and p.get("remove") else [])))
+        return {"at": self.key_rows["at"], "keys": sorted(out, key=lambda k: (-len(k["flags"]), -k["spend"])), "error": self.integ_err.get("keys")}
+
+    def spend_count(self, frm, to, alias=None, status=None):
+        fm = lambda x: urllib.parse.quote(time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(x)))
+        q = "/spend/logs/ui?start_date=%s&end_date=%s&page=1&page_size=1" % (fm(frm), fm(to))
+        q += "&key_alias=" + urllib.parse.quote(alias) if alias else ""
+        q += "&status_filter=" + status if status else ""
+        return self.lread(q).get("total") or 0
+
+    def backfill_ticket_spend(self, t):
+        """LiteLLM's calls around each ticket (older than Prometheus and Langfuse), saved once: a past window never changes.
+        A few tickets per round, to keep the load on LiteLLM's database low."""
+        if not self.integrations()["keys"]:
+            return
+        use, done = self.usage().get("users", {}), 0
+        for r in self.rows("SELECT id, data FROM tickets ORDER BY id DESC"):
+            d = json.loads(r["data"])
+            created, (who, _) = d.get("created"), tickets.ticket_user(self, d, use)
+            alias = who if who and "-" in who else None
+            k = "tspend:%d:%s" % (r["id"], alias or "-")
+            if not created or self.meta(k) or t - created < 3 * 3600:
+                continue
+            a, b = created - tickets.PLATFORM_S, created + tickets.PLATFORM_S
+            out = {"total": self.spend_count(a, b), "failed": self.spend_count(a, b, status="failure")}
+            if alias:
+                a, b = created - tickets.NEAR_S, created + tickets.NEAR_S
+                out["user_total"], out["user_failed"] = self.spend_count(a, b, alias), self.spend_count(a, b, alias, "failure")
+            self.set_meta(k, json.dumps(out))
+            done += 1
+            if done >= 4:
+                return
+
     def check_llm_keys(self, t):
         """A user's LLM calls failing: at least LLM_FAIL_MIN calls and LLM_FAIL_RATE of them failed in the last hour, per key
         (LiteLLM counters in Prometheus). Dashboard only, never Telegram: users' keys fail often, and many at once."""
@@ -493,7 +587,7 @@ class Collector:
         sym = {}
         for alias, f in fail.items():
             n, (tot, labels) = sum(f["codes"].values()), total.get(alias, (0, {}))
-            who = key_user(dict(labels, api_key_alias=alias))
+            who = self.key_owner(dict(labels, api_key_alias=alias))
             if not who or tot < LLM_FAIL_MIN or n < LLM_FAIL_RATE * tot:
                 continue
             codes = {c: round(v) for c, v in sorted(f["codes"].items(), key=lambda x: -x[1]) if round(v)}
@@ -518,7 +612,7 @@ class Collector:
                                  ("spend", "litellm_spend_metric_total"), ("failed", "litellm_proxy_failed_requests_metric_total")):
                 for s in self.prom("sum by (api_key_alias, hashed_api_key, model, user_email) (increase(%s[30d]))" % metric):
                     m, v = s["metric"], float(s["value"][1])
-                    alias, who = m.get("api_key_alias") or "None", key_user(m)
+                    alias, who = m.get("api_key_alias") or "None", self.key_owner(m)
                     if not v or not who:  # master key, or no alias and no email: no user to put it on
                         continue
                     r = row(who)
@@ -528,7 +622,7 @@ class Collector:
                     if what == "requests" and m.get("model"):
                         r["models"][m["model"]] = r["models"].get(m["model"], 0) + v
             for s in self.prom("sum by (api_key_alias, user_email, route) (increase(litellm_proxy_total_requests_metric_total[30d]))"):
-                who, v = key_user(s["metric"]), round(float(s["value"][1]))
+                who, v = self.key_owner(s["metric"]), round(float(s["value"][1]))
                 if who and v:
                     rt = row(who).setdefault("routes", {})
                     rt[s["metric"].get("route", "?")] = rt.get(s["metric"].get("route", "?"), 0) + v
@@ -537,7 +631,7 @@ class Collector:
                              ("left", "min by (api_key_alias) (litellm_remaining_api_key_budget_metric)")):
                 for s in self.prom(q):
                     alias, v = s["metric"].get("api_key_alias") or "None", float(s["value"][1])
-                    who = key_user(s["metric"])
+                    who = self.key_owner(s["metric"])
                     if who and who in users and alias in users[who]["keys"] and v != float("inf"):
                         users[who]["keys"][alias][field] = round(v, 2)
             for what, q in (("cpu_h", 'sum by (namespace) (increase(container_cpu_usage_seconds_total{namespace=~"user-.*",container!=""}[30d])) / 3600'),
@@ -665,7 +759,7 @@ class Collector:
                 except Exception as e:
                     errors.append("%s: %s" % (ns, probe.err(e)))
         self.hosts = {h: ns for ns, inv in self.inv.items() for k, v in inv.items() if v["kind"] == "Ingress" for h in v["hosts"]}
-        for step in ([self.check_probe] + ([self.scan_logs, self.test_models, self.check_llm_keys] if slow else []) + [self.judge_changes]):
+        for step in ([self.check_probe] + ([self.scan_logs, self.test_models, self.check_llm_keys, self.refresh_keys, self.backfill_ticket_spend] if slow else []) + [self.judge_changes]):
             try:
                 step(t)
             except Exception as e:
@@ -1316,7 +1410,7 @@ class Collector:
         ns_list = sorted({ns for ns, _ in items})
         q = ",".join("?" * len(ns_list))
         return {"user": who, "namespaces": ns_list, "pods": [dict(p, ns=ns) for ns, p in items],
-                "use": use.get("users", {}).get(who), "use_from": use.get("from"),
+                "use": use.get("users", {}).get(who), "use_from": use.get("from"), "key_rows": [k for k in self.keys()["keys"] if k["user"] == who],
                 "sso": self.sso().get("users", {}).get(who), "sso_from": self.sso().get("from"),
                 "person": next(({"name": p["name"], "users": p["users"], "remove": bool(p.get("remove"))} for p in self.people() if who in p["users"]), None),
                 "key_people": {k: p["name"] for p in self.people() for k in p["keys"]},

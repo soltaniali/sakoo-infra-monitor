@@ -71,7 +71,7 @@ function showLogin(msg) {
 }
 
 const TABS = [['overview', 'Overview'], ['incidents', 'Incidents'], ['changes', 'Changes'], ['models', 'Models'],
-  ['services', 'Services'], ['logs', 'Logs'], ['infra', 'Infra or us'], ['users', 'Users'], ['tickets', 'Tickets'], ['capacity', 'Capacity'], ['trends', 'Trends']];
+  ['services', 'Services'], ['logs', 'Logs'], ['infra', 'Infra or us'], ['users', 'Users'], ['keys', 'Keys'], ['tickets', 'Tickets'], ['capacity', 'Capacity'], ['trends', 'Trends']];
 setInterval(() => { const c = document.getElementById('clock'); if (c) c.textContent = 'Tehran ' + fmt(Date.now() / 1000); }, 15000);
 function nav(page) {
   document.getElementById('tabs').replaceChildren(...TABS.map(([k, t]) => h('a', {href: '#/' + k, class: page === k || (page === 'incident' && k === 'incidents') || (page === 'ticket' && k === 'tickets') ? 'on' : ''}, t)));
@@ -131,8 +131,8 @@ const VIEWS = {};
 VIEWS.overview = async () => {
   const s = await api('/api/state');
   const st = s.status || {}, ig = s.integrations || {};
-  const chips = ['ai', 'litellm', 'gitlab', 'grafana', 'langfuse', 'tickets'].map(k => h('span', {class: 'chip ' + (ig[k] ? (ig.errors[k] ? 'warn' : 'ok') : ''),
-    title: ig.errors[k] || (ig[k] ? 'on' : 'off: set its env in secrets/ops.env')}, {ai: 'AI summaries', litellm: 'model test calls', gitlab: 'who changed it', grafana: 'GPU % · usage', langfuse: 'LLM request log', tickets: 'ticket site'}[k]));
+  const chips = ['ai', 'litellm', 'keys', 'gitlab', 'grafana', 'langfuse', 'tickets'].map(k => h('span', {class: 'chip ' + (ig[k] ? (ig.errors[k] ? 'warn' : 'ok') : ''),
+    title: ig.errors[k] || (ig[k] ? 'on' : 'off: set its env in secrets/ops.env')}, {ai: 'AI summaries', litellm: 'model test calls', gitlab: 'who changed it', grafana: 'GPU % · usage', langfuse: 'LLM request log', keys: 'LiteLLM keys', tickets: 'ticket site'}[k]));
   return h('div', {},
     h('div', {class: 'row mut small'}, 'Last round ' + ago(st.last) + (st.took != null ? ' (' + st.took + ' s)' : '') + ' · ' +
       (st.namespaces || 0) + ' namespaces read · full read ' + ago(st.slow_last) + ' · probe report ' + ago(s.probe_ts), ' ', chips,
@@ -338,6 +338,29 @@ VIEWS.users = async () => {
     locked.length ? [h('h2', {class: 'locked-title'}, 'Not visible yet · ' + locked.length), h('div', {class: 'locked-grid'}, locked.map(lockedCard))] : '');
 };
 
+// --- LiteLLM keys: owner, limits, warnings. Dashboard only, nothing goes to the bot ------------------------------------
+const KEY_FLAG = {blocked: 'bad', expired: 'bad', 'over budget': 'bad', 'near budget': 'warn', 'expires soon': 'warn', 'account to delete': 'warn'};
+const keyFlags = k => k.flags.length ? k.flags.map(f => [h('span', {class: 'chip ' + (KEY_FLAG[f] || '')}, f), ' ']) : h('span', {class: 'mut'}, 'ok');
+const keyLimits = k => (k.rpm || k.tpm ? (k.rpm || '–') + ' rpm · ' + (k.tpm || '–') + ' tpm' : 'no limit');
+const keyModels = k => !k.models.length || k.models.includes('all-team-models') ? 'all' : h('span', {title: k.models.join(', ')}, k.models.length + ' models');
+const keyBudget = k => k.budget == null ? h('span', {class: 'mut'}, 'no limit') : '$' + k.spend + ' of $' + k.budget;
+VIEWS.keys = async q => {
+  const r = await api('/api/keys'), flag = q.flag || '';
+  const flags = [...new Set(r.keys.flatMap(k => k.flags))].sort();
+  const rows = flag ? r.keys.filter(k => k.flags.includes(flag)) : r.keys;
+  const go = f => { location.hash = '#/keys' + (f ? '?' + qs({flag: f}) : ''); };
+  return h('div', {}, h('h1', {}, 'Keys · ' + r.keys.length),
+    h('p', {class: 'mut small'}, 'Every LiteLLM key, read with a read-only key every 5 min. Read ', T(r.at), '. Warnings stay on this page; nothing goes to the bot.'),
+    r.error ? h('div', {class: 'card err small'}, 'Last read failed: ' + r.error + ' (showing the last good read)') : '',
+    h('div', {class: 'row'}, h('button', {class: flag ? '' : 'primary', onclick: () => go('')}, 'All'),
+      flags.map(f => h('button', {class: flag === f ? 'primary' : '', onclick: () => go(f)}, f + ' · ' + r.keys.filter(k => k.flags.includes(f)).length))),
+    h('div', {class: 'card'}, table([['Key', k => h('b', {dir: 'auto'}, k.alias)],
+      ['Owner', k => [h('a', {href: '#/user?' + qs({name: k.user})}, k.user), k.person ? h('div', {class: 'small mut', dir: 'auto'}, k.person) : '']],
+      ['Warnings', keyFlags], ['Spend / budget', k => k.budget == null ? '$' + k.spend : keyBudget(k)], ['Rate limit', keyLimits], ['Models', keyModels],
+      ['Expires', k => k.expires ? T(k.expires) : h('span', {class: 'mut'}, 'never')], ['Last used', k => k.active ? T(k.active) : h('span', {class: 'mut'}, 'never')],
+      ['Created', k => T(k.created)]], rows)));
+};
+
 VIEWS.user = async q => {
   const u = await api('/api/user?' + qs({name: q.name}));
   return h('div', {}, h('p', {}, h('a', {href: '#/users'}, '← users')),
@@ -358,6 +381,9 @@ VIEWS.user = async q => {
           Object.entries(u.use.keys)),
         h('p', {class: 'small'}, 'Requests per model: ' + (Object.entries(u.use.models).map(([m, n]) => m + ' ' + n).join(', ') || '–')),
         h('p', {class: 'small'}, 'API routes on the LLM gateway: ' + (Object.entries(u.use.routes || {}).sort((a, b) => b[1] - a[1]).map(([r, n]) => r + ' ' + n).join(', ') || '–')))] : '',
+    (u.key_rows || []).length ? [h('h2', {}, 'Keys · limits and warnings (LiteLLM)'), h('div', {class: 'card'}, table([['Key', k => h('b', {dir: 'auto'}, k.alias)],
+      ['Warnings', keyFlags], ['Budget', keyBudget], ['Rate limit', keyLimits], ['Models', keyModels], ['Expires', k => k.expires ? T(k.expires) : h('span', {class: 'mut'}, 'never')],
+      ['Last used', k => k.active ? T(k.active) : h('span', {class: 'mut'}, 'never')]], u.key_rows))] : '',
     h('h2', {}, 'Pods · ' + u.pods.length), h('div', {class: 'card'}, table([['Namespace', p => p.ns], ['Pod', p => p.name], ['Phase', p => p.phase],
       ['Ready', p => live(p.ready ? 'ready' : 'not ready', p.since, null, !p.ready)], ['Restarts', p => p.restarts],
       ['CPU / RAM now', p => p.use_cpu == null ? '–' : p.use_cpu.toFixed(2) + ' cores / ' + (p.use_mem / 1073741824).toFixed(1) + ' GiB'],

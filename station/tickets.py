@@ -71,6 +71,17 @@ def key_usage(col, selectors, at):
     return out
 
 
+def key_problems(col, alias, models):
+    k = next((k for k in col.key_rows["rows"] if k["alias"] == alias), None) if alias else None
+    if not k:
+        return []
+    out = ["key %s now: %s" % (alias, f) for f in k["flags"] if f in ("blocked", "expired", "over budget")]
+    allowed = k["models"]
+    if allowed and "all-team-models" not in allowed:
+        out += ["key %s now: model %s not allowed" % (alias, m["name"]) for m in models if not any(m["name"] in a for a in allowed)]
+    return out
+
+
 def ticket_user(col, d, use):
     """AIP username of the requester: from the hand-kept map, else the owner of an API key posted in the ticket."""
     try:
@@ -340,6 +351,10 @@ def analyze(col, d, ai=None):
     who, found = ticket_user(col, d, use)
     alias = who if who and "-" in who else None  # usernames have no '-'; key aliases are '<user>-<key name>'
     who = who.split("-", 1)[0] if who else None
+    # what LiteLLM says about the key now: a likely reason for the ticket
+    for p in key_problems(col, alias, models):
+        q1["answer"] = p if q1["answer"] == "complete" else p + "; " + q1["answer"]
+        q1["status"] = "bad" if q1["status"] == "bad" else "warn"
     # the user's own LLM requests from 2 h before the first to 2 h after the last moment they wrote (Langfuse)
     log = col.llm_log(alias or who, moments[0] - NEAR_S, moments[-1] + NEAR_S) if who else None
     n_req = sum(m["count"] for m in log["models"]) if log else 0
@@ -401,8 +416,17 @@ def analyze(col, d, ai=None):
           "incidents": mine, "platform": platform[:20], "moments": moments, "data_from": first_data, "first_answer_h": wait_h}
     if log:  # Langfuse keeps older history than our incidents: the user's own failed calls still answer "was it broken"
         q5["answer"] += "; the user's own LLM calls then: %d of %d failed" % (n_err, n_req)
+    # older than Langfuse: LiteLLM's own logs, saved once in the background (Collector.backfill_ticket_spend)
+    old = json.loads(col.meta("tspend:%d:%s" % (d["id"], alias or "-")) or "null") if d.get("id") else None
+    if old and alias and "user_total" in old and not n_req:
+        q5["answer"] += "; the user's key then (LiteLLM logs): %d of %d failed" % (old["user_failed"], old["user_total"])
+        q5["status"] = "warn" if old["user_failed"] and q5["status"] in ("ok", "info") else q5["status"]
     # every LLM call through the gateway 30 min around the filing time: was the whole platform failing then?
     plat = col.llm_platform(created - PLATFORM_S, created + PLATFORM_S)
+    if not plat and old and old["total"]:
+        q5["answer"] += "; platform LLM calls ±30 min (LiteLLM logs): %d%% of %d failed" % (100 * old["failed"] / old["total"], old["total"])
+        if old["failed"] >= PLATFORM_BAD * old["total"] and q5["status"] in ("ok", "info"):
+            q5["status"] = "warn"
     if plat:
         tot, bad = sum(m["count"] for m in plat), sum(m["failed"] for m in plat)
         names = [m["name"].lower() for m in models]

@@ -462,6 +462,43 @@ assert lf_inc["uni-k1"]["owner"] == "us" and "60 of 100 calls failed" in lf_inc[
 assert lf_inc["kaf_prd"]["ns"] == "user-nilva" and lf_inc["kaf_prd"]["owner"] == "user-nilva" and "rejects" in lf_inc["kaf_prd"]["cause"]
 assert len(col.alerts) == n_alerts and not any(r["alerted"] for r in lf_inc.values()), col.alerts   # never Telegram
 
+# LiteLLM keys: owner from alias or email, warnings, never the key itself; old tickets get LiteLLM's counts, saved once
+T0 = time.time()
+iso = lambda x: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(x))
+def fake_lread(path):
+    fake_lread.calls.append(path)
+    if path.startswith("/user/list"):
+        return {"users": [{"user_id": "u1", "user_email": "nilva@x.ir"}], "total_pages": 1}
+    if path.startswith("/key/list"):
+        return {"total_pages": 1, "keys": [
+            {"key_alias": "uni-k2", "user_id": "u9", "api_key": "sk-SECRETvalue", "expires": iso(T0 - 86400), "spend": 9, "max_budget": 10, "models": ["rayen-zzz"], "created_at": iso(T0 - 90 * 86400), "last_active": iso(T0 - 60)},
+            {"key_alias": "kaf_prd", "user_id": "u1", "created_at": iso(T0 - 90 * 86400), "spend": 1},
+            {"key_alias": "ops-dashboard-readonly", "user_id": "u1"}]}
+    return {"total": 8 if "status_filter=failure" in path else 20}
+fake_lread.calls = []
+col.lread = fake_lread
+os.environ.update(LITELLM_READ_URL="https://l", LITELLM_READ_KEY="k")
+col.refresh_keys(T0)
+ks = {k["alias"]: k for k in col.keys()["keys"]}
+assert set(ks) == {"uni-k2", "kaf_prd"} and "SECRET" not in json.dumps(ks), ks
+assert ks["uni-k2"]["user"] == "uni" and set(ks["uni-k2"]["flags"]) == {"expired", "near budget"}, ks["uni-k2"]
+assert ks["kaf_prd"]["user"] == "nilva" and ks["kaf_prd"]["flags"] == ["unused 30 d"], ks["kaf_prd"]
+assert tickets.key_problems(col, "uni-k2", [{"name": "m1"}]) == ["key uni-k2 now: expired", "key uni-k2 now: model m1 not allowed"]
+assert tickets.key_problems(col, "kaf_prd", [{"name": "m1"}]) == [] and tickets.key_problems(col, None, []) == []
+old_t = dict(rows[0], **dict(d, id=99, created=T0 - 100 * 86400, key_hashes=[]))
+old_t["messages"] = [dict(d["messages"][0], ts=old_t["created"])]
+col.exec("INSERT INTO tickets (id, sig, data, fetched, seen, ai) VALUES (99, 's', ?, ?, ?, NULL)", (json.dumps(old_t), T0, T0))
+col.lf, col.usage = (lambda path, **q: {"data": []}), (lambda: {})
+col.backfill_ticket_spend(T0)
+n = len(fake_lread.calls)
+col.backfill_ticket_spend(T0)
+assert n > 2 and len(fake_lread.calls) == n   # saved once: no second read of the same window
+assert "platform LLM calls ±30 min (LiteLLM logs): 40% of 20 failed" in tickets.analyze(col, old_t)["q5"]["answer"]   # older than Langfuse
+col.exec("DELETE FROM tickets WHERE id=99")
+del col.usage
+for k in ("LITELLM_READ_URL", "LITELLM_READ_KEY"):
+    os.environ.pop(k)
+
 # Casdoor log: last activity per user of the platform organisation; anonymous / built-in admins are skipped
 log = "\n".join([
     "2026/10/30 09:16:44.793 [I]  (10.0.0.210) subOwner = anonymous, subName = anonymous, method = POST, urlPath = /api/login, obj.Owner = , obj.Name = , result = allow",
