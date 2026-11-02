@@ -7,6 +7,7 @@ Rounds: every ROUND_S our namespace; every SLOW_EVERY rounds all readable namesp
 Data: SQLite $OPS_DATA/ops.db (default /data). Probe results: $PROBE_RESULTS (written by probe.py on this station).
 Optional integrations, each on when its env is set (secrets/ops.env):
   LITELLM_URL (…/v1), LITELLM_KEY, LITELLM_MODEL     model test calls, "registered in litellm?" for models
+  CASDOOR_URL, CASDOOR_KEY, CASDOOR_SECRET           login records (read only; the key has its user's rights)
   LITELLM_READ_URL, LITELLM_READ_KEY                 read-only key (Admin Viewer): key owners, limits, old spend logs
   AI_URL (…/v1), AI_KEY, AI_MODEL                     any OpenAI-compatible LLM (free tier: Mistral, OpenRouter, ...) for log,
                                                        incident and ticket summaries; without it the LITELLM_* model is used
@@ -99,6 +100,8 @@ CREATE TABLE IF NOT EXISTS restarts (day TEXT, ns TEXT, wl TEXT, first INTEGER, 
 CREATE TABLE IF NOT EXISTS state_since (key TEXT PRIMARY KEY, state TEXT, since REAL);
 CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY, ts REAL, text TEXT, sent REAL);
 CREATE TABLE IF NOT EXISTS tickets (id INTEGER PRIMARY KEY, sig TEXT, data TEXT, fetched REAL, seen REAL, ai TEXT);
+CREATE TABLE IF NOT EXISTS logins (name TEXT PRIMARY KEY, ts REAL, user TEXT, result TEXT);
+CREATE INDEX IF NOT EXISTS logins_user ON logins (user, ts);
 CREATE INDEX IF NOT EXISTS changes_ts ON changes (ts);
 CREATE INDEX IF NOT EXISTS incidents_state ON incidents (state, scope);
 """
@@ -160,6 +163,28 @@ def key_user(m):
     """AIP username of a LiteLLM key from its Prometheus labels: alias '<user>-<key name>', else the key's user email."""
     alias, mail = m.get("api_key_alias") or "None", m.get("user_email") or "None"
     return alias.split("-", 1)[0] if "-" in alias else mail.split("@")[0] if "@" in mail else None
+
+
+def login_row(r, known):
+    """(record name, time, user, result) of a Casdoor login record, or None if it is no real login attempt.
+    Never keeps the record's Object (it holds what was typed) or its IP (always the same internal proxy). A name that
+    is no known account becomes "(unknown name)": people type passwords into the username field."""
+    resp = r.get("response") or ""
+    if 'status:"ok"' in resp:
+        result = "ok"
+    elif "wrong password" in resp or "password or code is incorrect" in resp:
+        result = "wrong password"
+    elif "The user: " in resp:
+        result = "no such user"
+    else:
+        return None
+    try:
+        typed = json.loads(r.get("object") or "{}")
+    except ValueError:
+        typed = {}
+    name = r.get("user") or (typed.get("username") if isinstance(typed, dict) else "") or ""
+    name = str(name).rsplit("/", 1)[-1].strip().lower()
+    return r.get("name"), ts(r.get("createdTime")), name if name in known else "(unknown name)", result
 
 
 def slim_key(k, u, t):
@@ -343,6 +368,7 @@ class Collector:
                 "gitlab": bool(e("GITLAB_URL") and e("GITLAB_TOKEN") and e("GITLAB_PROJECTS")),
                 "grafana": bool(e("GRAFANA_URL") and (e("GRAFANA_TOKEN") or e("GRAFANA_USER") and e("GRAFANA_PASSWORD"))),
                 "keys": bool(e("LITELLM_READ_URL") and e("LITELLM_READ_KEY")),
+                "casdoor": bool(e("CASDOOR_URL") and e("CASDOOR_KEY") and e("CASDOOR_SECRET")),
                 "tickets": tickets.enabled(), "langfuse": bool(e("LANGFUSE_URL") and e("LANGFUSE_PK") and e("LANGFUSE_SK")),
                 "ai": bool(e("AI_URL") and e("AI_KEY") and e("AI_MODEL")) or bool(e("LITELLM_URL") and e("LITELLM_KEY") and e("LITELLM_MODEL"))}
 
@@ -495,6 +521,37 @@ class Collector:
                 u["denied"] += m.group(5) == "deny"
             return {"from": first, "users": users}
         return self.cached("sso", 600, fetch) or {}
+
+    def refresh_logins(self, t):
+        """Every 5 min: Casdoor's newest login records, plus a few older pages until the history is in."""
+        if not self.integrations()["casdoor"]:
+            return
+        known = set(self.user_pods()) | {u for p in self.people() for u in p["users"]} | {k["user"] for k in self.key_rows["rows"]}
+        known |= set(self.sso().get("users", {}))
+        back = int(self.meta("logins_page") or 2)
+        for page in [1] + (list(range(back, back + 3)) if back else []):
+            q = urllib.parse.urlencode({"p": page, "pageSize": 200, "field": "action", "value": "login", "sortField": "createdTime", "sortOrder": "descend",
+                                        "accessKey": os.environ["CASDOOR_KEY"], "accessSecret": os.environ["CASDOOR_SECRET"]})
+            r = http_json("GET", os.environ["CASDOOR_URL"].rstrip("/") + "/api/get-records?" + q, timeout=40)
+            if r.get("status") != "ok":
+                raise RuntimeError("casdoor: %s" % str(r.get("msg"))[:120])
+            rows = r.get("data") or []
+            for x in rows:
+                row = login_row(x, known)
+                if row and row[0]:
+                    self.exec("INSERT OR IGNORE INTO logins VALUES (?, ?, ?, ?)", row)
+            if page > 1 and not rows:
+                back = 0
+                break
+        self.set_meta("logins_page", str(back + 3 if back else 0))
+
+    def logins(self):
+        """Failed logins over the platform, last 7 days: who is being tried, and how much."""
+        since = time.time() - 7 * 86400
+        return {"from": (self.one("SELECT min(ts) t FROM logins") or {}).get("t"),
+                "ok": self.one("SELECT count(*) n FROM logins WHERE ts>=? AND result='ok'", (since,))["n"],
+                "failed": self.one("SELECT count(*) n FROM logins WHERE ts>=? AND result!='ok'", (since,))["n"],
+                "top": self.rows("SELECT user, count(*) n, max(ts) last FROM logins WHERE ts>=? AND result!='ok' GROUP BY user ORDER BY n DESC LIMIT 8", (since,))}
 
     def key_owner(self, m):
         """AIP username for a key's Prometheus labels: LiteLLM's owner record when we have it, else from the labels."""
@@ -759,7 +816,7 @@ class Collector:
                 except Exception as e:
                     errors.append("%s: %s" % (ns, probe.err(e)))
         self.hosts = {h: ns for ns, inv in self.inv.items() for k, v in inv.items() if v["kind"] == "Ingress" for h in v["hosts"]}
-        for step in ([self.check_probe] + ([self.scan_logs, self.test_models, self.check_llm_keys, self.refresh_keys, self.backfill_ticket_spend] if slow else []) + [self.judge_changes]):
+        for step in ([self.check_probe] + ([self.scan_logs, self.test_models, self.check_llm_keys, self.refresh_keys, self.backfill_ticket_spend, self.refresh_logins] if slow else []) + [self.judge_changes]):
             try:
                 step(t)
             except Exception as e:
@@ -1385,8 +1442,11 @@ class Collector:
                          "cpu_req": 0, "mem_use_gib": 0, "gpu": "", "restarts": 0, "open": 0, "changes_7d": 0, "last_change": None,
                          "started": None})
         people, sso = self.people(), self.sso().get("users", {})
+        since = t - 30 * 86400
+        logins = {r["user"]: r for r in self.rows("SELECT user, max(CASE WHEN result='ok' THEN ts END) last_ok, sum(result!='ok' AND ts>=?) failed, "
+                                                  "max(CASE WHEN result!='ok' THEN ts END) last_failed FROM logins GROUP BY user", (since,))}
         for r in rows:
-            r["use"], r["sso"] = use.get(r["user"]), sso.get(r["user"])
+            r["use"], r["sso"], r["login"] = use.get(r["user"]), sso.get(r["user"]), logins.get(r["user"])
             p = next((p for p in people if r["user"] in p["users"]), None)
             r["person"] = p and {"name": p["name"], "users": p["users"], "remove": bool(p.get("remove"))}
         # one person's namespaces next to each other (Avir: aviraip, aviraip2)
@@ -1412,6 +1472,7 @@ class Collector:
         return {"user": who, "namespaces": ns_list, "pods": [dict(p, ns=ns) for ns, p in items],
                 "use": use.get("users", {}).get(who), "use_from": use.get("from"), "key_rows": [k for k in self.keys()["keys"] if k["user"] == who],
                 "sso": self.sso().get("users", {}).get(who), "sso_from": self.sso().get("from"),
+                "login_rows": self.rows("SELECT ts, result FROM logins WHERE user=? ORDER BY ts DESC LIMIT 30", (who,)),
                 "person": next(({"name": p["name"], "users": p["users"], "remove": bool(p.get("remove"))} for p in self.people() if who in p["users"]), None),
                 "key_people": {k: p["name"] for p in self.people() for k in p["keys"]},
                 "llm_log": self.llm_log(who, now - 7 * 86400, now), "llm_error": self.integ_err.get(

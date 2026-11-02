@@ -416,6 +416,11 @@ def analyze(col, d, ai=None):
           "incidents": mine, "platform": platform[:20], "moments": moments, "data_from": first_data, "first_answer_h": wait_h}
     if log:  # Langfuse keeps older history than our incidents: the user's own failed calls still answer "was it broken"
         q5["answer"] += "; the user's own LLM calls then: %d of %d failed" % (n_err, n_req)
+    if who:  # could the user log in? (Casdoor login records)
+        n = col.one("SELECT count(*) n FROM logins WHERE user=? AND result!='ok' AND ts BETWEEN ? AND ?", (who, moments[0] - NEAR_S, moments[-1] + NEAR_S))["n"]
+        if n:
+            q5["answer"] += "; failed logins of %s within 2 h: %d" % (who, n)
+            q5["status"] = "warn" if q5["status"] in ("ok", "info") else q5["status"]
     # older than Langfuse: LiteLLM's own logs, saved once in the background (Collector.backfill_ticket_spend)
     old = json.loads(col.meta("tspend:%d:%s" % (d["id"], alias or "-")) or "null") if d.get("id") else None
     if old and alias and "user_total" in old and not n_req:

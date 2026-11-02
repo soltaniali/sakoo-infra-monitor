@@ -499,6 +499,33 @@ del col.usage
 for k in ("LITELLM_READ_URL", "LITELLM_READ_KEY"):
     os.environ.pop(k)
 
+# Casdoor login records: real attempts only, a failed name that is no account is not stored, what was typed never is
+known = {"uni"}
+rec = lambda resp, **kw: dict({"name": "r1", "createdTime": "2026-10-30T10:00:00Z", "user": "", "response": resp, "object": ""}, **kw)
+assert ops.login_row(rec('{status:"ok", msg:""}', user="UNI"), known)[2:] == ("uni", "ok")
+assert ops.login_row(rec('{status:"error", msg:"You have entered the wrong password or code"}', object='{"username":"org/uni","password":"***"}'), known)[2:] == ("uni", "wrong password")
+leak = ops.login_row(rec('{status:"error", msg:"You have entered the wrong password or code"}', object='{"username":"MyS3cretPass","password":"x"}'), known)
+assert leak[2] == "(unknown name)" and "MyS3cret" not in json.dumps(leak), leak
+assert ops.login_row(rec('{status:"", msg:""}'), known) is None and ops.login_row(rec('{status:"error", msg:"Unauthorized operation"}', user="uni"), known) is None
+T1 = time.time()
+stamp = lambda x: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(x))
+pages = {1: [rec('{status:"ok", msg:""}', user="uni", name="a", createdTime=stamp(T1 - 600)),
+             rec('{status:"error", msg:"You have entered the wrong password"}', name="b", object='{"username":"uni"}', createdTime=stamp(T1 - 300))],
+         2: [rec('{status:"error", msg:"You have entered the wrong password"}', name="c", object='{"username":"nobody"}', createdTime=stamp(T1 - 200))]}
+real_http, ops.http_json = ops.http_json, lambda m, url, h=None, b=None, timeout=30: {"status": "ok", "data": pages.get(int(ops.urllib.parse.parse_qs(url.split("?")[1])["p"][0]), [])}
+os.environ.update(CASDOOR_URL="https://c", CASDOOR_KEY="k", CASDOOR_SECRET="s")
+col.pods.setdefault("user-uni", [])
+col.key_rows["rows"].append({"user": "uni", "alias": "uni-k9", "flags": []})
+col.refresh_logins(T1)
+col.refresh_logins(T1)   # same records again: no double count
+ops.http_json = real_http
+lg = col.logins()
+assert lg["ok"] == 1 and lg["failed"] == 2 and {x["user"]: x["n"] for x in lg["top"]} == {"uni": 1, "(unknown name)": 1}, lg
+assert col.meta("logins_page") == "0"   # history finished: only the newest page from now on
+col.key_rows["rows"].pop()
+for k in ("CASDOOR_URL", "CASDOOR_KEY", "CASDOOR_SECRET"):
+    os.environ.pop(k)
+
 # Casdoor log: last activity per user of the platform organisation; anonymous / built-in admins are skipped
 log = "\n".join([
     "2026/10/30 09:16:44.793 [I]  (10.0.0.210) subOwner = anonymous, subName = anonymous, method = POST, urlPath = /api/login, obj.Owner = , obj.Name = , result = allow",

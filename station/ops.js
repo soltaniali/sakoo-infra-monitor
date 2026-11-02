@@ -286,7 +286,7 @@ const LOCKED_USER = [  // what our access still cannot show (2026-10-31: kubecon
   {key: 'failed-login', title: 'Failed logins', shows: 'wrong passwords per user', needs: 'Casdoor writes failed logins as anonymous; only its database has them (access request 45)'},
 ];
 // LLM usage comes from Grafana's Prometheus (LiteLLM counters per key) once a Grafana login is set
-const userLocked = () => LOCKED_USER.filter(l => !(l.key === 'llm' && me.integrations.grafana));
+const userLocked = () => LOCKED_USER.filter(l => !(l.key === 'llm' && me.integrations.grafana) && !(l.key === 'failed-login' && me.integrations.casdoor));
 const big = n => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e4 ? Math.round(n / 1e3) + 'k' : String(n);
 const llmCell = u => !u || !u.requests ? '–' : [big(u.requests) + ' calls · ' + big(u.tokens) + ' tok · $' + u.spend,
   u.failed ? h('span', {class: 'err'}, ' · ' + u.failed + ' failed') : ''];
@@ -295,7 +295,7 @@ const lockedCard = l => h('div', {class: 'card locked'}, h('div', {}, h('b', {},
   h('div', {class: 'small'}, 'Will show: ' + l.shows), h('div', {class: 'small'}, 'Needs: ' + l.needs));
 
 VIEWS.users = async () => {
-  const us = await api('/api/users');
+  const us = await api('/api/users'), lg = me.integrations.casdoor ? await api('/api/logins') : null;
   const groups = [];  // one card per person from the name list (several namespaces), or per account not in the list
   for (const u of us) {
     const k = u.person ? 'p:' + u.person.name : 'u:' + u.user;
@@ -306,7 +306,8 @@ VIEWS.users = async () => {
   const sum = (g, f) => g.rows.reduce((n, u) => n + (f(u) || 0), 0);
   for (const g of groups) Object.assign(g, {open: sum(g, u => u.open), running: sum(g, u => u.running), restarts: sum(g, u => u.restarts),
     req: sum(g, u => u.use && u.use.requests), failed: sum(g, u => u.use && u.use.failed), spend: sum(g, u => u.use && u.use.spend),
-    cpu_h: sum(g, u => u.use && u.use.cpu_h), gpu_h: sum(g, u => u.use && u.use.gpu_h), seen: Math.max(0, ...g.rows.map(u => u.sso ? u.sso.last : 0))});
+    cpu_h: sum(g, u => u.use && u.use.cpu_h), gpu_h: sum(g, u => u.use && u.use.gpu_h), seen: Math.max(0, ...g.rows.map(u => u.sso ? u.sso.last : 0)),
+    lastLogin: Math.max(0, ...g.rows.map(u => u.login && u.login.last_ok || 0)), loginFail: sum(g, u => u.login && u.login.failed)});
   groups.sort((a, b) => b.open - a.open || b.seen - a.seen || b.req - a.req);
   const stat = (k, ...v) => h('div', {class: 'stat'}, h('span', {class: 'k'}, k), h('span', {class: 'v'}, ...v));
   const num = n => Math.round(n).toLocaleString('en');
@@ -315,14 +316,15 @@ VIEWS.users = async () => {
       g.rows.length > 1 ? h('span', {class: 'chip group'}, 'one person · ' + g.rows.length + ' namespaces') : '',
       g.name ? '' : h('span', {class: 'small mut'}, 'not in the name list')),
     h('div', {class: 'stats'},
-      stat('Last active (SSO)', T(g.seen || null)), stat('Open incidents', g.open ? h('span', {class: 'err'}, g.open) : '0'),
+      stat('Last active (SSO)', T(g.seen || null)), me.integrations.casdoor ? stat('Last password login', T(g.lastLogin || null)) : '',
+      me.integrations.casdoor ? stat('Failed logins · 30 d', g.loginFail ? h('span', {class: 'err'}, g.loginFail) : '0') : '', stat('Open incidents', g.open ? h('span', {class: 'err'}, g.open) : '0'),
       stat('Running pods', g.running), stat('LLM calls · 30 d', num(g.req), g.failed ? h('span', {class: 'err'}, ' · ' + num(g.failed) + ' failed') : ''),
       stat('Spend · 30 d', '$' + g.spend.toFixed(2)), stat('CPU-h · GPU-h · 30 d', num(g.cpu_h) + ' · ' + num(g.gpu_h))),
     table([['Namespace / account', u => h('a', {href: '#/user?' + qs({name: u.user})}, h('b', {}, u.user))], ['Runs', u => u.kinds.join(', ')],
       ['Pods', u => u.running + ' running' + (u.pending ? ', ' + u.pending + ' pending' : '')], ['CPU used / reserved', u => u.cpu_use + ' / ' + u.cpu_req],
       ['RAM', u => u.mem_use_gib + ' GiB'], ['GPU', u => u.gpu || '–'], ['Restarts', u => u.restarts ? h('span', {class: 'err'}, u.restarts) : 0],
       ['Incidents', u => u.open ? h('span', {class: 'err'}, u.open) : 0], ['LLM 30 d', u => llmCell(u.use)],
-      ['CPU-h · GPU-h', u => u.use ? u.use.cpu_h + ' · ' + u.use.gpu_h : '–'], ['Last active (SSO)', u => T(u.sso && u.sso.last)],
+      ['CPU-h · GPU-h', u => u.use ? u.use.cpu_h + ' · ' + u.use.gpu_h : '–'], ['Last active (SSO)', u => T(u.sso && u.sso.last)], ...(me.integrations.casdoor ? [['Failed logins 30 d', u => u.login && u.login.failed ? h('span', {class: 'err'}, u.login.failed) : 0]] : []),
       ['Changes 7 d', u => u.changes_7d ? [u.changes_7d + ' · ', T(u.last_change)] : 0], ['Running since', u => T(u.started)]], g.rows))]);
   const search = h('input', {type: 'search', placeholder: 'Search name or namespace…', oninput: () => {
     const v = search.value.trim().toLowerCase();
@@ -334,6 +336,10 @@ VIEWS.users = async () => {
       stat('With open incidents', groups.filter(g => g.open).length)),
     h('p', {class: 'mut small'}, 'One card per person: all their namespaces are inside it. Red edge = open incident, grey = nothing running and no LLM use. ' +
       'Real names: the team\'s name list. LLM and CPU/GPU: Grafana (30 d, Prometheus data from 21 Oct). Last active: Casdoor log.'),
+    lg ? h('div', {class: 'card', style: 'margin-bottom:14px'}, h('b', {}, 'Logins · last 7 days (Casdoor)'),
+      h('div', {class: 'stats'}, stat('Password logins', lg.ok), stat('Failed', lg.failed ? h('span', {class: 'err'}, lg.failed) : 0), stat('History from', T(lg.from))),
+      lg.top.length ? table([['Failed for', t => t.user], ['Times', t => t.n], ['Last', t => T(t.last)]], lg.top) : '',
+      h('div', {class: 'small mut'}, 'A login through a running session is not counted here. "(unknown name)" = not one of our accounts; the typed name is not stored. No IPs: Casdoor sees only its proxy.')) : '',
     h('div', {class: 'row'}, search), cards.map(c => c[1]),
     locked.length ? [h('h2', {class: 'locked-title'}, 'Not visible yet · ' + locked.length), h('div', {class: 'locked-grid'}, locked.map(lockedCard))] : '');
 };
@@ -372,7 +378,8 @@ VIEWS.user = async q => {
       h('div', {class: 'stat'}, h('span', {class: 'k'}, 'SSO requests'), h('span', {class: 'v'}, u.sso.requests)),
       h('div', {class: 'stat'}, h('span', {class: 'k'}, 'Log-outs'), h('span', {class: 'v'}, u.sso.logouts)),
       h('div', {class: 'stat'}, h('span', {class: 'k'}, 'Denied requests'), h('span', {class: 'v'}, u.sso.denied ? h('span', {class: 'err'}, u.sso.denied) : 0)))
-      : h('span', {class: 'mut'}, 'No sign-in in the Casdoor log'), h('div', {class: 'small mut'}, 'The log covers ', T(u.sso_from), ' until now (the running Casdoor pod).')),
+      : h('span', {class: 'mut'}, 'No sign-in in the Casdoor log'), h('div', {class: 'small mut'}, 'The log covers ', T(u.sso_from), ' until now (the running Casdoor pod).'),
+      (u.login_rows || []).length ? [h('b', {}, 'Password logins'), table([['Time', x => T(x.ts)], ['Result', x => x.result === 'ok' ? h('span', {class: 'chip ok'}, 'ok') : h('span', {class: 'chip bad'}, x.result)]], u.login_rows)] : ''),
     h('p', {class: 'mut'}, 'Namespaces: ' + (u.namespaces.join(', ') || 'none (API key only)')),
     u.use ? [h('h2', {}, 'LLM and compute · 30 d' + (u.use_from ? ' (Prometheus data from ' + fmt(u.use_from) + ', Tehran)' : '')),
       h('div', {class: 'card'}, h('p', {}, llmCell(u.use), ' · CPU ' + u.use.cpu_h + ' core-h · GPU ' + u.use.gpu_h + ' h'),
