@@ -540,7 +540,7 @@ class Collector:
                 row = login_row(x, known)
                 if row and row[0]:
                     self.exec("INSERT OR IGNORE INTO logins VALUES (?, ?, ?, ?)", row)
-            if page > 1 and not rows:
+            if page > 1 and (not rows or page * 200 >= (r.get("data2") or 0)):  # past the end Casdoor repeats the last page
                 back = 0
                 break
         self.set_meta("logins_page", str(back + 3 if back else 0))

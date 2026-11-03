@@ -282,7 +282,7 @@ const bar = (v, max) => h('span', {style: 'display:inline-block;height:8px;borde
 const LOCKED_USER = [  // what our access still cannot show (2026-10-31: kubeconfig, Grafana Viewer, Langfuse, Casdoor log)
   {key: 'llm', title: 'LLM usage', shows: 'models used, tokens, LLM errors', needs: 'a Grafana login on the station: sh station/set-grafana-login.sh'},
   {key: 'train', title: 'Trainings', shows: 'queued, running and failed mlops-core tasks', needs: 'a read-only mlops-core API key (tasks are in its Elasticsearch; its logs show only hashed user ids)'},
-  {key: 'history', title: 'Log history', shows: 'logs of pods that are gone, 30 days', needs: 'access requests 7 and 12 (central log store); today only the running pods\' logs are readable'},
+  {key: 'history', title: 'Log history', shows: 'logs of pods that are gone, 30 days', needs: 'a central log store, which we have no access to; only the running pods\' logs are readable'},
   {key: 'failed-login', title: 'Failed logins', shows: 'wrong passwords per user', needs: 'Casdoor writes failed logins as anonymous; only its database has them (access request 45)'},
 ];
 // LLM usage comes from Grafana's Prometheus (LiteLLM counters per key) once a Grafana login is set

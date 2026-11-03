@@ -522,6 +522,15 @@ ops.http_json = real_http
 lg = col.logins()
 assert lg["ok"] == 1 and lg["failed"] == 2 and {x["user"]: x["n"] for x in lg["top"]} == {"uni": 1, "(unknown name)": 1}, lg
 assert col.meta("logins_page") == "0"   # history finished: only the newest page from now on
+# past the last page Casdoor repeats it instead of answering empty: the backfill must still stop
+col.set_meta("logins_page", "2")
+os.environ.update(CASDOOR_URL="https://c", CASDOOR_KEY="k", CASDOOR_SECRET="s")
+calls = []
+real_http, ops.http_json = ops.http_json, lambda m, url, h=None, b=None, timeout=30: calls.append(url) or {"status": "ok", "data": pages[1], "data2": 300}
+col.refresh_logins(T1)
+col.refresh_logins(T1)
+ops.http_json = real_http
+assert col.meta("logins_page") == "0" and len(calls) == 3, (col.meta("logins_page"), len(calls))   # 1 + 2, then only page 1
 col.key_rows["rows"].pop()
 for k in ("CASDOOR_URL", "CASDOOR_KEY", "CASDOOR_SECRET"):
     os.environ.pop(k)

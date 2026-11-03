@@ -33,9 +33,9 @@ PURPOSES = [  # first match wins; words in English and Persian as users write th
 ]
 ERROR_HINT = re.compile(r"\b[45]\d\d\b|error|exception|traceback|timeout|خطا|ارور|قطع|پاسخ.?گو نیست|loop|لوپ|none", re.I)
 LOCKED = {
-    "user_logs": "the requester's AIP username or key (data/ticket-users.json or the name list) and Langfuse keys: sh station/set-langfuse-keys.sh",
-    "user_infra": "the requester's AIP username: add it to data/ticket-users.json on the station ({\"name on ticket\": \"username\"})",
-    "user_services": "the requester's AIP username (data/ticket-users.json on the station) or their API key hash",
+    "user_logs": "an account for this requester: the ticket site shows only a display name, which matches no account or key",
+    "user_infra": "an account for this requester: the ticket site shows only a display name, which matches no account or key",
+    "user_services": "an account for this requester: the ticket site shows only a display name, which matches no account or key",
     "key_usage": "a Grafana login on the station: sh station/set-grafana-login.sh",
 }
 # LiteLLM's Prometheus counters, per API key (label hashed_api_key = sha256 of the key); names differ between versions
