@@ -39,7 +39,8 @@ LOCKED = {
     "key_usage": "a Grafana login on the station: sh station/set-grafana-login.sh",
 }
 # LiteLLM's Prometheus counters, per API key (label hashed_api_key = sha256 of the key); names differ between versions
-USAGE_Q = ('sum by (__name__, model) (increase({__name__=~"litellm_(requests|total_tokens|spend|proxy_failed_requests)_metric(_total)?'
+# proxy_total_requests = every call; litellm_requests_metric counts successes only
+USAGE_Q = ('sum by (__name__, model, requested_model) (increase({__name__=~"litellm_(proxy_total_requests|total_tokens|spend|proxy_failed_requests)_metric(_total)?'
            '|litellm_total_tokens(_total)?", %s}[%s]))')
 PLATFORM_S, PLATFORM_BAD = 1800, 0.3  # platform-wide: 30 min each side of the filing time; a model with >= 30 % failed is "failing"
 USERS_FILE = "ticket-users.json"  # in OPS_DATA, edited by hand: {"requester name on the ticket site": "AIP username" or "key alias"}
@@ -66,7 +67,7 @@ def key_usage(col, selectors, at):
                 v = float(r["value"][1])
                 if v:
                     name = r["metric"].get("__name__", "")
-                    out.append({"key": key, "period": label, "model": r["metric"].get("model", "?"), "value": round(v, 2),
+                    out.append({"key": key, "period": label, "model": r["metric"].get("requested_model") or r["metric"].get("model", "?"), "value": round(v, 2),
                                 "metric": next(k for k in ("failed", "tokens", "spend", "requests") if k in name)})
     return out
 

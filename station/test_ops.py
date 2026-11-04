@@ -382,11 +382,11 @@ q4 = tickets.analyze(col, dict(rows[0], **d))["q4"]
 assert q4["answer"] == "12 requests, 3400 tokens in 30 days" and q4["locked"] is None, q4
 # per-user usage: key alias '<user>-<key>' groups LiteLLM counters, user-<name> namespace gives CPU/GPU hours
 def fake_prom(q, at=None):
-    if "litellm_requests_metric_total[30d]" in q:
+    if "litellm_proxy_total_requests_metric_total[" in q:
         return [{"metric": {"api_key_alias": "uni-k1", "hashed_api_key": "h1", "model": "m1"}, "value": [0, "10"]},
                 {"metric": {"api_key_alias": "uni-k2", "hashed_api_key": "h2", "model": "m2"}, "value": [0, "5"]},
                 {"metric": {"api_key_alias": "None", "model": "m1"}, "value": [0, "99"]}]
-    if "litellm_spend_metric_total[30d]" in q:
+    if "litellm_spend_metric_total[" in q:
         return [{"metric": {"api_key_alias": "uni-k1", "hashed_api_key": "h1", "model": "m1"}, "value": [0, "1.234"]}]
     if "container_cpu_usage_seconds_total" in q:
         return [{"metric": {"namespace": "user-uni"}, "value": [0, "7.6"]}]
@@ -565,10 +565,45 @@ col.prune_logs(T3)
 ops.LOG_CAP_BYTES = real_cap
 assert not (ops.LOG_DIR / "2026-10-30").exists()
 col.pods, col.log_marks = saved_pods, saved_marks
-# service load: one row per service; task log: only tasks we know, masked
-saved_prom, col.prom, col.cache = col.prom, (lambda q, at=None: [{"metric": {"namespace": "dify"}, "value": [0, "15.26"]}]), {}
-assert next(r for r in col.service_load() if r["ns"] == "dify") == {"ns": "dify", "cpu_h": 15.3, "mem_gib": 15.3, "net_gb": 15.3}
-col.prom = saved_prom
+# whole cluster: real hours as the divisor, one row per physical GPU, a data check that flags a difference
+def res_prom(q, at=None):
+    v = lambda x, **m: [{"metric": m, "value": [0, str(x)]}]
+    if "tsdb_lowest" in q: return v(T3 - 10 * 86400)
+    if 'resource="nvidia_com_gpu"})' in q and "allocatable" in q: return v(10)
+    if 'allocatable{resource="cpu"}' in q: return v(100)
+    if 'allocatable{resource="memory"}' in q: return v(1024 ** 3 * 200)
+    if q == "DCGM_FI_DEV_GPU_UTIL": return [{"metric": {"UUID": "g1", "Hostname": "n1", "gpu": "0", "modelName": "NVIDIA H200", "namespace": "user-uni", "pod": "w"}, "value": [0, "0"]},
+                                            {"metric": {"UUID": "g2", "Hostname": "n1", "gpu": "1", "modelName": "NVIDIA H200"}, "value": [0, "50"]}]
+    if "avg by (UUID)" in q: return v(10, UUID="g1")
+    if "DCGM_FI_DEV_FB_USED" in q: return v(2048, UUID="g1")
+    if "DCGM_FI_DEV_FB_FREE" in q: return v(2048, UUID="g1")
+    if q.startswith("sum by (namespace) (increase(container_cpu"): return v(240, namespace="user-uni")
+    if q.startswith("sum by (namespace) (sum_over_time"): return v(24, namespace="user-uni")
+    return []
+saved_prom, col.prom, col.cache = col.prom, res_prom, {}
+r = col.resources(T3 - 30 * 86400, T3)
+assert r["window"]["cut"] and round(r["window"]["hours"]) == 240, r["window"]    # 30 days asked, 10 days held by Prometheus
+row = r["namespaces"][0]
+assert row["kind"] == "user" and row["cpu_pct"] == 1.0 and row["gpu_pct"] == 1.0, row    # 240 of 100 x 240 h; 24 of 10 x 240 h
+assert r["gpus"][0]["mem_total"] == 4 and r["gpus"][1]["ns"] is None and r["gpu"]["busy_now"] == 25.0, r["gpus"]
+assert col.capacity(T3 - 86400, T3)["resources"]["gpu"]["total"] == 10
+# failure rate is out of every call and cannot pass 100 %; the data check says when two systems disagree
+col.cache = {}
+col.prom = lambda q, at=None: [{"metric": {"api_key_alias": "uni-a", "hashed_api_key": "h", "requested_model": "m"}, "value": [0, "100" if "total_requests" in q else "150" if "failed" in q else "0"]}] if "increase" in q and "by (api_key_alias, hashed" in q else []
+assert col.usage(T3 - 86400, T3)["users"]["uni"]["fail_pct"] == 100.0
+col.prom = lambda q, at=None: [{"metric": {"api_key_alias": "k1"}, "value": [0, "1000"]}] if "topk" in q or "total_requests" in q else [{"metric": {}, "value": [0, "200"]}] if "failed" in q else [{"metric": {"UUID": "u"}, "value": [0, "1"]}] if q == "DCGM_FI_DEV_GPU_UTIL" else [{"metric": {}, "value": [0, "1"]}]
+os.environ.update(LITELLM_READ_URL="https://l", LITELLM_READ_KEY="k")
+col.lread, col.checks = (lambda path: {"total": 900 if "status_filter" not in path else 200}), {"at": None, "rows": []}
+col.data_check(T3)
+got = {x["what"]: x["ok"] for x in col.checks["rows"]}
+assert got == {"LLM calls · k1": False, "Failed calls · k1": True, "GPUs in the cluster": True}, col.checks    # 1000 against 900 is flagged
+n_checks = col.checks["at"]
+col.data_check(T3 + 60)
+assert col.checks["at"] == n_checks   # once an hour
+for k in ("LITELLM_READ_URL", "LITELLM_READ_KEY"):
+    os.environ.pop(k)
+col.prom, col.cache = saved_prom, {}
+# task log: only tasks we know, masked
 col.task_rows = {"at": 1, "rows": [{"id": "t1", "user": "u"}]}
 real_http, ops.http_json = ops.http_json, lambda m, url, h=None, b=None, timeout=30: {"data": {"token": "x"}} if url.endswith("auth.login") else {
     "data": {"total": 9, "events": [{"timestamp": 2000, "level": "error", "msg": "password=abcdef1 failed"}, {"timestamp": 1000, "level": "info", "msg": "start"}]}}

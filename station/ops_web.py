@@ -65,6 +65,20 @@ def allowed(ip):
     return not ALLOW or any(ipaddress.ip_address(ip) in n for n in ALLOW)
 
 
+def time_range(q):
+    """(from, to) in epoch seconds from the page's date range; (None, None) when it sent none."""
+    if not q.get("from") and not q.get("to"):
+        return None, None
+    try:
+        to = min(float(q.get("to") or time.time()), time.time())
+        frm = float(q.get("from") or to - 30 * 86400)
+    except ValueError:
+        raise BadRequest("bad date range")
+    if not 0 <= frm < to:
+        raise BadRequest("the range must start before it ends")
+    return frm, to
+
+
 def name(q, key, required=True):
     v = q.get(key, "")
     if (v or required) and not NAME_RE.match(v):
@@ -139,30 +153,33 @@ class Handler(BaseHTTPRequestHandler):
     def api(self, what, q, user):
         if what == "me":
             return {"user": user, "integrations": COL.integrations()}
+        frm, to = time_range(q)
         if what == "state":
             return COL.state()
         if what == "incidents":
-            return COL.incidents(q.get("state", "open"), q.get("kind"))
+            return COL.incidents(q.get("state", "open"), q.get("kind"), frm=frm or 0, to=to)
         if what == "incident":
             return COL.incident(int(q["id"]))
         if what == "changes":
-            return COL.changes(min(max(int(q.get("days", 1)), 1), 30), q.get("type") or None)
+            return COL.changes(min(max(int(q.get("days", 1)), 1), 30), q.get("type") or None, frm, to)
         if what == "models":
-            return COL.models()
+            return COL.models(frm, to)
         if what == "namespaces":
             return COL.namespaces_info()
         if what == "services":
-            return COL.services(self.known_ns(q))
+            ns = self.known_ns(q)
+            res = COL.resources(frm, to) if frm else {}  # the Logs page reads this too, and needs no usage
+            return dict(COL.services(ns), use=next((r for r in res.get("namespaces", []) if r["ns"] == ns), None), range=res.get("window"))
         if what == "users":
-            return COL.users()
+            return {"rows": COL.users(frm, to), "range": COL.window(frm, to) if COL.integrations()["grafana"] else None}
         if what == "user":
-            return COL.user(name(q, "name"))
+            return COL.user(name(q, "name"), frm, to)
         if what == "keys":
             return COL.keys()
         if what == "logins":
-            return COL.logins()
+            return COL.logins(frm, to)
         if what == "tasks":
-            return COL.tasks()
+            return COL.tasks(frm, to)
         if what == "task_log":
             return COL.task_log(name(q, "id"))
         if what == "archive":
@@ -176,9 +193,9 @@ class Handler(BaseHTTPRequestHandler):
         if what == "ticket":
             return COL.ticket(int(q["id"]))
         if what == "capacity":
-            return COL.capacity()
+            return COL.capacity(frm, to)
         if what == "trends":
-            return COL.trends()
+            return COL.trends(14, frm, to)
         if what == "infra":
             return COL.infra()
         if what == "logs":

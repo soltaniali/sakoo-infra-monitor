@@ -69,6 +69,10 @@ LOG_STAMP_RE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\S*Z ")
 LOG_SECRET_RES = (  # logs can hold secrets (data-ingestion-api prints users' S3 keys): masked before they are saved or read
     re.compile(r"(?i)((?:access|secret|password|passwd|pwd|token|api[_-]?key|authorization|bearer|cookie)[\w-]*[\"']?\s*[:= ]\s*[\"']?(?:bearer\s+)?)[^\s\"',;&]{4,}"),
     re.compile(r"\b[A-Z0-9]{20}\b"), re.compile(r"(?<![\w/+])[A-Za-z0-9/+]{40}(?![\w/+=])"))
+# GPU-hours held per namespace over a range: running pods only, sampled every 15 min. % (label filter, range)
+GPU_HELD_H = ('sum by (namespace) (sum_over_time((sum by (namespace) (kube_pod_container_resource_requests{resource="nvidia_com_gpu",%s} '
+              '* on (namespace,pod) group_left () (kube_pod_status_phase{phase="Running"} == 1)))[%s:15m])) / 4')
+CHECK_OK_PCT = 2  # two systems agree when they differ by at most this (or by 5 in small counts)
 SERVICE_NS = ("jupyterhub", "mlflow", "dify", "n8nio", "zenml", "langflow", "ragflow", "openwebui", "airflow", "harbor", "gitlab")
 TASK_STUCK_S = 6 * 3600  # a running task with no update for this long is marked "no update"
 LLM_FAIL_MIN, LLM_FAIL_RATE = 20, 0.3  # a key with >= 20 calls in the last hour of which >= 30 % failed: incident (dashboard only)
@@ -360,6 +364,7 @@ class Collector:
         self.states = {r["key"]: (r["state"], r["since"]) for r in self.rows("SELECT * FROM state_since")}  # liveness
         self.bg, self.tickets_busy, self.tickets_tried = queue.Queue(), False, 0
         self.task_rows = {"at": None, "rows": []}  # last good read of mlops-core's tasks
+        self.checks = {"at": None, "rows": []}  # last data_check
         self.log_marks = {}  # (ns, pod, container) -> newest saved log time: scan windows overlap, nothing is saved twice
         self.key_rows = {"at": None, "rows": []}  # last good read: the VPN path to LiteLLM drops every few minutes
         threading.Thread(target=self._bg_loop, daemon=True).start()
@@ -572,13 +577,14 @@ class Collector:
                 break
         self.set_meta("logins_page", str(back + 3 if back else 0))
 
-    def logins(self):
-        """Failed logins over the platform, last 7 days: who is being tried, and how much."""
-        since = time.time() - 7 * 86400
+    def logins(self, frm=None, to=None):
+        """Failed logins over the platform in the range: who is being tried, and how much."""
+        end = to or time.time()
+        since = frm or end - 7 * 86400
         return {"from": (self.one("SELECT min(ts) t FROM logins") or {}).get("t"),
-                "ok": self.one("SELECT count(*) n FROM logins WHERE ts>=? AND result='ok'", (since,))["n"],
-                "failed": self.one("SELECT count(*) n FROM logins WHERE ts>=? AND result!='ok'", (since,))["n"],
-                "top": self.rows("SELECT user, count(*) n, max(ts) last FROM logins WHERE ts>=? AND result!='ok' GROUP BY user ORDER BY n DESC LIMIT 8", (since,))}
+                "ok": self.one("SELECT count(*) n FROM logins WHERE ts>=? AND ts<=? AND result='ok'", (since, end))["n"],
+                "failed": self.one("SELECT count(*) n FROM logins WHERE ts>=? AND ts<=? AND result!='ok'", (since, end))["n"],
+                "top": self.rows("SELECT user, count(*) n, max(ts) last FROM logins WHERE ts>=? AND ts<=? AND result!='ok' GROUP BY user ORDER BY n DESC LIMIT 8", (since, end))}
 
     def mread(self, name, token, body):
         """A call on mlops-core. Its API is ClearML-style: list calls are POSTs too. Only auth.login and *.get_all are ever called."""
@@ -609,10 +615,11 @@ class Collector:
                 break
         self.task_rows = {"at": t, "rows": rows}
 
-    def tasks(self):
-        """The Trainings tab."""
-        people = self.people()
-        rows = [dict(r, person=next((p["name"] for p in people if r["user"] in p["users"]), None)) for r in self.task_rows["rows"]]
+    def tasks(self, frm=None, to=None):
+        """The Trainings tab: tasks that were active in the range. Running and queued ones always show."""
+        people, end = self.people(), to or time.time()
+        rows = [dict(r, person=next((p["name"] for p in people if r["user"] in p["users"]), None)) for r in self.task_rows["rows"]
+                if r["status"] in ("in_progress", "queued") or not frm or (frm <= (r["last"] or 0) <= end)]
         return {"at": self.task_rows["at"], "tasks": rows, "error": self.integ_err.get("tasks")}
 
     def key_owner(self, m):
@@ -716,20 +723,31 @@ class Collector:
             sym["llm:" + alias] = ("llm-failing", "user-" + who, alias, detail, {"codes": codes, "models": models})
         self.observe("llm", sym, t, alert=False)
 
-    def usage(self):
-        """Per user, last 30 days (Prometheus history starts later: see "from"), from Grafana's Prometheus:
-        LiteLLM requests/tokens/spend/failures per key (key alias = '<user>-<key name>') and CPU core-hours,
-        GPU-hours of the user-<name> namespace. {"from": epoch, "users": {user: {...}}}; {} without Grafana."""
+    def window(self, frm=None, to=None):
+        """The asked range cut to what Prometheus holds. Percentages divide by these real hours, not by the asked ones."""
+        to = to or time.time()
+        frm = frm or to - 30 * 86400
+        start = self.cached("prom_start", 3600, lambda: next((float(s["value"][1]) for s in self.prom("prometheus_tsdb_lowest_timestamp_seconds")), None))
+        real = max(frm, start) if start else frm
+        real = min(real, to - 60)
+        return {"from": frm, "to": to, "real_from": real, "data_from": start, "cut": bool(start and frm < start - 3600), "secs": int(to - real), "hours": (to - real) / 3600}
+
+    def usage(self, frm=None, to=None):
+        """Per user in a date range, from Grafana's Prometheus: LLM calls/tokens/spend/failures per key, CPU core-hours, GPU-hours and
+        how busy those GPUs were. "requests" = every call: LiteLLM's requests metric counts successes only, and a rate over it is wrong
+        (checked against LiteLLM's own logs: see data_check). {"from": epoch, "users": {user: {...}}}; {} without Grafana."""
         if not self.integrations()["grafana"]:
             return {}
+        w = self.window(frm, to)
+        span, at = "%ds" % w["secs"], int(w["to"])
 
         def fetch():
             users = {}
             row = lambda who: users.setdefault(who, {"requests": 0, "tokens": 0, "spend": 0, "failed": 0, "cpu_h": 0, "gpu_h": 0,
                                                      "keys": {}, "models": {}})
-            for what, metric in (("requests", "litellm_requests_metric_total"), ("tokens", "litellm_total_tokens_metric_total"),
+            for what, metric in (("requests", "litellm_proxy_total_requests_metric_total"), ("tokens", "litellm_total_tokens_metric_total"),
                                  ("spend", "litellm_spend_metric_total"), ("failed", "litellm_proxy_failed_requests_metric_total")):
-                for s in self.prom("sum by (api_key_alias, hashed_api_key, model, user_email) (increase(%s[30d]))" % metric):
+                for s in self.prom("sum by (api_key_alias, hashed_api_key, model, requested_model, user_email) (increase(%s[%s]))" % (metric, span), at):
                     m, v = s["metric"], float(s["value"][1])
                     alias, who = m.get("api_key_alias") or "None", self.key_owner(m)
                     if not v or not who:  # master key, or no alias and no email: no user to put it on
@@ -738,9 +756,10 @@ class Collector:
                     r[what] += v
                     k = r["keys"].setdefault(alias, {"hash": m.get("hashed_api_key", ""), "requests": 0, "tokens": 0, "spend": 0, "failed": 0})
                     k[what] += v
-                    if what == "requests" and m.get("model"):
-                        r["models"][m["model"]] = r["models"].get(m["model"], 0) + v
-            for s in self.prom("sum by (api_key_alias, user_email, route) (increase(litellm_proxy_total_requests_metric_total[30d]))"):
+                    model = m.get("requested_model") or m.get("model")
+                    if what == "requests" and model and model != "None":
+                        r["models"][model] = r["models"].get(model, 0) + v
+            for s in self.prom("sum by (api_key_alias, user_email, route) (increase(litellm_proxy_total_requests_metric_total[%s]))" % span, at):
                 who, v = self.key_owner(s["metric"]), round(float(s["value"][1]))
                 if who and v:
                     rt = row(who).setdefault("routes", {})
@@ -753,21 +772,111 @@ class Collector:
                     who = self.key_owner(s["metric"])
                     if who and who in users and alias in users[who]["keys"] and v != float("inf"):
                         users[who]["keys"][alias][field] = round(v, 2)
-            for what, q in (("cpu_h", 'sum by (namespace) (increase(container_cpu_usage_seconds_total{namespace=~"user-.*",container!=""}[30d])) / 3600'),
-                            ("gpu_h", 'sum by (namespace) (sum_over_time((sum by (namespace) (kube_pod_container_resource_requests'
-                                      '{resource="nvidia_com_gpu",namespace=~"user-.*"}))[30d:1h]))')):
-                for s in self.prom(q):
+            for what, q in (("cpu_h", 'sum by (namespace) (increase(container_cpu_usage_seconds_total{namespace=~"user-.*",container!=""}[%s])) / 3600' % span),
+                            ("gpu_h", GPU_HELD_H % ('namespace=~"user-.*"', span))):  # running pods only: a pending pod holds no GPU
+                for s in self.prom(q, at):
                     row(s["metric"]["namespace"][5:])[what] += float(s["value"][1])
+            for s in self.prom('avg by (namespace) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{namespace=~"user-.*"}[%s]))' % span, at):
+                row(s["metric"]["namespace"][5:])["gpu_util"] = round(float(s["value"][1]), 1)
             for r in users.values():
                 for d in [r] + list(r["keys"].values()):
+                    # a share of all calls, so it can never pass 100 %
+                    d["fail_pct"] = round(100 * min(d["failed"], d["requests"]) / d["requests"], 1) if d["requests"] else None
                     for f in ("requests", "tokens", "failed", "cpu_h", "gpu_h"):
                         if f in d:
                             d[f] = round(d[f])
                     d["spend"] = round(d["spend"], 2)
                 r["models"] = {m: round(n) for m, n in sorted(r["models"].items(), key=lambda x: -x[1])}
-            lo = self.prom("prometheus_tsdb_lowest_timestamp_seconds")
-            return {"from": float(lo[0]["value"][1]) if lo else None, "users": users}
-        return self.cached("usage", 300, fetch) or {}
+            return {"from": w["data_from"], "users": users}
+        return self.cached("usage:%d:%d" % (w["from"] // 300, w["to"] // 300), 300, fetch) or {}
+
+    def resources(self, frm=None, to=None):
+        """The whole cluster: what we have, what holds it now, how busy it is, and every namespace's share over the range."""
+        if not self.integrations()["grafana"]:
+            return {}
+        w = self.window(frm, to)
+        span, at = "%ds" % w["secs"], int(w["to"])
+        one = lambda q, t=None: next((float(s["value"][1]) for s in self.prom(q, t)), 0.0)
+
+        def fetch():
+            gpu_req = 'kube_pod_container_resource_requests{resource="nvidia_com_gpu"} * on (namespace,pod) group_left () (kube_pod_status_phase{phase="%s"} == 1)'
+            total = {r: one('sum(kube_node_status_allocatable{resource="%s"})' % r) for r in ("nvidia_com_gpu", "cpu", "memory")}
+            hours, gib = max(w["hours"], 1 / 60), 1024 ** 3
+            cards = {}  # one row per physical GPU; a GPU with no pod has no pod label
+            for s in self.prom("DCGM_FI_DEV_GPU_UTIL"):
+                m = s["metric"]
+                cards[m.get("UUID")] = {"node": m.get("Hostname") or m.get("kubernetes_node"), "gpu": m.get("gpu"), "model": (m.get("modelName") or "").replace("NVIDIA ", ""),
+                                        "ns": m.get("namespace"), "pod": m.get("pod"), "util": float(s["value"][1]), "util_avg": None, "mem_used": None, "mem_total": None}
+            for s in self.prom("avg by (UUID) (avg_over_time(DCGM_FI_DEV_GPU_UTIL[%s]))" % span, at):
+                if s["metric"].get("UUID") in cards:
+                    cards[s["metric"]["UUID"]]["util_avg"] = round(float(s["value"][1]), 1)
+            for field, q in (("mem_used", "max by (UUID) (DCGM_FI_DEV_FB_USED)"), ("mem_free", "max by (UUID) (DCGM_FI_DEV_FB_FREE)")):
+                for s in self.prom(q):
+                    if s["metric"].get("UUID") in cards:
+                        cards[s["metric"]["UUID"]][field] = float(s["value"][1])
+            for c in cards.values():
+                used, free = c.pop("mem_used", None), c.pop("mem_free", None)
+                c["mem_used"], c["mem_total"] = (round(used / 1024), round((used + free) / 1024)) if used is not None and free is not None else (None, None)
+            rows = {}
+            row = lambda ns: rows.setdefault(ns, {"ns": ns, "cpu_h": 0, "mem_gib": 0, "gpu_h": 0, "net_gb": 0, "gpu_util": None})
+            for field, q in (("cpu_h", 'sum by (namespace) (increase(container_cpu_usage_seconds_total{container!=""}[%s])) / 3600' % span),
+                             ("mem_gib", 'sum by (namespace) (avg_over_time((sum by (namespace) (container_memory_working_set_bytes{container!=""}))[%s:15m])) / %d' % (span, gib)),
+                             ("gpu_h", GPU_HELD_H % ('namespace!=""', span)),
+                             ("net_gb", "sum by (namespace) (increase(container_network_receive_bytes_total[%s])) / 1000000000" % span),
+                             ("gpu_util", "avg by (namespace) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{namespace!=\"\"}[%s]))" % span)):
+                for s in self.prom(q, at):
+                    ns = s["metric"].get("namespace")
+                    if ns:
+                        row(ns)[field] = round(float(s["value"][1]), 1)
+            for r in rows.values():
+                r["cpu_pct"] = round(100 * r["cpu_h"] / (total["cpu"] * hours), 1) if total["cpu"] else None
+                r["gpu_pct"] = round(100 * r["gpu_h"] / (total["nvidia_com_gpu"] * hours), 1) if total["nvidia_com_gpu"] else None
+                r["kind"] = "user" if r["ns"].startswith("user-") else "models" if r["ns"] == OUR_NS else "service" if r["ns"] in SERVICE_NS else "other"
+            util = [c["util_avg"] for c in cards.values() if c["util_avg"] is not None]
+            held = one("sum(%s)" % (gpu_req % "Running"))
+            return {"window": w, "gpus": sorted(cards.values(), key=lambda c: (str(c["node"]), int(c["gpu"] or 0))),
+                    "gpu": {"total": total["nvidia_com_gpu"], "held": held, "waiting": one("sum(%s)" % (gpu_req % "Pending")),
+                            "busy_now": round(sum(c["util"] for c in cards.values()) / len(cards), 1) if cards else None,
+                            "busy_avg": round(sum(util) / len(util), 1) if util else None,
+                            "held_avg_pct": round(100 * one("avg_over_time((sum(%s))[%s:15m])" % (gpu_req % "Running", span), at) / total["nvidia_com_gpu"], 1) if total["nvidia_com_gpu"] else None},
+                    "cpu": {"total": total["cpu"], "used_now": round(one('sum(rate(container_cpu_usage_seconds_total{container!=""}[5m]))'), 1),
+                            "used_avg": round(one('sum(rate(container_cpu_usage_seconds_total{container!=""}[%s]))' % span, at), 1),
+                            "requested": round(one('sum(kube_pod_container_resource_requests{resource="cpu"} * on (namespace,pod) group_left () (kube_pod_status_phase{phase="Running"} == 1))'), 1)},
+                    "mem": {"total": round(total["memory"] / gib, 1), "used_now": round(one('sum(container_memory_working_set_bytes{container!=""})') / gib, 1),
+                            "used_avg": round(one('avg_over_time((sum(container_memory_working_set_bytes{container!=""}))[%s:15m])' % span, at) / gib, 1),
+                            "requested": round(one('sum(kube_pod_container_resource_requests{resource="memory"} * on (namespace,pod) group_left () (kube_pod_status_phase{phase="Running"} == 1))') / gib, 1)},
+                    "namespaces": sorted(rows.values(), key=lambda r: (-r["gpu_h"], -r["cpu_h"]))}
+        return self.cached("resources:%d:%d" % (w["from"] // 300, w["to"] // 300), 300, fetch) or {}
+
+    def data_check(self, t):
+        """Hourly proof of the numbers on the page: the same figure from two systems. Calls: Prometheus against LiteLLM's own logs.
+        Tokens: Prometheus against Langfuse. GPUs: DCGM against Kubernetes. Shown on Capacity."""
+        on = self.integrations()
+        if not on["grafana"] or t - (self.checks["at"] or 0) < 3600:
+            return
+        rows, end, start = [], t - 300, t - 300 - 7 * 86400  # 5 min back: LiteLLM writes its logs in batches
+        total = lambda metric, alias: next((float(s["value"][1]) for s in self.prom('sum(increase(%s{api_key_alias="%s"}[%ds]))' % (metric, alias, end - start), int(end))), 0.0)
+        top = [s["metric"]["api_key_alias"] for s in self.prom("topk(5, sum by (api_key_alias) (increase(litellm_proxy_total_requests_metric_total{api_key_alias!=\"None\"}[7d])))", int(end))
+               if s["metric"].get("api_key_alias")]
+
+        def add(what, name_a, a, name_b, b):
+            diff = abs(a - b)
+            pct = 100 * diff / max(a, b) if max(a, b) else 0
+            rows.append({"what": what, "a_name": name_a, "a": round(a), "b_name": name_b, "b": round(b), "diff_pct": round(pct, 1), "ok": pct <= CHECK_OK_PCT or diff <= 5})
+        for alias in top:
+            if on["keys"]:
+                add("LLM calls · " + alias, "Prometheus", total("litellm_proxy_total_requests_metric_total", alias), "LiteLLM logs", self.spend_count(start, end, alias))
+                add("Failed calls · " + alias, "Prometheus", total("litellm_proxy_failed_requests_metric_total", alias), "LiteLLM logs", self.spend_count(start, end, alias, "failure"))
+            if on["langfuse"]:
+                iso = lambda x: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(x))
+                q = {"view": "observations", "dimensions": [], "metrics": [{"measure": "totalTokens", "aggregation": "sum"}], "fromTimestamp": iso(start), "toTimestamp": iso(end),
+                     "filters": [{"column": "metadata", "key": "user_api_key_alias", "type": "stringObject", "operator": "=", "value": alias},
+                                 {"column": "type", "operator": "=", "value": "GENERATION", "type": "string"}]}
+                data = self.lf("/api/public/metrics", query=json.dumps(q))["data"]
+                add("Tokens · " + alias, "Prometheus", total("litellm_total_tokens_metric_total", alias), "Langfuse", float((data[0].get("sum_totalTokens") or 0) if data else 0))
+        add("GPUs in the cluster", "GPU exporter", len({s["metric"].get("UUID") for s in self.prom("DCGM_FI_DEV_GPU_UTIL")}), "Kubernetes",
+            next((float(s["value"][1]) for s in self.prom('sum(kube_node_status_capacity{resource="nvidia_com_gpu"})')), 0.0))
+        self.checks = {"at": t, "rows": rows}
 
     def gitlab_enrich(self, change_id):
         """Author and MR of a change: commits in the 30 min before it whose diff mentions the new image tag or the name."""
@@ -878,7 +987,7 @@ class Collector:
                 except Exception as e:
                     errors.append("%s: %s" % (ns, probe.err(e)))
         self.hosts = {h: ns for ns, inv in self.inv.items() for k, v in inv.items() if v["kind"] == "Ingress" for h in v["hosts"]}
-        for step in ([self.check_probe] + ([self.scan_logs, self.test_models, self.check_llm_keys, self.refresh_keys, self.backfill_ticket_spend, self.refresh_logins, self.refresh_tasks] if slow else []) + [self.judge_changes]):
+        for step in ([self.check_probe] + ([self.scan_logs, self.test_models, self.check_llm_keys, self.refresh_keys, self.backfill_ticket_spend, self.refresh_logins, self.refresh_tasks, self.data_check] if slow else []) + [self.judge_changes]):
             try:
                 step(t)
             except Exception as e:
@@ -1201,22 +1310,6 @@ class Collector:
         lines = sorted(r.get("events", []), key=lambda e: e.get("timestamp") or 0)
         return {"total": r.get("total"), "lines": [{"ts": (e.get("timestamp") or 0) / 1000, "level": e.get("level"), "msg": mask_log(str(e.get("msg")))} for e in lines]}
 
-    def service_load(self):
-        """Non-LLM services, each as a whole (their logs do not say which user): CPU hours and traffic from Prometheus."""
-        if not self.integrations()["grafana"]:
-            return []
-
-        def fetch():
-            sel = 'namespace=~"%s"' % "|".join(SERVICE_NS)
-            out = {ns: {"ns": ns, "cpu_h": 0, "mem_gib": 0, "net_gb": 0} for ns in SERVICE_NS}
-            for field, q in (("cpu_h", 'sum by (namespace) (increase(container_cpu_usage_seconds_total{%s,container!=""}[30d])) / 3600' % sel),
-                             ("mem_gib", 'sum by (namespace) (container_memory_working_set_bytes{%s,container!=""}) / 1073741824' % sel),
-                             ("net_gb", 'sum by (namespace) (increase(container_network_receive_bytes_total{%s}[7d])) / 1000000000' % sel)):
-                for s in self.prom(q):
-                    out[s["metric"]["namespace"]][field] = round(float(s["value"][1]), 1)
-            return sorted(out.values(), key=lambda r: -r["cpu_h"])
-        return self.cached("service_load", 300, fetch) or []
-
     def test_models(self, t):
         """Every 5 min: a 1-token chat call (or a tiny embedding) to each KubeAI model litellm knows. Needs the litellm key."""
         if not self.integrations()["litellm"]:
@@ -1467,9 +1560,10 @@ class Collector:
         return {"tiles": tiles, "incidents": incs, "unsent": unsent, "changes": changes[:40], "status": self.status, "now": t,
                 "integrations": dict(self.integrations(), errors=self.integ_err), "probe_ts": self.probe.get("ts")}
 
-    def incidents(self, state="open", kind=None, limit=300):
+    def incidents(self, state="open", kind=None, limit=300, frm=0, to=None):
+        """Incidents open at any moment of the range."""
         rows = self.rows("SELECT id, ns, obj, symptom, owner, cause, detail, opened, last_seen, closed, scope FROM incidents "
-                         "WHERE state=? ORDER BY id DESC LIMIT ?", (state, limit))
+                         "WHERE state=? AND opened<=? AND (closed IS NULL OR closed>=?) ORDER BY id DESC LIMIT ?", (state, to or time.time(), frm, limit))
         group = {"bug": BUG, "down": DOWN}.get(kind)
         return [r for r in rows if not group or r["symptom"] in group]
 
@@ -1487,8 +1581,8 @@ class Collector:
             + (["Last log lines:"] + logs if logs else []) + (["Dashboard: %s#/incident?id=%d" % (OPS_URL, iid)] if OPS_URL else []))
         return i
 
-    def changes(self, days=1, typ=None):
-        rows = self.rows("SELECT * FROM changes WHERE ts>=? ORDER BY ts DESC LIMIT 500", (time.time() - days * 86400,))
+    def changes(self, days=1, typ=None, frm=None, to=None):
+        rows = self.rows("SELECT * FROM changes WHERE ts>=? AND ts<=? ORDER BY ts DESC LIMIT 500", (frm or time.time() - days * 86400, to or time.time()))
         groups = {"new-service": ("new-service", "new-host", "new-namespace"), "release": ("release", "config"),
                   "new-model": ("new-model", "model-changed", "model-removed")}
         rows = [r for r in rows if not typ or r["type"] in groups.get(typ, (typ,))]
@@ -1496,18 +1590,41 @@ class Collector:
             r["info"] = json.loads(r["info"] or "{}")
         return rows
 
-    def models(self):
+    def models(self, frm=None, to=None):
         on = self.integrations()
         gpu = self.gpu_util() if on["grafana"] else {}
+        use = self.model_use(frm, to)
         llm_names = (self.litellm_models() if on["litellm"] else None)
         counts = {r["obj"]: r["n"] for r in self.rows("SELECT obj, count(*) n FROM incidents WHERE state='open' AND ns=? GROUP BY obj", (OUR_NS,))}
         out = []
         for o in sorted((o for o in self.inv.get(OUR_NS, {}).values() if o["kind"] == "Model"), key=lambda o: o["name"]):
             pods = [p for p in self.pods.get(OUR_NS, []) if p["workload"] == o["name"]]
             g = [gpu[p["name"]] for p in pods if p["name"] in gpu]
-            out.append(dict(o, pods=pods, open=counts.get(o["name"], 0), test=self.model_tests.get(o["name"]), gpu=round(sum(g) / len(g), 1) if g else None,
+            out.append(dict(o, pods=pods, open=counts.get(o["name"], 0), test=self.model_tests.get(o["name"]), gpu=round(sum(g) / len(g), 1) if g else None, use=use.get(o["name"]),
                             litellm=None if llm_names is None else any(o["name"] == n or o["name"] in n for n in llm_names)))
         return out
+
+    def model_use(self, frm=None, to=None):
+        """Per model in the range: all calls, failures, and how busy its GPUs were."""
+        if not self.integrations()["grafana"]:
+            return {}
+        w = self.window(frm, to)
+        span, at = "%ds" % w["secs"], int(w["to"])
+
+        def fetch():
+            out = {}
+            row = lambda m: out.setdefault(m, {"calls": 0, "failed": 0, "gpu_avg": None})
+            for field, metric in (("calls", "litellm_proxy_total_requests_metric_total"), ("failed", "litellm_proxy_failed_requests_metric_total")):
+                for s in self.prom("sum by (requested_model) (increase(%s[%s]))" % (metric, span), at):
+                    if s["metric"].get("requested_model"):
+                        row(s["metric"]["requested_model"])[field] = round(float(s["value"][1]))
+            for s in self.prom('avg by (pod) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{pod=~"model-.*"}[%s]))' % span, at):
+                name = s["metric"]["pod"][len("model-"):].rsplit("-", 2)[0]  # model-<name>-<replicaset>-<pod>
+                row(name)["gpu_avg"] = round(float(s["value"][1]), 1)
+            for r in out.values():
+                r["fail_pct"] = round(100 * min(r["failed"], r["calls"]) / r["calls"], 1) if r["calls"] else None
+            return out
+        return self.cached("model_use:%d:%d" % (w["from"] // 300, w["to"] // 300), 300, fetch) or {}
 
     def namespaces_info(self):
         counts = {r["ns"]: r["n"] for r in self.rows("SELECT ns, count(*) n FROM incidents WHERE state='open' GROUP BY ns")}
@@ -1552,9 +1669,11 @@ class Collector:
                     out.setdefault(who, []).append((ns, p))
         return out
 
-    def users(self):
-        """One row per user: what they run now, what it uses, what is broken, what changed (7 days)."""
+    def users(self, frm=None, to=None):
+        """One row per user: what they run now, and in the date range: what it used, what broke, what changed."""
         gib, t, rows = 1024 ** 3, time.time(), []
+        end = to or t
+        frm = frm or end - 30 * 86400
         nss = {}
         for who, items in self.user_pods().items():
             for ns, _ in items:
@@ -1564,7 +1683,7 @@ class Collector:
             ns_list = sorted(nss[who])
             q = ",".join("?" * len(ns_list))
             inc = self.one("SELECT count(*) n FROM incidents WHERE state='open' AND ns IN (%s)" % q, ns_list)["n"]
-            chg = self.one("SELECT count(*) n, max(ts) last FROM changes WHERE ts>=? AND ns IN (%s)" % q, [t - 7 * 86400] + ns_list)
+            chg = self.one("SELECT count(*) n, max(ts) last FROM changes WHERE ts>=? AND ts<=? AND ns IN (%s)" % q, [frm, end] + ns_list)
             gpu = {}
             for p in live:
                 for k, n in p["res"]["gpu"].items():
@@ -1578,19 +1697,18 @@ class Collector:
                          "mem_use_gib": round(sum(p.get("use_mem") or 0 for p in live) / gib, 1),
                          "gpu": ", ".join("%s×%d" % kv for kv in sorted(gpu.items())),
                          "restarts": sum(p["restarts"] for _, p in items), "open": inc,
-                         "changes_7d": chg["n"], "last_change": chg["last"],
+                         "changes": chg["n"], "last_change": chg["last"],
                          "started": min((p["started"] or t for _, p in items), default=None)})
-        use = self.usage().get("users", {})
+        use = self.usage(frm, end).get("users", {})
         for who in sorted(set(use) - {r["user"] for r in rows}):  # API key only, nothing running
             rows.append({"user": who, "namespaces": [], "pods": 0, "running": 0, "pending": 0, "kinds": ["API key"], "cpu_use": 0,
-                         "cpu_req": 0, "mem_use_gib": 0, "gpu": "", "restarts": 0, "open": 0, "changes_7d": 0, "last_change": None,
+                         "cpu_req": 0, "mem_use_gib": 0, "gpu": "", "restarts": 0, "open": 0, "changes": 0, "last_change": None,
                          "started": None})
         people, sso = self.people(), self.sso().get("users", {})
-        since = t - 30 * 86400
-        logins = {r["user"]: r for r in self.rows("SELECT user, max(CASE WHEN result='ok' THEN ts END) last_ok, sum(result!='ok' AND ts>=?) failed, "
-                                                  "max(CASE WHEN result!='ok' THEN ts END) last_failed FROM logins GROUP BY user", (since,))}
+        logins = {r["user"]: r for r in self.rows("SELECT user, max(CASE WHEN result='ok' THEN ts END) last_ok, sum(result!='ok' AND ts>=? AND ts<=?) failed, "
+                                                  "max(CASE WHEN result!='ok' THEN ts END) last_failed FROM logins GROUP BY user", (frm, end))}
         train = {}
-        for x in self.task_rows["rows"]:
+        for x in self.tasks(frm, end)["tasks"]:
             c = train.setdefault(x["user"], {"running": 0, "queued": 0, "failed": 0, "completed": 0, "last": 0})
             k = {"in_progress": "running", "queued": "queued", "failed": "failed", "completed": "completed"}.get(x["status"])
             if k:
@@ -1613,22 +1731,24 @@ class Collector:
         except (OSError, ValueError):
             return []
 
-    def user(self, who):
-        items, use, now = self.user_pods().get(who), self.usage(), time.time()
+    def user(self, who, frm=None, to=None):
+        now = to or time.time()
+        frm = frm or now - 30 * 86400
+        items, use = self.user_pods().get(who), self.usage(frm, now)
         if items is None and who not in use.get("users", {}):
             raise KeyError("no such user")
         items = items or []
         ns_list = sorted({ns for ns, _ in items})
         q = ",".join("?" * len(ns_list))
         return {"user": who, "namespaces": ns_list, "pods": [dict(p, ns=ns) for ns, p in items],
-                "use": use.get("users", {}).get(who), "use_from": use.get("from"), "key_rows": [k for k in self.keys()["keys"] if k["user"] == who],
+                "use": use.get("users", {}).get(who), "use_from": use.get("from"), "key_rows": [k for k in self.keys()["keys"] if k["user"] == who], "range": self.window(frm, now) if self.integrations()["grafana"] else None,
                 "sso": self.sso().get("users", {}).get(who), "sso_from": self.sso().get("from"),
-                "task_rows": [x for x in self.task_rows["rows"] if x["user"] == who][:30],
-                "login_rows": self.rows("SELECT ts, result FROM logins WHERE user=? ORDER BY ts DESC LIMIT 30", (who,)),
+                "task_rows": [x for x in self.tasks(frm, now)["tasks"] if x["user"] == who][:30],
+                "login_rows": self.rows("SELECT ts, result FROM logins WHERE user=? AND ts>=? AND ts<=? ORDER BY ts DESC LIMIT 30", (who, frm, now)),
                 "person": next(({"name": p["name"], "users": p["users"], "remove": bool(p.get("remove"))} for p in self.people() if who in p["users"]), None),
                 "key_people": {k: p["name"] for p in self.people() for k in p["keys"]},
-                "llm_log": self.llm_log(who, now - 7 * 86400, now), "llm_error": self.integ_err.get(
-                    "lf:%s:%d:%d" % (who, (now - 7 * 86400) // 300, now // 300)),
+                "llm_log": self.llm_log(who, frm, now), "llm_error": self.integ_err.get(
+                    "lf:%s:%d:%d" % (who, frm // 300, now // 300)),
                 "incidents": self.rows("SELECT id, ns, obj, symptom, owner, cause, opened, closed, state FROM incidents WHERE ns IN (%s) "
                                        "ORDER BY id DESC LIMIT 50" % q, ns_list),
                 "changes": self.rows("SELECT * FROM changes WHERE ns IN (%s) ORDER BY ts DESC LIMIT 50" % q, ns_list)}
@@ -1651,7 +1771,7 @@ class Collector:
         d, ai = json.loads(r["data"]), json.loads(r["ai"]) if r["ai"] else None
         return dict(d, fetched=r["fetched"], seen=r["seen"], ai=ai, answers=tickets.analyze(self, d, ai))
 
-    def capacity(self):
+    def capacity(self, frm=None, to=None):
         """Per namespace: CPU/RAM used vs requested, GPUs held. Pods near their memory limit, idle pods that hold resources."""
         gib, rows, near, idle, gpus = 1024 ** 3, [], [], [], []
         for ns, pods in sorted(self.pods.items()):
@@ -1679,29 +1799,29 @@ class Collector:
                          "gpu": ", ".join("%s×%d" % (k.replace("nvidia.com/", ""), n) for k, n in sorted(g.items())),
                          "gpu_n": sum(g.values()), "metrics": any(p.get("use_cpu") is not None for p in live)})
         rows.sort(key=lambda r: (-r["gpu_n"], -r["cpu_use"]))
-        return {"services": self.service_load(), "namespaces": rows, "near_limit": sorted(near, key=lambda r: -r["pct"]), "idle": sorted(idle, key=lambda r: -r["cpu_req"]),
+        return {"resources": self.resources(frm, to), "checks": self.checks, "namespaces": rows, "near_limit": sorted(near, key=lambda r: -r["pct"]), "idle": sorted(idle, key=lambda r: -r["cpu_req"]),
                 "gpus": sorted(gpus, key=lambda r: (r["ns"], r["pod"]))}
 
-    def trends(self, days=14):
-        """Per day: incidents opened/closed, changes, mean time to close; services that break or restart most."""
-        t = time.time()
-        since = t - days * 86400
+    def trends(self, days=14, frm=None, to=None):
+        """Per day in the range: incidents opened/closed, changes, mean time to close; services that break or restart most."""
+        t = to or time.time()
+        since = frm or t - days * 86400
         day = "strftime('%Y-%m-%d', {}, 'unixepoch', '+210 minutes')"  # Tehran calendar day
         per = {}
-        for r in self.rows("SELECT %s d, count(*) n FROM incidents WHERE opened>=? GROUP BY d" % day.format("opened"), (since,)):
+        for r in self.rows("SELECT %s d, count(*) n FROM incidents WHERE opened>=? AND opened<=? GROUP BY d" % day.format("opened"), (since, t)):
             per.setdefault(r["d"], {})["opened"] = r["n"]
-        for r in self.rows("SELECT %s d, count(*) n, avg(closed - opened) m FROM incidents WHERE closed>=? GROUP BY d" % day.format("closed"),
-                           (since,)):
+        for r in self.rows("SELECT %s d, count(*) n, avg(closed - opened) m FROM incidents WHERE closed>=? AND closed<=? GROUP BY d" % day.format("closed"),
+                           (since, t)):
             per.setdefault(r["d"], {}).update(closed=r["n"], fix_min=round(r["m"] / 60) if r["m"] else None)
-        for r in self.rows("SELECT %s d, count(*) n FROM changes WHERE ts>=? GROUP BY d" % day.format("ts"), (since,)):
+        for r in self.rows("SELECT %s d, count(*) n FROM changes WHERE ts>=? AND ts<=? GROUP BY d" % day.format("ts"), (since, t)):
             per.setdefault(r["d"], {})["changes"] = r["n"]
-        for r in self.rows("SELECT day d, sum(last - first) n FROM restarts WHERE day>=? GROUP BY day",
-                           (time.strftime("%Y-%m-%d", time.gmtime(since)),)):
+        for r in self.rows("SELECT day d, sum(last - first) n FROM restarts WHERE day>=? AND day<=? GROUP BY day",
+                           (time.strftime("%Y-%m-%d", time.gmtime(since)), time.strftime("%Y-%m-%d", time.gmtime(t)))):
             per.setdefault(r["d"], {})["restarts"] = r["n"]
-        top_inc = self.rows("SELECT ns, obj, count(*) n, sum(state='open') open FROM incidents WHERE opened>=? AND ns!='-' "
-                            "GROUP BY ns, obj ORDER BY n DESC LIMIT 10", (t - 30 * 86400,))
-        top_rst = self.rows("SELECT ns, wl, sum(last - first) n FROM restarts WHERE day>=? GROUP BY ns, wl HAVING n>0 ORDER BY n DESC LIMIT 10",
-                            (time.strftime("%Y-%m-%d", time.gmtime(t - 7 * 86400)),))
+        top_inc = self.rows("SELECT ns, obj, count(*) n, sum(state='open') open FROM incidents WHERE opened>=? AND opened<=? AND ns!='-' "
+                            "GROUP BY ns, obj ORDER BY n DESC LIMIT 10", (since, t))
+        top_rst = self.rows("SELECT ns, wl, sum(last - first) n FROM restarts WHERE day>=? AND day<=? GROUP BY ns, wl HAVING n>0 ORDER BY n DESC LIMIT 10",
+                            (time.strftime("%Y-%m-%d", time.gmtime(since)), time.strftime("%Y-%m-%d", time.gmtime(t))))
         return {"days": [dict(v, day=k) for k, v in sorted(per.items(), reverse=True)], "top_incidents": top_inc, "top_restarts": top_rst}
 
     def infra(self):

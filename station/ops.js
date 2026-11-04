@@ -56,6 +56,35 @@ function table(cols, rows, onclick) {
     rows.map((r, i) => h('tr', {class: onclick ? 'click' : '', onclick: onclick && (() => onclick(r))}, cols.map(c => h('td', {}, c[1](r, i, rows))))));
 }
 
+// --- the date range, shared by every page it applies to ---------------------------------------------------------------
+const RANGE_PAGES = ['users', 'user', 'trainings', 'capacity', 'services', 'models', 'incidents', 'changes', 'trends', 'tickets'];
+let range = {days: 7};
+try { range = JSON.parse(localStorage.getItem('ops-range')) || range; } catch (e) { /* no storage: the default */ }
+const tehranDay = d => Date.parse(d + 'T00:00:00+03:30') / 1000;  // a date picked on the page means a Tehran day
+function rangeNow() {
+  const now = Math.floor(Date.now() / 300000) * 300;  // 5-min steps: the server's cache follows
+  if (range.from && range.to) return {from: tehranDay(range.from), to: Math.min(tehranDay(range.to) + 86399, now)};
+  return {from: now - (range.days || 7) * 86400, to: now};
+}
+const Rq = o => qs(Object.assign({}, o, rangeNow()));
+function setRange(r) {
+  range = r;
+  try { localStorage.setItem('ops-range', JSON.stringify(r)); } catch (e) { /* kept for this page only */ }
+  render();
+}
+function rangeBar() {
+  const r = rangeNow(), today = new Date(Date.now() + 12600000).toISOString().slice(0, 10);
+  const a = h('input', {type: 'date', value: range.from || '', max: today}), b = h('input', {type: 'date', value: range.to || today, max: today});
+  return h('div', {class: 'row rangebar'}, h('b', {}, 'Date range'),
+    [[1, '24 h'], [3, '3 d'], [7, '7 d'], [14, '14 d'], [30, '30 d'], [90, '90 d']].map(([d, t]) => h('button', {class: !range.from && range.days === d ? 'primary' : '', onclick: () => setRange({days: d})}, t)),
+    h('span', {class: 'mut small'}, 'from'), a, h('span', {class: 'mut small'}, 'to'), b,
+    h('button', {class: range.from ? 'primary' : '', onclick: () => { if (a.value && b.value && a.value <= b.value) setRange({from: a.value, to: b.value}); }}, 'Apply'),
+    h('span', {class: 'small mut'}, fmt(r.from) + ' → ' + fmt(r.to) + ' (Tehran)'));
+}
+// Prometheus holds less than the range asked: say so; its percentages already use the real hours
+const cutNote = w => w && w.cut ? h('div', {class: 'card small', style: 'margin-bottom:12px'}, 'Prometheus data starts ' + fmt(w.data_from) + ': CPU, GPU and LLM counts cover only ' + Math.round(w.hours / 24) + ' days of this range, and their percentages use those days.') : '';
+const pct = (a, b) => b ? ' (' + Math.round(100 * a / b) + ' %)' : '';
+
 // --- login and navigation ------------------------------------------------------------------------------------------
 function showLogin(msg) {
   me = null; clearTimeout(timer);
@@ -86,7 +115,7 @@ async function render() {
   if (!me) { try { me = await api('/api/me'); } catch (e) { return; } }
   const [page, q] = route();
   nav(page);
-  try { app.replaceChildren(await (VIEWS[page] || VIEWS.overview)(q)); }
+  try { app.replaceChildren(...[RANGE_PAGES.includes(page) ? rangeBar() : null, await (VIEWS[page] || VIEWS.overview)(q)].filter(Boolean)); }
   catch (e) { if (e.message !== 'login') app.replaceChildren(h('div', {class: 'card err'}, 'Error: ' + e.message)); }
   if (['overview', 'incidents', 'infra'].includes(page)) timer = setTimeout(render, 30000);
 }
@@ -149,7 +178,7 @@ VIEWS.overview = async () => {
 
 VIEWS.incidents = async q => {
   const state = q.state || 'open', kind = q.kind || '';
-  const rows = await api('/api/incidents?' + qs({state, kind}));
+  const rows = await api('/api/incidents?' + Rq({state, kind}));
   const sel = (key, val, opts) => h('select', {onchange: e => { location.hash = '#/incidents?' + qs(Object.assign({state, kind}, {[key]: e.target.value})); }},
     opts.map(([v, t]) => h('option', {value: v, selected: v === val}, t)));
   return h('div', {}, h('div', {class: 'row'}, sel('state', state, [['open', 'Open'], ['closed', 'Closed']]),
@@ -191,11 +220,10 @@ VIEWS.incident = async q => {
 };
 
 VIEWS.changes = async q => {
-  const days = q.days || '1', type = q.type || '';
-  const rows = await api('/api/changes?' + qs({days, type}));
-  const go = o => { location.hash = '#/changes?' + qs(Object.assign({days, type}, o)); };
+  const type = q.type || '';
+  const rows = await api('/api/changes?' + Rq({type}));
+  const go = o => { location.hash = '#/changes?' + qs(Object.assign({type}, o)); };
   return h('div', {}, h('div', {class: 'row'},
-    h('select', {onchange: e => go({days: e.target.value})}, [['1', 'Last 24 h'], ['7', 'Last 7 days'], ['30', 'Last 30 days']].map(([v, t]) => h('option', {value: v, selected: v === days}, t))),
     h('select', {onchange: e => go({type: e.target.value})}, [['', 'All changes'], ['release', 'Features / releases (3)'], ['new-service', 'New services (4)'],
       ['new-model', 'Models (5)'], ['removed', 'Removed']].map(([v, t]) => h('option', {value: v, selected: v === type}, t))),
     h('span', {class: 'mut'}, rows.length + ' changes')), h('div', {class: 'card'}, changeTable(rows)),
@@ -204,13 +232,14 @@ VIEWS.changes = async q => {
 };
 
 VIEWS.models = async () => {
-  const ms = await api('/api/models');
+  const ms = await api('/api/models?' + Rq());
   const cols = [['Model', m => m.name], ['Ready', m => live(m.ready + '/' + m.min, m.since, m.checked, m.min && m.ready < m.min)],
     ['Engine', m => m.engine], ['Resource profile', m => m.profile], ['Pods', m => m.pods.map(p => p.name + (p.restarts ? ' (' + p.restarts + ' restarts)' : '') + (p.node ? ' on ' + p.node : '')).join(', ')],
     ['Source', m => h('span', {class: 'small mut'}, m.url)], ['Age', m => ago(m.created)],
     ['Open incidents', m => m.open ? h('a', {href: '#/incidents'}, m.open) : '0']];
   if (me.integrations.litellm) cols.splice(4, 0, ['Test call', m => !m.test ? '–' : m.test.ok ? m.test.ms + ' ms' : h('span', {class: 'err', title: m.test.detail}, 'failed')]);
-  if (me.integrations.grafana) cols.splice(4, 0, ['GPU %', m => m.gpu == null ? '–' : m.gpu + ' %']);
+  if (me.integrations.grafana) cols.splice(4, 0, ['GPU busy now', m => m.gpu == null ? '–' : m.gpu + ' %'], ['GPU busy · range', m => m.use && m.use.gpu_avg != null ? m.use.gpu_avg + ' %' : '–'],
+    ['Calls · range', m => m.use ? big(m.use.calls) : '–'], ['Failed · range', m => m.use && m.use.failed ? h('span', {class: 'err'}, big(m.use.failed) + ' (' + m.use.fail_pct + ' %)') : '0']);
   if (me.integrations.litellm) cols.splice(4, 0, ['In litellm', m => m.litellm == null ? '?' : m.litellm ? 'yes' : h('span', {class: 'err'}, 'no')]);
   return h('div', {}, h('h1', {}, 'KubeAI models · ' + ms.length), h('div', {class: 'card'}, table(cols, ms)),
     !me.integrations.grafana ? h('p', {class: 'mut small'}, 'GPU % is off: run set-grafana-login.sh (Grafana login) or set GRAFANA_TOKEN.') : '');
@@ -224,8 +253,10 @@ async function nsSelect(current, onpick) {
 
 VIEWS.services = async q => {
   const ns = q.ns || 'aip-mlops-service';
-  const s = await api('/api/services?' + qs({ns}));
-  return h('div', {}, h('div', {class: 'row'}, await nsSelect(ns, v => { location.hash = '#/services?' + qs({ns: v}); }),
+  const s = await api('/api/services?' + Rq({ns}));
+  return h('div', {}, cutNote(s.range), s.use ? h('div', {class: 'stats'}, [['CPU hours', s.use.cpu_h + pct0(s.use.cpu_pct)], ['GPU hours held', s.use.gpu_h + pct0(s.use.gpu_pct)], ['GPU busy while held', s.use.gpu_util == null ? '–' : s.use.gpu_util + ' %'],
+    ['RAM, average', s.use.mem_gib + ' GiB'], ['Traffic in', s.use.net_gb + ' GB']].map(([k, v]) => h('div', {class: 'stat'}, h('span', {class: 'k'}, k), h('span', {class: 'v'}, v)))) : '',
+    h('div', {class: 'row'}, await nsSelect(ns, v => { location.hash = '#/services?' + qs({ns: v}); }),
     h('span', {class: 'mut'}, 'read ' + ago(s.read))),
     h('h2', {}, 'Workloads · ' + s.workloads.length), h('div', {class: 'card'}, table([
       ['Kind', w => w.kind], ['Name', w => w.name],
@@ -309,13 +340,14 @@ const LOCKED_USER = [  // what our access still cannot show (2026-10-31: kubecon
 const userLocked = () => LOCKED_USER.filter(l => !(l.key === 'llm' && me.integrations.grafana) && !(l.key === 'failed-login' && me.integrations.casdoor) && !(l.key === 'train' && me.integrations.mlops));
 const big = n => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e4 ? Math.round(n / 1e3) + 'k' : String(n);
 const llmCell = u => !u || !u.requests ? '–' : [big(u.requests) + ' calls · ' + big(u.tokens) + ' tok · $' + u.spend,
-  u.failed ? h('span', {class: 'err'}, ' · ' + u.failed + ' failed') : ''];
+  u.failed ? h('span', {class: 'err'}, ' · ' + u.fail_pct + ' % failed') : ''];
+const pct0 = p => p == null ? '' : ' (' + p + ' % of the cluster)';
 const lockedCell = l => h('span', {class: 'locked-cell', title: l.title + ': not visible yet. Needs ' + l.needs}, '—');
 const lockedCard = l => h('div', {class: 'card locked'}, h('div', {}, h('b', {}, l.title), h('span', {class: 'chip'}, 'not visible yet')),
   h('div', {class: 'small'}, 'Will show: ' + l.shows), h('div', {class: 'small'}, 'Needs: ' + l.needs));
 
 VIEWS.users = async () => {
-  const us = await api('/api/users'), lg = me.integrations.casdoor ? await api('/api/logins') : null;
+  const res = await api('/api/users?' + Rq()), us = res.rows, lg = me.integrations.casdoor ? await api('/api/logins?' + Rq()) : null;
   const groups = [];  // one card per person from the name list (several namespaces), or per account not in the list
   for (const u of us) {
     const k = u.person ? 'p:' + u.person.name : 'u:' + u.user;
@@ -327,6 +359,7 @@ VIEWS.users = async () => {
   for (const g of groups) Object.assign(g, {open: sum(g, u => u.open), running: sum(g, u => u.running), restarts: sum(g, u => u.restarts),
     req: sum(g, u => u.use && u.use.requests), failed: sum(g, u => u.use && u.use.failed), spend: sum(g, u => u.use && u.use.spend),
     cpu_h: sum(g, u => u.use && u.use.cpu_h), gpu_h: sum(g, u => u.use && u.use.gpu_h), seen: Math.max(0, ...g.rows.map(u => u.sso ? u.sso.last : 0)),
+    gpuBusy: (l => l.length ? Math.round(l.reduce((a, b) => a + b, 0) / l.length) : null)(g.rows.filter(u => u.use && u.use.gpu_util != null).map(u => u.use.gpu_util)),
     lastLogin: Math.max(0, ...g.rows.map(u => u.login && u.login.last_ok || 0)), loginFail: sum(g, u => u.login && u.login.failed),
     trainRun: sum(g, u => u.train && u.train.running), trainFail: sum(g, u => u.train && u.train.failed), trainDone: sum(g, u => u.train && u.train.completed)});
   groups.sort((a, b) => b.open - a.open || b.seen - a.seen || b.req - a.req);
@@ -338,16 +371,16 @@ VIEWS.users = async () => {
       g.name ? '' : h('span', {class: 'small mut'}, 'not in the name list')),
     h('div', {class: 'stats'},
       stat('Last active (SSO)', T(g.seen || null)), me.integrations.casdoor ? stat('Last password login', T(g.lastLogin || null)) : '',
-      me.integrations.casdoor ? stat('Failed logins · 30 d', g.loginFail ? h('span', {class: 'err'}, g.loginFail) : '0') : '', stat('Open incidents', g.open ? h('span', {class: 'err'}, g.open) : '0'),
+      me.integrations.casdoor ? stat('Failed logins', g.loginFail ? h('span', {class: 'err'}, g.loginFail) : '0') : '', stat('Open incidents', g.open ? h('span', {class: 'err'}, g.open) : '0'),
       me.integrations.mlops ? stat('Tasks: running · done · failed', g.trainRun + ' · ' + g.trainDone + ' · ', g.trainFail ? h('span', {class: 'err'}, g.trainFail) : '0') : '',
-      stat('Running pods', g.running), stat('LLM calls · 30 d', num(g.req), g.failed ? h('span', {class: 'err'}, ' · ' + num(g.failed) + ' failed') : ''),
-      stat('Spend · 30 d', '$' + g.spend.toFixed(2)), stat('CPU-h · GPU-h · 30 d', num(g.cpu_h) + ' · ' + num(g.gpu_h))),
+      stat('Running pods', g.running), stat('LLM calls', num(g.req), g.failed ? h('span', {class: 'err'}, ' · ' + (100 * g.failed / Math.max(g.req, g.failed)).toFixed(1) + ' % failed') : ''),
+      stat('Spend', '$' + g.spend.toFixed(2)), stat('CPU h · GPU h held', num(g.cpu_h) + ' · ' + num(g.gpu_h)), ...(g.gpuBusy != null ? [stat('GPU busy while held', g.gpuBusy + ' %')] : [])),
     table([['Namespace / account', u => h('a', {href: '#/user?' + qs({name: u.user})}, h('b', {}, u.user))], ['Runs', u => u.kinds.join(', ')],
-      ['Pods', u => u.running + ' running' + (u.pending ? ', ' + u.pending + ' pending' : '')], ['CPU used / reserved', u => u.cpu_use + ' / ' + u.cpu_req],
+      ['Pods', u => u.running + ' running' + (u.pending ? ', ' + u.pending + ' pending' : '')], ['CPU now / reserved', u => u.cpu_use + ' / ' + u.cpu_req + pct(u.cpu_use, u.cpu_req)],
       ['RAM', u => u.mem_use_gib + ' GiB'], ['GPU', u => u.gpu || '–'], ['Restarts', u => u.restarts ? h('span', {class: 'err'}, u.restarts) : 0],
-      ['Incidents', u => u.open ? h('span', {class: 'err'}, u.open) : 0], ['LLM 30 d', u => llmCell(u.use)],
-      ['CPU-h · GPU-h', u => u.use ? u.use.cpu_h + ' · ' + u.use.gpu_h : '–'], ['Last active (SSO)', u => T(u.sso && u.sso.last)], ...(me.integrations.casdoor ? [['Failed logins 30 d', u => u.login && u.login.failed ? h('span', {class: 'err'}, u.login.failed) : 0]] : []),
-      ['Changes 7 d', u => u.changes_7d ? [u.changes_7d + ' · ', T(u.last_change)] : 0], ['Running since', u => T(u.started)]], g.rows))]);
+      ['Incidents', u => u.open ? h('span', {class: 'err'}, u.open) : 0], ['LLM', u => llmCell(u.use)],
+      ['CPU h · GPU h', u => u.use ? u.use.cpu_h + ' · ' + u.use.gpu_h : '–'], ['GPU busy', u => u.use && u.use.gpu_util != null ? u.use.gpu_util + ' %' : '–'], ['Last active (SSO)', u => T(u.sso && u.sso.last)], ...(me.integrations.casdoor ? [['Failed logins', u => u.login && u.login.failed ? h('span', {class: 'err'}, u.login.failed) : 0]] : []),
+      ['Changes', u => u.changes ? [u.changes + ' · ', T(u.last_change)] : 0], ['Running since', u => T(u.started)]], g.rows))]);
   const search = h('input', {type: 'search', placeholder: 'Search name or namespace…', oninput: () => {
     const v = search.value.trim().toLowerCase();
     for (const [g, el] of cards) el.hidden = !!v && !(g.name || '').toLowerCase().includes(v) && !g.rows.some(u => u.user.includes(v));
@@ -357,8 +390,9 @@ VIEWS.users = async () => {
     h('div', {class: 'stats'}, stat('People', groups.length), stat('Namespaces / accounts', us.length), stat('Active in SSO last 24 h', today),
       stat('With open incidents', groups.filter(g => g.open).length)),
     h('p', {class: 'mut small'}, 'One card per person: all their namespaces are inside it. Red edge = open incident, grey = nothing running and no LLM use. ' +
-      'Real names: the team\'s name list. LLM and CPU/GPU: Grafana (30 d, Prometheus data from 21 Oct). Last active: Casdoor log.'),
-    lg ? h('div', {class: 'card', style: 'margin-bottom:14px'}, h('b', {}, 'Logins · last 7 days (Casdoor)'),
+      'Real names: the team\'s name list. LLM and CPU/GPU: Prometheus, for the date range; "% failed" is failed calls out of all calls. GPU busy: how hard held GPUs worked. Last active: Casdoor log.'),
+    cutNote(res.range),
+    lg ? h('div', {class: 'card', style: 'margin-bottom:14px'}, h('b', {}, 'Logins (Casdoor)'),
       h('div', {class: 'stats'}, stat('Password logins', lg.ok), stat('Failed', lg.failed ? h('span', {class: 'err'}, lg.failed) : 0), stat('History from', T(lg.from))),
       lg.top.length ? table([['Failed for', t => t.user], ['Times', t => t.n], ['Last', t => T(t.last)]], lg.top) : '',
       h('div', {class: 'small mut'}, 'A login through a running session is not counted here. "(unknown name)" = not one of our accounts; the typed name is not stored. No IPs: Casdoor sees only its proxy.')) : '',
@@ -385,14 +419,14 @@ VIEWS.tasklog = async q => {
 const taskTable = rows => table([['Task', x => h('span', {dir: 'auto'}, x.name)], ['', taskLogLink], ['Type', x => x.type], ['Status', taskStatus], ['Reason', x => h('span', {class: 'small', dir: 'auto'}, x.reason || '')],
   ['Created', x => T(x.created)], ['Last update', x => T(x.last)]], rows);
 VIEWS.trainings = async q => {
-  const r = await api('/api/tasks'), f = q.status || '', user = q.user || '';
+  const r = await api('/api/tasks?' + Rq()), f = q.status || '', user = q.user || '';
   const stuck = x => x.stuck, counts = {in_progress: 0, queued: 0, failed: 0, completed: 0};
   for (const x of r.tasks) if (x.status in counts) counts[x.status]++;
   const rows = r.tasks.filter(x => (f === 'stuck' ? stuck(x) : !f || x.status === f) && (!user || x.user === user));
   const go = s => { location.hash = '#/trainings' + (s ? '?' + qs({status: s}) : ''); };
   const btn = (s, label) => h('button', {class: f === s ? 'primary' : '', onclick: () => go(s)}, label);
   return h('div', {}, h('h1', {}, 'Trainings · ' + r.tasks.length),
-    h('p', {class: 'mut small'}, 'Tasks in mlops-core, read every 5 min. Read ', T(r.at), '. "No update" = running, but nothing reported for 6 h. Scripts and settings of tasks are not read.'),
+    h('p', {class: 'mut small'}, 'Tasks active in the date range (running and queued ones always show), read every 5 min. Read ', T(r.at), '. "No update" = running, but nothing reported for 6 h. Scripts and settings of tasks are not read.'),
     r.error ? h('div', {class: 'card err small'}, 'Last read failed: ' + r.error + ' (showing the last good read)') : '',
     h('div', {class: 'row'}, btn('', 'All'), btn('in_progress', 'Running · ' + counts.in_progress), btn('queued', 'Queued · ' + counts.queued), btn('failed', 'Failed · ' + counts.failed),
       btn('completed', 'Completed · ' + counts.completed), btn('stuck', 'No update · ' + r.tasks.filter(stuck).length)),
@@ -407,7 +441,7 @@ VIEWS.keys = async q => {
   const rows = flag ? r.keys.filter(k => k.flags.includes(flag)) : r.keys;
   const go = f => { location.hash = '#/keys' + (f ? '?' + qs({flag: f}) : ''); };
   return h('div', {}, h('h1', {}, 'Keys · ' + r.keys.length),
-    h('p', {class: 'mut small'}, 'Every LiteLLM key, read with a read-only key every 5 min. Read ', T(r.at), '. Warnings stay on this page; nothing goes to the bot.'),
+    h('p', {class: 'mut small'}, 'Every LiteLLM key, read with a read-only key every 5 min. Spend here is since the key was created. Read ', T(r.at), '. Warnings stay on this page; nothing goes to the bot.'),
     r.error ? h('div', {class: 'card err small'}, 'Last read failed: ' + r.error + ' (showing the last good read)') : '',
     h('div', {class: 'row'}, h('button', {class: flag ? '' : 'primary', onclick: () => go('')}, 'All'),
       flags.map(f => h('button', {class: flag === f ? 'primary' : '', onclick: () => go(f)}, f + ' · ' + r.keys.filter(k => k.flags.includes(f)).length))),
@@ -419,7 +453,7 @@ VIEWS.keys = async q => {
 };
 
 VIEWS.user = async q => {
-  const u = await api('/api/user?' + qs({name: q.name}));
+  const u = await api('/api/user?' + Rq({name: q.name}));
   return h('div', {}, h('p', {}, h('a', {href: '#/users'}, '← users')),
     h('h1', {dir: 'auto'}, u.person ? u.person.name : u.user, u.person ? h('span', {class: 'mut'}, ' · ' + u.user) : '', u.person && u.person.remove ? [' ', h('span', {class: 'chip warn'}, 'marked to delete')] : ''),
     u.person && u.person.users.length > 1 ? h('p', {}, h('span', {class: 'chip group'}, 'one person · ' + u.person.users.length + ' namespaces'), ' other namespaces: ',
@@ -432,10 +466,10 @@ VIEWS.user = async q => {
       : h('span', {class: 'mut'}, 'No sign-in in the Casdoor log'), h('div', {class: 'small mut'}, 'The log covers ', T(u.sso_from), ' until now (the running Casdoor pod).'),
       (u.login_rows || []).length ? [h('b', {}, 'Password logins'), table([['Time', x => T(x.ts)], ['Result', x => x.result === 'ok' ? h('span', {class: 'chip ok'}, 'ok') : h('span', {class: 'chip bad'}, x.result)]], u.login_rows)] : ''),
     h('p', {class: 'mut'}, 'Namespaces: ' + (u.namespaces.join(', ') || 'none (API key only)')),
-    u.use ? [h('h2', {}, 'LLM and compute · 30 d' + (u.use_from ? ' (Prometheus data from ' + fmt(u.use_from) + ', Tehran)' : '')),
-      h('div', {class: 'card'}, h('p', {}, llmCell(u.use), ' · CPU ' + u.use.cpu_h + ' core-h · GPU ' + u.use.gpu_h + ' h'),
+    u.use ? [cutNote(u.range), h('h2', {}, 'LLM and compute · date range'),
+      h('div', {class: 'card'}, h('p', {}, llmCell(u.use), ' · CPU ' + u.use.cpu_h + ' core-h · GPU ' + u.use.gpu_h + ' h held' + (u.use.gpu_util != null ? ', ' + u.use.gpu_util + ' % busy' : '')),
         table([['Key', k => k[0]], ['Used by', k => h('span', {dir: 'auto'}, u.key_people[k[0]] || '–')], ['Requests', k => k[1].requests], ['Tokens', k => k[1].tokens], ['Spend $', k => k[1].spend], ['Budget', k => k[1].budget == null ? h('span', {class: 'mut'}, 'no limit') : '$' + (k[1].left == null ? '?' : k[1].left) + ' left of $' + k[1].budget],
-          ['Failed', k => k[1].failed ? h('span', {class: 'err'}, k[1].failed) : 0], ['Key hash', k => h('span', {class: 'small mut'}, k[1].hash.slice(0, 8) + '…')]],
+          ['Failed', k => k[1].failed ? h('span', {class: 'err'}, k[1].failed + ' (' + k[1].fail_pct + ' %)') : 0], ['Key hash', k => h('span', {class: 'small mut'}, k[1].hash.slice(0, 8) + '…')]],
           Object.entries(u.use.keys)),
         h('p', {class: 'small'}, 'Requests per model: ' + (Object.entries(u.use.models).map(([m, n]) => m + ' ' + n).join(', ') || '–')),
         h('p', {class: 'small'}, 'API routes on the LLM gateway: ' + (Object.entries(u.use.routes || {}).sort((a, b) => b[1] - a[1]).map(([r, n]) => r + ' ' + n).join(', ') || '–')))] : '',
@@ -448,7 +482,7 @@ VIEWS.user = async q => {
       ['CPU / RAM now', p => p.use_cpu == null ? '–' : p.use_cpu.toFixed(2) + ' cores / ' + (p.use_mem / 1073741824).toFixed(1) + ' GiB'],
       ['Problem', p => p.waiting.join(', ')], ['Started', p => T(p.created)],
       ['', p => p.bad ? h('a', {href: '#/logs?' + qs({ns: p.ns, pod: p.name, container: p.bad})}, 'logs') : '']], u.pods)),
-    me.integrations.langfuse ? [h('h2', {}, 'LLM requests · last 7 days (Langfuse)'), llmLog(u.llm_log, u.llm_error)] : '',
+    me.integrations.langfuse ? [h('h2', {}, 'LLM requests · date range (Langfuse)'), llmLog(u.llm_log, u.llm_error)] : '',
     h('h2', {}, 'Incidents'), h('div', {class: 'card'}, incidentTable(u.incidents)),
     h('h2', {}, 'Changes'), h('div', {class: 'card'}, changeTable(u.changes.map(c => Object.assign(c, {info: JSON.parse(c.info || '{}')})))),
     h('h2', {class: 'locked-title'}, 'Activity · not visible yet'),
@@ -470,7 +504,8 @@ const shortChip = (k, a) => {
 const lockedNote = why => !why ? '' : h('div', {class: 'small locked-cell', title: 'Needs ' + why}, 'The user\'s own part: not visible yet. Needs ' + why);
 
 VIEWS.tickets = async () => {
-  const r = await api('/api/tickets');
+  const r = await api('/api/tickets'), w = rangeNow();
+  r.tickets = r.tickets.filter(t => (t.last || t.created || 0) >= w.from && (t.created || 0) <= w.to);
   if (!r.enabled) return h('div', {}, h('h1', {}, 'Tickets'), h('div', {class: 'card locked'}, h('b', {}, 'Ticket site not connected'),
     h('div', {class: 'small'}, 'Set TICKETS_URL, TICKETS_USER and TICKETS_PASSWORD on the station: ssh -t AIP-IRAN sh station/set-ticket-login.sh')));
   return h('div', {}, h('h1', {}, 'Tickets · ' + r.tickets.length),
@@ -528,16 +563,43 @@ VIEWS.ticket = async q => {
         h('div', {dir: 'auto', style: 'white-space:pre-wrap'}, m.text)))));
 };
 
+// the whole cluster: what we have, what holds it, how busy it is. Held = reserved by a pod; busy = really computing.
+function clusterView(r) {
+  if (!r || !r.gpu) return h('div', {class: 'card locked'}, 'Whole-cluster view needs the Grafana login.');
+  const stat = (k, v, small) => h('div', {class: 'stat'}, h('span', {class: 'k'}, k), h('span', {class: 'v'}, v), small ? h('span', {class: 'small mut'}, small) : '');
+  const g = r.gpu, kinds = {user: 'User', models: 'Models', service: 'Service', other: 'Other'};
+  const list = h('div', {});
+  const draw = kind => list.replaceChildren(table([['Namespace', x => h('a', {href: '#/services?' + qs({ns: x.ns})}, x.ns)], ['Kind', x => kinds[x.kind]],
+    ['GPU hours held', x => x.gpu_h || 0], ['Share of all GPUs', x => x.gpu_pct ? x.gpu_pct + ' %' : '0'], ['GPU busy while held', x => x.gpu_util == null ? '–' : x.gpu_util + ' %'],
+    ['CPU hours', x => x.cpu_h], ['Share of all CPU', x => x.cpu_pct + ' %'], ['RAM, average', x => x.mem_gib + ' GiB'], ['Traffic in', x => x.net_gb + ' GB']],
+    r.namespaces.filter(x => !kind || x.kind === kind)));
+  draw('');
+  return [cutNote(r.window), h('h2', {}, 'Whole cluster'),
+    h('div', {class: 'card'}, h('b', {}, 'GPUs'), h('div', {class: 'stats'}, stat('Total', g.total), stat('Held now', g.held + pct(g.held, g.total)), stat('Waiting for a GPU', g.waiting ? h('span', {class: 'err'}, g.waiting) : 0),
+      stat('Busy now', g.busy_now + ' %', 'all GPUs, average'), stat('Held · range', g.held_avg_pct + ' %'), stat('Busy · range', g.busy_avg + ' %')),
+      h('b', {}, 'CPU cores'), h('div', {class: 'stats'}, stat('Total', r.cpu.total), stat('Reserved', r.cpu.requested + pct(r.cpu.requested, r.cpu.total)), stat('Used now', r.cpu.used_now + pct(r.cpu.used_now, r.cpu.total)), stat('Used · range', r.cpu.used_avg + pct(r.cpu.used_avg, r.cpu.total))),
+      h('b', {}, 'RAM (GiB)'), h('div', {class: 'stats'}, stat('Total', r.mem.total), stat('Reserved', r.mem.requested + pct(r.mem.requested, r.mem.total)), stat('Used now', r.mem.used_now + pct(r.mem.used_now, r.mem.total)), stat('Used · range', r.mem.used_avg + pct(r.mem.used_avg, r.mem.total))),
+      h('div', {class: 'small mut'}, 'Held = reserved by a pod, whether it works or not. Busy = the GPU really computing. A held GPU at 0 % is doing nothing for anyone else.')),
+    h('h2', {}, 'Each GPU · who holds it'), h('div', {class: 'card'}, table([['Node', x => x.node], ['GPU', x => x.gpu], ['Model', x => x.model],
+      ['Held by', x => x.ns ? [h('a', {href: '#/services?' + qs({ns: x.ns})}, x.ns), h('div', {class: 'small mut'}, x.pod)] : h('span', {class: 'mut'}, 'free')],
+      ['Busy now', x => x.ns && x.util < 1 ? h('span', {class: 'chip warn'}, 'held, idle') : x.util + ' %'], ['Busy · range', x => x.util_avg == null ? '–' : x.util_avg + ' %'],
+      ['Memory', x => x.mem_total ? x.mem_used + ' / ' + x.mem_total + ' GiB' : '–']], r.gpus)),
+    h('h2', {}, 'Who used what · date range'), h('div', {class: 'row'}, h('select', {onchange: e => draw(e.target.value)}, [['', 'All namespaces'], ['user', 'Users'], ['models', 'Models'], ['service', 'Services'], ['other', 'Other']].map(([v, t]) => h('option', {value: v}, t)))),
+    h('div', {class: 'card'}, list, h('div', {class: 'small mut'}, 'Non-LLM services count as a whole: their logs do not say which user.'))];
+}
+// the same figure from two systems, re-checked every hour
+const checksView = c => !c || !c.rows.length ? '' : [h('h2', {}, 'Data check · are these numbers right?'),
+  h('div', {class: 'card'}, h('p', {class: 'small mut'}, 'The same figure from two systems, last 7 days, read ', T(c.at), '. Agreed = within ' + 2 + ' %.'),
+    table([['Figure', x => h('span', {dir: 'auto'}, x.what)], ['First', x => x.a_name + ': ' + big(x.a)], ['Second', x => x.b_name + ': ' + big(x.b)], ['Difference', x => x.diff_pct + ' %'],
+      ['Result', x => h('span', {class: 'chip ' + (x.ok ? 'ok' : 'bad')}, x.ok ? 'agrees' : 'differs')]], c.rows))];
 VIEWS.capacity = async () => {
-  const c = await api('/api/capacity');
+  const c = await api('/api/capacity?' + Rq());
   const maxCpu = Math.max(...c.namespaces.map(r => r.cpu_use), 1);
   const noMetrics = !c.namespaces.some(r => r.metrics);
   return h('div', {}, h('h1', {}, 'Capacity'),
     h('p', {class: 'mut'}, 'Live use from metrics.k8s.io against what pods requested. Not one of the 8 events: a view to spot waste and pods about to run out of memory.'),
     noMetrics ? h('div', {class: 'card err small'}, 'No usage numbers: metrics.k8s.io answered nothing.') : '',
-    c.services.length ? [h('h2', {}, 'Non-LLM services · whole service, not per user'), h('div', {class: 'card'}, table([['Service', r => h('a', {href: '#/services?' + qs({ns: r.ns})}, r.ns)],
-      ['CPU hours · 30 d', r => r.cpu_h], ['RAM now', r => r.mem_gib + ' GiB'], ['Traffic in · 7 d', r => r.net_gb + ' GB']], c.services),
-      h('div', {class: 'small mut'}, 'From Prometheus (data from 21 Oct). These services\' logs do not say which user, so there is no per-user split. Traffic includes their internal traffic.'))] : '',
+    clusterView(c.resources), checksView(c.checks),
     h('h2', {}, 'Pods near their memory limit (85% or more) · ' + c.near_limit.length),
     h('div', {class: 'card'}, table([['Namespace', r => r.ns], ['Pod', r => r.pod], ['Used', r => r.used_gib + ' GiB'], ['Limit', r => r.limit_gib + ' GiB'],
       ['%', r => h('span', {class: r.pct >= 95 ? 'err' : ''}, r.pct + ' %')]], c.near_limit)),
@@ -553,14 +615,14 @@ VIEWS.capacity = async () => {
 };
 
 VIEWS.trends = async () => {
-  const tr = await api('/api/trends');
+  const tr = await api('/api/trends?' + Rq());
   const maxO = Math.max(...tr.days.map(d => d.opened || 0), 1), maxR = Math.max(...tr.days.map(d => d.restarts || 0), 1);
   return h('div', {}, h('h1', {}, 'Trends'),
-    h('p', {class: 'mut'}, 'Last 14 days, Tehran calendar. Restart counts start from the day this tab was added.'),
+    h('p', {class: 'mut'}, 'Tehran calendar. Restart counts start from the day this tab was added.'),
     h('div', {class: 'card'}, table([['Day', d => d.day], ['Incidents opened', d => [bar(d.opened || 0, maxO), ' ', d.opened || 0]], ['Closed', d => d.closed || 0],
       ['Avg time to close', d => d.fix_min == null ? '–' : d.fix_min + ' min'], ['Changes', d => d.changes || 0],
       ['Restarts', d => [bar(d.restarts || 0, maxR), ' ', d.restarts || 0]]], tr.days)),
-    h('h2', {}, 'Services with the most incidents (30 days)'),
+    h('h2', {}, 'Services with the most incidents'),
     h('div', {class: 'card'}, table([['Namespace', r => r.ns], ['Service', r => r.obj], ['Incidents', r => r.n], ['Open now', r => r.open]], tr.top_incidents)),
     h('h2', {}, 'Services that restart most (7 days)'),
     h('div', {class: 'card'}, table([['Namespace', r => r.ns], ['Service', r => r.wl], ['Restarts', r => r.n]], tr.top_restarts)));
