@@ -176,7 +176,7 @@ function columnChart({title, note, days, series, unit, partial, counts}) {
   const W = 640, H = 210, L = 48, R = 12, T = 12, B = 28, n = days.length;
   const totals = days.map((_, i) => series.reduce((a, s) => a + (s.values[i] || 0), 0));
   if (!n || !Math.max(...totals)) return emptyChart(title);
-  const max = counts ? Math.ceil(Math.max(...totals, 1) / 4) * 4 : niceMax(Math.max(...totals)), band = (W - L - R) / n, w = Math.min(24, Math.max(3, band * 0.62));
+  const max = counts ? Math.ceil(niceMax(Math.max(...totals, 1)) / 4) * 4 : niceMax(Math.max(...totals)), band = (W - L - R) / n, w = Math.min(24, Math.max(3, band * 0.62));
   const xs = days.map((_, i) => L + band * (i + 0.5));
   const y = v => (H - T - B) * v / max;
   const svg = S('svg', {viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': title + ': highest ' + compact(Math.max(...totals))});
@@ -215,7 +215,7 @@ function meter(title, total, used, reserved, unit, usedName, reservedName) {
       u > 0 ? h('div', {style: 'flex:' + u + ';background:' + COL(1), title: usedName + ': ' + nice(u) + unit}) : '',
       r > 0 ? h('div', {style: 'flex:' + r + ';background:' + COL(2), title: reservedName + ': ' + nice(r) + unit}) : '',
       free > 0 ? h('div', {class: 'segfree', style: 'flex:' + free, title: 'Free: ' + nice(free) + unit}) : ''),
-    h('div', {class: 'legend'}, h('span', {class: 'key'}, h('i', {style: 'background:' + COL(1)}), usedName + ' ' + nice(u)), h('span', {class: 'key'}, h('i', {style: 'background:' + COL(2)}), reservedName + ' ' + nice(r)),
+    h('div', {class: 'legend'}, h('span', {class: 'key'}, h('i', {style: 'background:' + COL(1)}), usedName + ' ' + nice(u)), r > 0 ? h('span', {class: 'key'}, h('i', {style: 'background:' + COL(2)}), reservedName + ' ' + nice(r)) : '',
       h('span', {class: 'key'}, h('i', {class: 'segfree'}), 'free ' + nice(free)), h('span', {class: 'small mut'}, 'of ' + nice(total) + unit)));
 }
 function spark(values) {
@@ -497,6 +497,14 @@ const userLocked = () => LOCKED_USER.filter(l => !(l.key === 'llm' && me.integra
 const big = n => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e4 ? Math.round(n / 1e3) + 'k' : String(n);
 const llmCell = u => !u || !u.requests ? '–' : [big(u.requests) + ' calls · ' + big(u.tokens) + ' tok · $' + u.spend,
   u.failed ? h('span', {class: 'err'}, ' · ' + u.fail_pct + ' % failed') : ''];
+// a user's real limit is their agent's size; the bar is their peak use against it
+const limitText = l => !l ? h('span', {class: 'mut'}, '–') : [l.cpu + ' CPU · ' + l.mem_gib + ' GiB' + (l.gpu ? ' · ' + l.gpu + ' GPU' : '') + (l.slices ? ' · ' + l.slices + ' slice' : ''), l.waiting ? h('div', {}, h('span', {class: 'chip warn'}, 'waiting for a GPU')) : ''];
+function peakBar(peak, limit, unit) {
+  if (peak == null) return h('span', {class: 'mut'}, '–');
+  if (!limit) return peak + unit;
+  const p = 100 * peak / limit;
+  return h('div', {class: 'peak', title: peak + unit + ' of ' + limit + unit}, h('div', {class: 'peaktrack'}, h('div', {style: 'width:' + Math.min(100, Math.max(p, 1)).toFixed(0) + '%'})), h('span', {class: 'small'}, Math.round(p) + ' %'));
+}
 const pct0 = p => p == null ? '' : ' (' + p + ' % of the cluster)';
 const lockedCell = l => h('span', {class: 'locked-cell', title: l.title + ': not visible yet. Needs ' + l.needs}, '—');
 const lockedCard = l => h('div', {class: 'card locked'}, h('div', {}, h('b', {}, l.title), h('span', {class: 'chip'}, 'not visible yet')),
@@ -539,6 +547,7 @@ VIEWS.users = async () => {
   const cards = groups.map(g => [g, h('div', {class: 'card person' + (g.open ? ' bad' : g.running || g.req ? '' : ' idle')},
     h('div', {class: 'ph'}, h('span', {class: 'name', dir: 'auto'}, g.name || g.rows[0].user),
       g.rows.length > 1 ? h('span', {class: 'chip group'}, 'one person · ' + g.rows.length + ' namespaces') : '',
+      g.rows.some(u => u.limit && u.limit.waiting) ? h('span', {class: 'chip warn'}, 'agent waiting for a GPU') : '',
       g.name ? '' : h('span', {class: 'small mut'}, 'not in the name list')),
     h('div', {class: 'stats'},
       stat('Last active (SSO)', T(g.seen || null)), me.integrations.casdoor ? stat('Last password login', T(g.lastLogin || null)) : '',
@@ -547,7 +556,8 @@ VIEWS.users = async () => {
       stat('Running pods', g.running), stat('LLM calls', num(g.req), g.failed ? h('span', {class: 'err'}, ' · ' + (100 * g.failed / Math.max(g.req, g.failed)).toFixed(1) + ' % failed') : ''),
       stat('LLM calls per day', spark(g.spark)), stat('Spend', '$' + g.spend.toFixed(2)), stat('CPU h · GPU h held', num(g.cpu_h) + ' · ' + num(g.gpu_h)), ...(g.gpuBusy != null ? [stat('GPU busy while held', g.gpuBusy + ' %')] : [])),
     table([['Namespace / account', u => h('a', {href: '#/user?' + qs({name: u.user})}, h('b', {}, u.user))], ['Runs', u => u.kinds.join(', ')],
-      ['Pods', u => u.running + ' running' + (u.pending ? ', ' + u.pending + ' pending' : '')], ['CPU now / reserved', u => u.cpu_use + ' / ' + u.cpu_req + pct(u.cpu_use, u.cpu_req)],
+      ['Pods', u => u.running + ' running' + (u.pending ? ', ' + u.pending + ' pending' : '')], ['Limit (agent)', u => limitText(u.limit)], ['Peak CPU · range', u => peakBar(u.use && u.use.cpu_peak, u.limit && u.limit.cpu, '')], ['Peak RAM · range', u => peakBar(u.use && u.use.mem_peak, u.limit && u.limit.mem_gib, ' GiB')],
+      ['CPU now / reserved', u => u.cpu_use + ' / ' + u.cpu_req + pct(u.cpu_use, u.cpu_req)],
       ['RAM', u => u.mem_use_gib + ' GiB'], ['GPU', u => u.gpu || '–'], ['Restarts', u => u.restarts ? h('span', {class: 'err'}, u.restarts) : 0],
       ['Incidents', u => u.open ? h('span', {class: 'err'}, u.open) : 0], ['LLM', u => llmCell(u.use)],
       ['CPU h · GPU h', u => u.use ? u.use.cpu_h + ' · ' + u.use.gpu_h : '–'], ['GPU busy', u => u.use && u.use.gpu_util != null ? u.use.gpu_util + ' %' : '–'], ['Last active (SSO)', u => T(u.sso && u.sso.last)], ...(me.integrations.casdoor ? [['Failed logins', u => u.login && u.login.failed ? h('span', {class: 'err'}, u.login.failed) : 0]] : []),
@@ -559,9 +569,10 @@ VIEWS.users = async () => {
   const today = groups.filter(g => g.seen && Date.now() / 1000 - g.seen < 86400).length, locked = userLocked();
   return h('div', {}, h('h1', {}, 'Users'),
     h('div', {class: 'stats'}, stat('People', groups.length), stat('Namespaces / accounts', us.length), stat('Active in SSO last 24 h', today),
-      stat('With open incidents', groups.filter(g => g.open).length)),
+      stat('With open incidents', groups.filter(g => g.open).length),
+      stat('Agents waiting for a GPU', (n => n ? h('span', {class: 'err'}, n) : '0')(us.filter(u => u.limit && u.limit.waiting).length))),
     h('p', {class: 'mut small'}, 'One card per person: all their namespaces are inside it. Red edge = open incident, grey = nothing running and no LLM use. ' +
-      'Real names: the team\'s name list. LLM and CPU/GPU: Prometheus, for the date range; "% failed" is failed calls out of all calls. GPU busy: how hard held GPUs worked. Last active: Casdoor log.'),
+      'Limit: what the user\'s agent may use; no other quota exists. Peak: their highest use in the range. Real names: the team\'s name list. LLM and CPU/GPU: Prometheus, for the date range; "% failed" is failed calls out of all calls. GPU busy: how hard held GPUs worked. Last active: Casdoor log.'),
     cutNote(res.range),
     usersCharts(kd, lg),
     lg ? h('details', {class: 'tablewrap'}, h('summary', {}, 'Logins: numbers and accounts tried'), h('div', {class: 'card', style: 'margin-bottom:14px'}, h('b', {}, 'Logins (Casdoor)'),
@@ -647,6 +658,8 @@ VIEWS.user = async q => {
     h('h1', {dir: 'auto'}, u.person ? u.person.name : u.user, u.person ? h('span', {class: 'mut'}, ' · ' + u.user) : '', u.person && u.person.remove ? [' ', h('span', {class: 'chip warn'}, 'marked to delete')] : ''),
     u.person && u.person.users.length > 1 ? h('p', {}, h('span', {class: 'chip group'}, 'one person · ' + u.person.users.length + ' namespaces'), ' other namespaces: ',
       u.person.users.filter(x => x !== u.user).map(x => [h('a', {href: '#/user?' + qs({name: x})}, x), ' '])) : '',
+    u.limit ? [h('h2', {}, 'Compute limit · what their agent may use'), h('div', {class: 'card'}, h('p', {style: 'margin:0 0 6px'}, limitText(u.limit)),
+      u.use ? h('div', {class: 'stats'}, [['Peak CPU', peakBar(u.use.cpu_peak, u.limit.cpu, '')], ['Peak RAM', peakBar(u.use.mem_peak, u.limit.mem_gib, ' GiB')]].map(([k, v]) => h('div', {class: 'stat'}, h('span', {class: 'k'}, k), v))) : '')] : '',
     h('h2', {}, 'Sign-in activity (Casdoor)'), h('div', {class: 'card'}, u.sso ? h('div', {class: 'stats'},
       h('div', {class: 'stat'}, h('span', {class: 'k'}, 'Last active'), h('span', {class: 'v'}, T(u.sso.last))),
       h('div', {class: 'stat'}, h('span', {class: 'k'}, 'SSO requests'), h('span', {class: 'v'}, u.sso.requests)),
@@ -759,7 +772,7 @@ function clusterView(r, d) {
   const g = r.gpu, kinds = {user: 'User', models: 'Models', service: 'Service', other: 'Other'};
   const list = h('div', {});
   const draw = kind => list.replaceChildren(table([['Namespace', x => h('a', {href: '#/services?' + qs({ns: x.ns})}, x.ns)], ['Kind', x => kinds[x.kind]],
-    ['GPU hours held', x => x.gpu_h || 0], ['Share of all GPUs', x => x.gpu_pct ? x.gpu_pct + ' %' : '0'], ['GPU busy while held', x => x.gpu_util == null ? '–' : x.gpu_util + ' %'],
+    ['GPU hours held', x => x.gpu_h || 0], ['Slice hours', x => x.slice_h || 0], ['Share of all GPUs', x => x.gpu_pct ? x.gpu_pct + ' %' : '0'], ['GPU busy while held', x => x.gpu_util == null ? '–' : x.gpu_util + ' %'],
     ['CPU hours', x => x.cpu_h], ['Share of all CPU', x => x.cpu_pct + ' %'], ['RAM, average', x => x.mem_gib + ' GiB'], ['Traffic in', x => x.net_gb + ' GB']],
     r.namespaces.filter(x => !kind || x.kind === kind)));
   draw('');
@@ -768,12 +781,17 @@ function clusterView(r, d) {
   const nsRows = (field, kind) => r.namespaces.filter(x => x[field] > 0 && (!kind || x.kind === kind)).sort((a, b) => b[field] - a[field]).slice(0, 8);
   return [cutNote(r.window), h('h2', {}, 'Whole cluster · how much is really working'),
     charts(meter('GPUs', g.total, g.total * (g.busy_avg || 0) / 100, g.total * (g.held_avg_pct || 0) / 100, '', 'computing', 'held, idle'),
-      meter('CPU cores', r.cpu.total, r.cpu.used_avg, r.cpu.requested, '', 'used', 'reserved, idle'), meter('RAM', r.mem.total, r.mem.used_avg, r.mem.requested, ' GiB', 'used', 'reserved, idle')),
-    h('p', {class: 'small mut'}, 'Averages over the date range. Now: ' + g.held + ' of ' + g.total + ' GPUs held, ' + (g.waiting ? g.waiting + ' more waiting, ' : '') + g.busy_now + ' % busy; CPU ' + r.cpu.used_now + ' cores; RAM ' + r.mem.used_now + ' GiB. Held = reserved by a pod, whether it works or not.'),
+      meter('CPU cores', r.cpu.total, r.cpu.used_avg, r.cpu.requested, '', 'used', 'reserved, idle'), meter('RAM', r.mem.total, r.mem.used_avg, r.mem.requested, ' GiB', 'used', 'reserved, idle'),
+      meter('GPU slices (10 GB)', r.slices.total, r.slices.held, r.slices.held, '', 'held now', 'unused')),
+    r.waiting.length ? [h('h2', {}, 'Waiting for a GPU · ' + r.waiting.length), h('div', {class: 'card person bad'}, h('p', {class: 'small mut', style: 'margin:0 0 6px'}, 'These cannot start until a GPU or slice is free.'),
+      table([['Namespace', x => h('a', {href: '#/services?' + qs({ns: x.ns})}, x.ns), ], ['Name', x => x.person ? h('span', {dir: 'auto'}, x.person) : h('span', {class: 'mut small'}, 'not in the name list')], ['Waiting for', x => h('span', {class: 'chip warn'}, x.kind)], ['Since', x => T(x.since)], ['Pod', x => h('span', {class: 'small mut'}, x.pod)]], r.waiting))] : '',
+    h('p', {class: 'small mut'}, 'Averages over the date range. Now: ' + g.held + ' of ' + g.total + ' GPUs held, ' + g.busy_now + ' % busy; ' + r.slices.held + ' of ' + r.slices.total + ' slices held; CPU ' + r.cpu.used_now + ' cores; RAM ' + r.mem.used_now + ' GiB. Held = reserved by a pod, whether it works or not.'),
     charts(lineChart({title: 'GPUs per day', note: 'Share of all ' + g.total + ' GPUs', days, partial: part, unit: ' %', yMax: 100, series: [{name: 'Held', color: COL(2), values: days.length ? series('gpu_held', 'gpu_total') : []}, {name: 'Computing', color: COL(1), values: days.length ? pick(d, 'all', 'gpu_busy').map(v => v == null ? null : +v.toFixed(1)) : []}]}),
       lineChart({title: 'CPU and RAM used per day', note: 'Share of all CPU and RAM', days, partial: part, unit: ' %', series: [{name: 'RAM', color: COL(2), values: days.length ? series('mem_used', 'mem_total') : []}, {name: 'CPU', color: COL(1), values: days.length ? series('cpu_used', 'cpu_total') : []}]})),
     h('h2', {}, 'Each GPU · who holds it, and is it working?'),
     barList('Busy over the date range', 'Sorted by how much it works. A bar near zero means a GPU held but idle.', [...r.gpus].sort((a, b) => (b.util_avg || 0) - (a.util_avg || 0)).map(x => ({label: x.node + ' #' + x.gpu, sub: x.ns ? x.ns + ' · ' + x.model : 'free · ' + x.model, value: x.util_avg || 0, title: 'now ' + x.util + ' %, memory ' + x.mem_used + ' / ' + x.mem_total + ' GiB', href: x.ns ? '#/services?' + qs({ns: x.ns}) : null})), v => v + ' %', 100),
+    r.slices.pods.length ? h('details', {class: 'tablewrap'}, h('summary', {}, 'Who holds the ' + r.slices.total + ' GPU slices (' + r.slices.held + ' held)'), h('div', {class: 'card'}, h('p', {class: 'small mut', style: 'margin:0 0 6px'}, 'The GPU exporter does not report slices per pod, so how busy they are is not known.'),
+      table([['Namespace', x => h('a', {href: '#/services?' + qs({ns: x.ns})}, x.ns)], ['Pod', x => h('span', {class: 'small mut'}, x.pod)], ['Slices', x => x.n]], r.slices.pods))) : '',
     h('details', {class: 'tablewrap'}, h('summary', {}, 'Table: each GPU'), h('div', {class: 'card'}, table([['Node', x => x.node], ['GPU', x => x.gpu], ['Model', x => x.model],
       ['Held by', x => x.ns ? [h('a', {href: '#/services?' + qs({ns: x.ns})}, x.ns), h('div', {class: 'small mut'}, x.pod)] : h('span', {class: 'mut'}, 'free')],
       ['Busy now', x => x.ns && x.util < 1 ? h('span', {class: 'chip warn'}, 'held, idle') : x.util + ' %'], ['Busy · range', x => x.util_avg == null ? '–' : x.util_avg + ' %'],

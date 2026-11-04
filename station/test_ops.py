@@ -587,6 +587,31 @@ row = r["namespaces"][0]
 assert row["kind"] == "user" and row["cpu_pct"] == 1.0 and row["gpu_pct"] == 1.0, row    # 240 of 100 x 240 h; 24 of 10 x 240 h
 assert r["gpus"][0]["mem_total"] == 4 and r["gpus"][1]["ns"] is None and r["gpu"]["busy_now"] == 25.0, r["gpus"]
 assert col.capacity(T3 - 86400, T3)["resources"]["gpu"]["total"] == 10
+# GPU slices are not full GPUs: counted apart, and everything that cannot start is listed with its name and time
+def slice_prom(q, at=None):
+    if 'allocatable{resource=~"nvidia_com_mig' in q: return [{"metric": {}, "value": [0, "7"]}]
+    if 'resource=~"nvidia_com_.*"' in q and 'phase="Running"' in q:
+        return [{"metric": {"namespace": "aip-mlops-service", "pod": "model-a", "resource": "nvidia_com_mig_1g_10gb"}, "value": [0, "1"]},
+                {"metric": {"namespace": "user-uni", "pod": "w", "resource": "nvidia_com_gpu"}, "value": [0, "1"]}]
+    if 'resource=~"nvidia_com_.*"' in q and 'phase="Pending"' in q:
+        return [{"metric": {"namespace": "user-new", "pod": "new-agent", "resource": "nvidia_com_mig_1g_10gb"}, "value": [0, "1"]},
+                {"metric": {"namespace": "aip-mlops-service", "pod": "model-b", "resource": "nvidia_com_gpu"}, "value": [0, "1"]}]
+    if "kube_pod_created" in q: return [{"metric": {"pod": "new-agent"}, "value": [0, "1000"]}]
+    return res_prom(q, at)
+col.prom, col.cache = slice_prom, {}
+(ops.DATA / "people.json").write_text(json.dumps([{"name": "Newco", "account": "new", "users": ["new"], "keys": []}]), encoding="utf-8")
+r = col.resources(T3 - 86400, T3)
+assert r["slices"]["total"] == 7 and r["slices"]["held"] == 1 and [x["pod"] for x in r["slices"]["pods"]] == ["model-a"], r["slices"]
+assert {(x["pod"], x["kind"], x["person"]) for x in r["waiting"]} == {("new-agent", "slice", "Newco"), ("model-b", "full GPU", None)} and r["waiting"][1]["since"] == 1000, r["waiting"]
+(ops.DATA / "people.json").unlink()
+# a user's limit is their agent; waiting shows; the agent's GPU kinds stay apart
+saved_pods2 = col.pods
+col.pods = {"user-new": [{"name": "new-agent", "workload": "new-agent-clearml-agent", "phase": "Pending", "created": 1000, "res": {"cpu_lim": 2.0, "mem_lim": 8 * 1024 ** 3, "gpu": {"nvidia.com/mig-1g.10gb": 1}}, "started": None, "restarts": 0, "containers": []}]}
+assert col.agent_limit("new") == {"cpu": 2.0, "mem_gib": 8.0, "gpu": 0, "slices": 1, "waiting": True, "since": 1000}, col.agent_limit("new")
+assert col.agent_limit("nobody") is None
+col.pods = saved_pods2
+assert ops.resources([{"resources": {"limits": {"cpu": "24", "memory": "256Gi", "nvidia.com/gpu": "1"}, "requests": {"cpu": "24", "memory": "256Gi"}}}])["cpu_lim"] == 24
+col.prom, col.cache = res_prom, {}
 # failure rate is out of every call and cannot pass 100 %; the data check says when two systems disagree
 col.cache = {}
 col.prom = lambda q, at=None: [{"metric": {"api_key_alias": "uni-a", "hashed_api_key": "h", "requested_model": "m"}, "value": [0, "100" if "total_requests" in q else "150" if "failed" in q else "0"]}] if "increase" in q and "by (api_key_alias, hashed" in q else []

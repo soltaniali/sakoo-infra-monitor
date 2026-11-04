@@ -72,6 +72,7 @@ LOG_SECRET_RES = (  # logs can hold secrets (data-ingestion-api prints users' S3
 # GPU-hours held per namespace over a range: running pods only, sampled every 15 min. % (label filter, range)
 GPU_HELD_H = ('sum by (namespace) (sum_over_time((sum by (namespace) (kube_pod_container_resource_requests{resource="nvidia_com_gpu",%s} '
               '* on (namespace,pod) group_left () (kube_pod_status_phase{phase="Running"} == 1)))[%s:15m])) / 4')
+SLICE_HELD_H = GPU_HELD_H.replace('resource="nvidia_com_gpu"', 'resource=~"nvidia_com_mig.*"')  # MIG slices of one card: not full GPUs
 CHECK_OK_PCT = 2  # two systems agree when they differ by at most this (or by 5 in small counts)
 SERVICE_NS = ("jupyterhub", "mlflow", "dify", "n8nio", "zenml", "langflow", "ragflow", "openwebui", "airflow", "harbor", "gitlab")
 TASK_STUCK_S = 6 * 3600  # a running task with no update for this long is marked "no update"
@@ -283,11 +284,12 @@ def qty(v):
 
 def resources(containers):
     """Summed requests/limits of a pod's containers; GPUs as {resource name: count} (nvidia.com/gpu, MIG slices)."""
-    r = {"cpu_req": 0.0, "mem_req": 0.0, "mem_lim": 0.0, "gpu": {}}
+    r = {"cpu_req": 0.0, "cpu_lim": 0.0, "mem_req": 0.0, "mem_lim": 0.0, "gpu": {}}
     for c in containers:
         res = c.get("resources", {})
         req, lim = res.get("requests", {}), res.get("limits", {})
         r["cpu_req"] += qty(req.get("cpu"))
+        r["cpu_lim"] += qty(lim.get("cpu"))
         r["mem_req"] += qty(req.get("memory"))
         r["mem_lim"] += qty(lim.get("memory"))
         for k, v in {**req, **lim}.items():
@@ -772,6 +774,7 @@ class Collector:
         for metric, query in (("cpu_h", 'sum by (namespace) (increase(container_cpu_usage_seconds_total{container!=""}[%s])) / 3600' % span),
                               ("mem_gib", 'sum by (namespace) (avg_over_time((sum by (namespace) (container_memory_working_set_bytes{container!=""}))[%s:15m])) / 1073741824' % span),
                               ("gpu_h", GPU_HELD_H % ('namespace!=""', span)),
+                              ("slice_h", SLICE_HELD_H % ('namespace!=""', span)),
                               ("gpu_util", 'avg by (namespace) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{namespace!=""}[%s]))' % span),
                               ("net_gb", "sum by (namespace) (increase(container_network_receive_bytes_total[%s])) / 1000000000" % span)):
             out += [("ns", s["metric"]["namespace"], metric, float(s["value"][1])) for s in q(query) if s["metric"].get("namespace")]
@@ -857,7 +860,7 @@ class Collector:
 
         def fetch():
             users = {}
-            row = lambda who: users.setdefault(who, {"requests": 0, "tokens": 0, "spend": 0, "failed": 0, "cpu_h": 0, "gpu_h": 0,
+            row = lambda who: users.setdefault(who, {"requests": 0, "tokens": 0, "spend": 0, "failed": 0, "cpu_h": 0, "gpu_h": 0, "slice_h": 0,
                                                      "keys": {}, "models": {}})
             for what, metric in (("requests", "litellm_proxy_total_requests_metric_total"), ("tokens", "litellm_total_tokens_metric_total"),
                                  ("spend", "litellm_spend_metric_total"), ("failed", "litellm_proxy_failed_requests_metric_total")):
@@ -887,9 +890,15 @@ class Collector:
                     if who and who in users and alias in users[who]["keys"] and v != float("inf"):
                         users[who]["keys"][alias][field] = round(v, 2)
             for what, q in (("cpu_h", 'sum by (namespace) (increase(container_cpu_usage_seconds_total{namespace=~"user-.*",container!=""}[%s])) / 3600' % span),
-                            ("gpu_h", GPU_HELD_H % ('namespace=~"user-.*"', span))):  # running pods only: a pending pod holds no GPU
+                            ("gpu_h", GPU_HELD_H % ('namespace=~"user-.*"', span)),  # running pods only: a pending pod holds no GPU
+                            ("slice_h", SLICE_HELD_H % ('namespace=~"user-.*"', span))):
                 for s in self.prom(q, at):
                     row(s["metric"]["namespace"][5:])[what] += float(s["value"][1])
+            # the highest use in the range, to set against the agent's limit (Prometheus's days only)
+            for field, q in (("cpu_peak", 'max_over_time((sum by (namespace) (rate(container_cpu_usage_seconds_total{namespace=~"user-.*",container!=""}[5m])))[%s:15m])' % span),
+                             ("mem_peak", 'max_over_time((sum by (namespace) (container_memory_working_set_bytes{namespace=~"user-.*",container!=""}))[%s:15m]) / 1073741824' % span)):
+                for s in self.prom(q, at):
+                    row(s["metric"]["namespace"][5:])[field] = round(float(s["value"][1]), 1)
             for s in self.prom('avg by (namespace) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{namespace=~"user-.*"}[%s]))' % span, at):
                 row(s["metric"]["namespace"][5:])["gpu_util"] = round(float(s["value"][1]), 1)
             d1, d2 = w["hist"]  # days older than Prometheus: from the daily history
@@ -906,11 +915,13 @@ class Collector:
                 r["gpu_h"] = held + h
             for x in self.rows("SELECT name, sum(value) v FROM daily WHERE scope='ns' AND metric='cpu_h' AND name LIKE 'user-%' AND day>=? AND day<=? GROUP BY name", (d1, d2)):
                 row(x["name"][5:])["cpu_h"] += x["v"]
+            for x in self.rows("SELECT name, sum(value) v FROM daily WHERE scope='ns' AND metric='slice_h' AND name LIKE 'user-%' AND day>=? AND day<=? GROUP BY name", (d1, d2)):
+                row(x["name"][5:])["slice_h"] += x["v"]
             for r in users.values():
                 for d in [r] + list(r["keys"].values()):
                     # a share of all calls, so it can never pass 100 %
                     d["fail_pct"] = round(100 * min(d["failed"], d["requests"]) / d["requests"], 1) if d["requests"] else None
-                    for f in ("requests", "tokens", "failed", "cpu_h", "gpu_h"):
+                    for f in ("requests", "tokens", "failed", "cpu_h", "gpu_h", "slice_h"):
                         if f in d:
                             d[f] = round(d[f])
                     d["spend"] = round(d["spend"], 2)
@@ -961,17 +972,18 @@ class Collector:
                 used, free = c.pop("mem_used", None), c.pop("mem_free", None)
                 c["mem_used"], c["mem_total"] = (round(used / 1024), round((used + free) / 1024)) if used is not None and free is not None else (None, None)
             rows = {}
-            row = lambda ns: rows.setdefault(ns, {"ns": ns, "cpu_h": 0, "mem_gib": 0, "gpu_h": 0, "net_gb": 0, "gpu_util": None})
+            row = lambda ns: rows.setdefault(ns, {"ns": ns, "cpu_h": 0, "mem_gib": 0, "gpu_h": 0, "slice_h": 0, "net_gb": 0, "gpu_util": None})
             for field, q in (("cpu_h", 'sum by (namespace) (increase(container_cpu_usage_seconds_total{container!=""}[%s])) / 3600' % span),
                              ("mem_gib", 'sum by (namespace) (avg_over_time((sum by (namespace) (container_memory_working_set_bytes{container!=""}))[%s:15m])) / %d' % (span, gib)),
                              ("gpu_h", GPU_HELD_H % ('namespace!=""', span)),
+                             ("slice_h", SLICE_HELD_H % ('namespace!=""', span)),
                              ("net_gb", "sum by (namespace) (increase(container_network_receive_bytes_total[%s])) / 1000000000" % span),
                              ("gpu_util", "avg by (namespace) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{namespace!=\"\"}[%s]))" % span)):
                 for s in self.prom(q, at):
                     ns = s["metric"].get("namespace")
                     if ns:
                         row(ns)[field] = round(float(s["value"][1]), 1)
-            for x in self.rows("SELECT name, metric, sum(value) v FROM daily WHERE scope='ns' AND metric IN ('cpu_h','net_gb') AND day>=? AND day<=? GROUP BY name, metric", (d1, d2)):
+            for x in self.rows("SELECT name, metric, sum(value) v FROM daily WHERE scope='ns' AND metric IN ('cpu_h','net_gb','slice_h') AND day>=? AND day<=? GROUP BY name, metric", (d1, d2)):
                 row(x["name"])[x["metric"]] = round(row(x["name"])[x["metric"]] + x["v"], 1)
             for x in self.rows("SELECT name, avg(value) v FROM daily WHERE scope='ns' AND metric='mem_gib' AND day>=? AND day<=? GROUP BY name", (d1, d2)):
                 r = row(x["name"])
@@ -986,8 +998,23 @@ class Collector:
                 r["gpu_pct"] = round(100 * r["gpu_h"] / (total["nvidia_com_gpu"] * hours), 1) if total["nvidia_com_gpu"] else None
                 r["kind"] = "user" if r["ns"].startswith("user-") else "models" if r["ns"] == OUR_NS else "service" if r["ns"] in SERVICE_NS else "other"
             util = [c["util_avg"] for c in cards.values() if c["util_avg"] is not None]
+            # MIG slices, and everything that cannot start for lack of a GPU or a slice
+            gpu_any = 'kube_pod_container_resource_requests{resource=~"nvidia_com_.*"} * on (namespace,pod) group_left () (kube_pod_status_phase{phase="%s"} == 1)'
+            is_slice = lambda m: "mig" in (m.get("resource") or "")
+            held_slices = [{"ns": s["metric"].get("namespace"), "pod": s["metric"].get("pod"), "n": float(s["value"][1])} for s in self.prom(gpu_any % "Running") if is_slice(s["metric"])]
+            pending = [s["metric"] for s in self.prom(gpu_any % "Pending")]
+            since = {}
+            if pending:
+                for s in self.prom('kube_pod_created{pod=~"%s"}' % "|".join(sorted({m.get("pod", "") for m in pending}))):
+                    since[s["metric"].get("pod")] = float(s["value"][1])
+            people = self.people()
+            who = lambda ns: next((p["name"] for p in people if ns and ns.startswith("user-") and ns[5:] in p["users"]), None)
+            waiting = [{"ns": m.get("namespace"), "pod": m.get("pod"), "kind": "slice" if is_slice(m) else "full GPU", "since": since.get(m.get("pod")), "person": who(m.get("namespace"))} for m in pending]
             held = one("sum(%s)" % (gpu_req % "Running"))
             return {"window": w, "gpus": sorted(cards.values(), key=lambda c: (str(c["node"]), int(c["gpu"] or 0))),
+                    "slices": {"total": one('sum(kube_node_status_allocatable{resource=~"nvidia_com_mig.*"})'), "held": sum(x["n"] for x in held_slices),
+                               "pods": sorted(held_slices, key=lambda x: (x["ns"] or "", x["pod"] or ""))},
+                    "waiting": sorted(waiting, key=lambda x: x["since"] or 0),
                     "gpu": {"total": total["nvidia_com_gpu"], "held": held, "waiting": one("sum(%s)" % (gpu_req % "Pending")),
                             "busy_now": round(sum(c["util"] for c in cards.values()) / len(cards), 1) if cards else None,
                             "busy_avg": round(blend(sum(util) / len(util), "gpu_busy"), 1) if util else None,
@@ -1873,6 +1900,7 @@ class Collector:
         for r in rows:
             r["use"], r["sso"], r["login"], r["train"] = use.get(r["user"]), sso.get(r["user"]), logins.get(r["user"]), train.get(r["user"])
             r["spark"] = [round(day["rows"].get(d, {}).get(r["user"], {}).get("requests", 0)) for d in day["days"]]
+            r["limit"] = self.agent_limit(r["user"])
             p = next((p for p in people if r["user"] in p["users"]), None)
             r["person"] = p and {"name": p["name"], "users": p["users"], "remove": bool(p.get("remove"))}
         # one person's namespaces next to each other (Avir: aviraip, aviraip2)
@@ -1888,6 +1916,16 @@ class Collector:
         except (OSError, ValueError):
             return []
 
+    def agent_limit(self, who):
+        """A user's real compute limit: no quota object exists, so it is what their agent pod may use. None without an agent."""
+        pods = [p for _, p in self.user_pods().get(who, []) if p["workload"].endswith("clearml-agent")]
+        p = next((p for p in pods if p["phase"] == "Running"), pods[0] if pods else None)
+        if not p:
+            return None
+        gpu = p["res"]["gpu"]
+        return {"cpu": p["res"]["cpu_lim"], "mem_gib": round(p["res"]["mem_lim"] / 1024 ** 3, 1), "gpu": sum(n for k, n in gpu.items() if "mig" not in k),
+                "slices": sum(n for k, n in gpu.items() if "mig" in k), "waiting": p["phase"] == "Pending", "since": p.get("created")}
+
     def user(self, who, frm=None, to=None):
         now = to or time.time()
         frm = frm or now - 30 * 86400
@@ -1899,7 +1937,7 @@ class Collector:
         q = ",".join("?" * len(ns_list))
         return {"user": who, "namespaces": ns_list, "pods": [dict(p, ns=ns) for ns, p in items],
                 "use": use.get("users", {}).get(who), "use_from": use.get("from"), "key_rows": [k for k in self.keys()["keys"] if k["user"] == who], "range": self.window(frm, now) if self.integrations()["grafana"] else None,
-                "sso": self.sso().get("users", {}).get(who), "sso_from": self.sso().get("from"),
+                "limit": self.agent_limit(who), "sso": self.sso().get("users", {}).get(who), "sso_from": self.sso().get("from"),
                 "task_rows": [x for x in self.tasks(frm, now)["tasks"] if x["user"] == who][:30],
                 "login_rows": self.rows("SELECT ts, result FROM logins WHERE user=? AND ts>=? AND ts<=? ORDER BY ts DESC LIMIT 30", (who, frm, now)),
                 "person": next(({"name": p["name"], "users": p["users"], "remove": bool(p.get("remove"))} for p in self.people() if who in p["users"]), None),
