@@ -161,6 +161,8 @@ class Handler(BaseHTTPRequestHandler):
             return COL.keys()
         if what == "logins":
             return COL.logins()
+        if what == "tasks":
+            return COL.tasks()
         if what == "tickets":
             return COL.tickets()
         if what == "ticket":

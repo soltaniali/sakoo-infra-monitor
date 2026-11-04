@@ -499,6 +499,46 @@ del col.usage
 for k in ("LITELLM_READ_URL", "LITELLM_READ_KEY"):
     os.environ.pop(k)
 
+# mlops-core tasks: owner name, no script or settings kept, a silent running task is marked; Q5/Q6 use real tasks of the user
+T2 = time.time()
+stamp2 = lambda x: time.strftime("%Y-%m-%dT%H:%M:%S.000000", time.gmtime(x))
+ml_calls = []
+def fake_ml(m, url, h=None, b=None, timeout=30):
+    name = url.rsplit("/", 1)[1]
+    ml_calls.append(name)
+    assert m == "POST" and (name == "auth.login" or name.endswith(".get_all")), name   # never a call that changes something
+    if name == "auth.login":
+        assert h["Authorization"].startswith("Basic ")
+        return {"data": {"token": "tok"}}
+    assert h["Authorization"] == "Bearer tok"
+    if name == "users.get_all":
+        return {"data": {"users": [{"id": "u1", "name": "UNI"}]}}
+    base = {"user": "u1", "type": "training", "name": "t", "script": {"diff": "SECRETSCRIPT"}, "hyperparams": {"a": "SECRETHP"}}
+    return {"data": {"tasks": [dict(base, id="a", status="failed", status_reason="exit 1", created=stamp2(T2 - 3600), last_update=stamp2(T2 - 3500)),
+                               dict(base, id="b", status="in_progress", created=stamp2(T2 - 86400), last_update=stamp2(T2 - 7 * 3600)),
+                               dict(base, id="c", status="in_progress", created=stamp2(T2 - 3600), last_update=stamp2(T2 - 60)),
+                               dict(base, id="d", status="created", type="data_processing", created=stamp2(T2), last_update=stamp2(T2))]}}
+real_http, ops.http_json = ops.http_json, fake_ml
+os.environ.update(MLOPS_URL="https://m/core", MLOPS_KEY="k", MLOPS_SECRET="s")
+col.refresh_tasks(T2)
+ops.http_json = real_http
+ts_ = col.tasks()["tasks"]
+assert [x["id"] for x in ts_] == ["a", "b", "c"] and ts_[0]["user"] == "uni" and "SECRET" not in json.dumps(ts_), ts_
+assert ts_[1]["stuck"] is True and ts_[2]["stuck"] is False and ml_calls[:2] == ["auth.login", "users.get_all"]
+assert [x["id"] for x in col.user("uni")["task_rows"]] == ["a", "b", "c"]
+assert next(r for r in col.users() if r["user"] == "uni")["train"] == {"running": 2, "queued": 0, "failed": 1, "completed": 0, "last": ops.ts(stamp2(T2 - 60))}
+(ops.DATA / tickets.USERS_FILE).write_text(json.dumps({rows[0]["requester"]: "uni"}), encoding="utf-8")
+now_t = dict(rows[0], **dict(d, key_hashes=[], created=T2))
+now_t["messages"] = [dict(d["messages"][0], ts=T2)]
+saved_prom, col.prom = col.prom, lambda q, at=None: []
+a = tickets.analyze(col, now_t)
+col.prom = saved_prom
+assert "fine-tune (3 training tasks in the week before)" in a["q6"]["answer"] and "failed tasks of uni within 2 h: 1" in a["q5"]["answer"], (a["q6"], a["q5"]["answer"])
+(ops.DATA / tickets.USERS_FILE).unlink()
+col.task_rows = {"at": None, "rows": []}
+for k in ("MLOPS_URL", "MLOPS_KEY", "MLOPS_SECRET"):
+    os.environ.pop(k)
+
 # Casdoor login records: real attempts only, a failed name that is no account is not stored, what was typed never is
 known = {"uni"}
 rec = lambda resp, **kw: dict({"name": "r1", "createdTime": "2026-10-30T10:00:00Z", "user": "", "response": resp, "object": ""}, **kw)

@@ -7,6 +7,7 @@ Rounds: every ROUND_S our namespace; every SLOW_EVERY rounds all readable namesp
 Data: SQLite $OPS_DATA/ops.db (default /data). Probe results: $PROBE_RESULTS (written by probe.py on this station).
 Optional integrations, each on when its env is set (secrets/ops.env):
   LITELLM_URL (…/v1), LITELLM_KEY, LITELLM_MODEL     model test calls, "registered in litellm?" for models
+  MLOPS_URL, MLOPS_KEY, MLOPS_SECRET                 training tasks (login and list calls only; the key is an admin key)
   CASDOOR_URL, CASDOOR_KEY, CASDOOR_SECRET           login records (read only; the key has its user's rights)
   LITELLM_READ_URL, LITELLM_READ_KEY                 read-only key (Admin Viewer): key owners, limits, old spend logs
   AI_URL (…/v1), AI_KEY, AI_MODEL                     any OpenAI-compatible LLM (free tier: Mistral, OpenRouter, ...) for log,
@@ -60,6 +61,7 @@ probe.TIMEOUT = 25  # the VPN path is slow: 8 s timed out on big lists
 SSO_ORG = "organization_sharif"  # Casdoor organisation of the platform's users (built-in = admins, app = applications)
 SSO_RE = re.compile(r"^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d)\.\d+ .*?subOwner = ([^,]*), subName = ([^,]*), method = \w+, "
                     r"urlPath = ([^,]*),.*?result = (\w+)", re.M)
+TASK_STUCK_S = 6 * 3600  # a running task with no update for this long is marked "no update"
 LLM_FAIL_MIN, LLM_FAIL_RATE = 20, 0.3  # a key with >= 20 calls in the last hour of which >= 30 % failed: incident (dashboard only)
 RULES = {
     "crashloop": ("the container exits right after it starts", "read the previous container's log below and fix that error",
@@ -163,6 +165,14 @@ def key_user(m):
     """AIP username of a LiteLLM key from its Prometheus labels: alias '<user>-<key name>', else the key's user email."""
     alias, mail = m.get("api_key_alias") or "None", m.get("user_email") or "None"
     return alias.split("-", 1)[0] if "-" in alias else mail.split("@")[0] if "@" in mail else None
+
+
+def slim_task(x, names, t):
+    """What the dashboard keeps of a mlops-core task. Never its script, config or hyperparameters: they can hold secrets."""
+    last = ts(x.get("last_update"))
+    return {"id": x.get("id"), "name": tickets.mask(x.get("name"))[:80], "user": (names.get(x.get("user")) or "?").lower(), "status": x.get("status"), "type": x.get("type"),
+            "created": ts(x.get("created")), "started": ts(x.get("started")), "ended": ts(x.get("completed")), "last": last,
+            "reason": tickets.mask(x.get("status_reason"))[:120], "stuck": x.get("status") == "in_progress" and bool(last) and last < t - TASK_STUCK_S}
 
 
 def login_row(r, known):
@@ -335,6 +345,7 @@ class Collector:
         self.model_tests, self.test_fails = {}, {}  # model -> {ok, ms, detail, ts, route}
         self.states = {r["key"]: (r["state"], r["since"]) for r in self.rows("SELECT * FROM state_since")}  # liveness
         self.bg, self.tickets_busy, self.tickets_tried = queue.Queue(), False, 0
+        self.task_rows = {"at": None, "rows": []}  # last good read of mlops-core's tasks
         self.key_rows = {"at": None, "rows": []}  # last good read: the VPN path to LiteLLM drops every few minutes
         threading.Thread(target=self._bg_loop, daemon=True).start()
 
@@ -368,6 +379,7 @@ class Collector:
                 "gitlab": bool(e("GITLAB_URL") and e("GITLAB_TOKEN") and e("GITLAB_PROJECTS")),
                 "grafana": bool(e("GRAFANA_URL") and (e("GRAFANA_TOKEN") or e("GRAFANA_USER") and e("GRAFANA_PASSWORD"))),
                 "keys": bool(e("LITELLM_READ_URL") and e("LITELLM_READ_KEY")),
+                "mlops": bool(e("MLOPS_URL") and e("MLOPS_KEY") and e("MLOPS_SECRET")),
                 "casdoor": bool(e("CASDOOR_URL") and e("CASDOOR_KEY") and e("CASDOOR_SECRET")),
                 "tickets": tickets.enabled(), "langfuse": bool(e("LANGFUSE_URL") and e("LANGFUSE_PK") and e("LANGFUSE_SK")),
                 "ai": bool(e("AI_URL") and e("AI_KEY") and e("AI_MODEL")) or bool(e("LITELLM_URL") and e("LITELLM_KEY") and e("LITELLM_MODEL"))}
@@ -552,6 +564,41 @@ class Collector:
                 "ok": self.one("SELECT count(*) n FROM logins WHERE ts>=? AND result='ok'", (since,))["n"],
                 "failed": self.one("SELECT count(*) n FROM logins WHERE ts>=? AND result!='ok'", (since,))["n"],
                 "top": self.rows("SELECT user, count(*) n, max(ts) last FROM logins WHERE ts>=? AND result!='ok' GROUP BY user ORDER BY n DESC LIMIT 8", (since,))}
+
+    def mread(self, name, token, body):
+        """A call on mlops-core. Its API is ClearML-style: list calls are POSTs too. Only auth.login and *.get_all are ever called."""
+        url = os.environ["MLOPS_URL"].rstrip("/") + "/" + name
+        for i in range(3):
+            try:
+                return http_json("POST", url, {"Authorization": token}, body, timeout=40).get("data") or {}
+            except urllib.error.HTTPError:
+                raise
+            except OSError:
+                if i == 2:
+                    raise
+                time.sleep(5)
+
+    def refresh_tasks(self, t):
+        """Every 5 min: mlops-core's training and data tasks, with the owner's name."""
+        if not self.integrations()["mlops"]:
+            return
+        basic = base64.b64encode((os.environ["MLOPS_KEY"] + ":" + os.environ["MLOPS_SECRET"]).encode()).decode()
+        token = "Bearer " + self.mread("auth.login", "Basic " + basic, {})["token"]
+        names = {u["id"]: u.get("name") for u in self.mread("users.get_all", token, {"only_fields": ["id", "name"]}).get("users", [])}
+        rows = []
+        for page in range(50):
+            got = self.mread("tasks.get_all", token, {"page": page, "page_size": 500, "order_by": ["-last_update"], "only_fields": [
+                "id", "name", "user", "status", "type", "created", "started", "completed", "last_update", "status_reason"]}).get("tasks", [])
+            rows += [slim_task(x, names, t) for x in got if x.get("status") != "created"]
+            if len(got) < 500:
+                break
+        self.task_rows = {"at": t, "rows": rows}
+
+    def tasks(self):
+        """The Trainings tab."""
+        people = self.people()
+        rows = [dict(r, person=next((p["name"] for p in people if r["user"] in p["users"]), None)) for r in self.task_rows["rows"]]
+        return {"at": self.task_rows["at"], "tasks": rows, "error": self.integ_err.get("tasks")}
 
     def key_owner(self, m):
         """AIP username for a key's Prometheus labels: LiteLLM's owner record when we have it, else from the labels."""
@@ -816,7 +863,7 @@ class Collector:
                 except Exception as e:
                     errors.append("%s: %s" % (ns, probe.err(e)))
         self.hosts = {h: ns for ns, inv in self.inv.items() for k, v in inv.items() if v["kind"] == "Ingress" for h in v["hosts"]}
-        for step in ([self.check_probe] + ([self.scan_logs, self.test_models, self.check_llm_keys, self.refresh_keys, self.backfill_ticket_spend, self.refresh_logins] if slow else []) + [self.judge_changes]):
+        for step in ([self.check_probe] + ([self.scan_logs, self.test_models, self.check_llm_keys, self.refresh_keys, self.backfill_ticket_spend, self.refresh_logins, self.refresh_tasks] if slow else []) + [self.judge_changes]):
             try:
                 step(t)
             except Exception as e:
@@ -1445,8 +1492,15 @@ class Collector:
         since = t - 30 * 86400
         logins = {r["user"]: r for r in self.rows("SELECT user, max(CASE WHEN result='ok' THEN ts END) last_ok, sum(result!='ok' AND ts>=?) failed, "
                                                   "max(CASE WHEN result!='ok' THEN ts END) last_failed FROM logins GROUP BY user", (since,))}
+        train = {}
+        for x in self.task_rows["rows"]:
+            c = train.setdefault(x["user"], {"running": 0, "queued": 0, "failed": 0, "completed": 0, "last": 0})
+            k = {"in_progress": "running", "queued": "queued", "failed": "failed", "completed": "completed"}.get(x["status"])
+            if k:
+                c[k] += 1
+            c["last"] = max(c["last"], x["last"] or 0)
         for r in rows:
-            r["use"], r["sso"], r["login"] = use.get(r["user"]), sso.get(r["user"]), logins.get(r["user"])
+            r["use"], r["sso"], r["login"], r["train"] = use.get(r["user"]), sso.get(r["user"]), logins.get(r["user"]), train.get(r["user"])
             p = next((p for p in people if r["user"] in p["users"]), None)
             r["person"] = p and {"name": p["name"], "users": p["users"], "remove": bool(p.get("remove"))}
         # one person's namespaces next to each other (Avir: aviraip, aviraip2)
@@ -1472,6 +1526,7 @@ class Collector:
         return {"user": who, "namespaces": ns_list, "pods": [dict(p, ns=ns) for ns, p in items],
                 "use": use.get("users", {}).get(who), "use_from": use.get("from"), "key_rows": [k for k in self.keys()["keys"] if k["user"] == who],
                 "sso": self.sso().get("users", {}).get(who), "sso_from": self.sso().get("from"),
+                "task_rows": [x for x in self.task_rows["rows"] if x["user"] == who][:30],
                 "login_rows": self.rows("SELECT ts, result FROM logins WHERE user=? ORDER BY ts DESC LIMIT 30", (who,)),
                 "person": next(({"name": p["name"], "users": p["users"], "remove": bool(p.get("remove"))} for p in self.people() if who in p["users"]), None),
                 "key_people": {k: p["name"] for p in self.people() for k in p["keys"]},

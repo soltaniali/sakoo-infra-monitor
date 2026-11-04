@@ -71,7 +71,7 @@ function showLogin(msg) {
 }
 
 const TABS = [['overview', 'Overview'], ['incidents', 'Incidents'], ['changes', 'Changes'], ['models', 'Models'],
-  ['services', 'Services'], ['logs', 'Logs'], ['infra', 'Infra or us'], ['users', 'Users'], ['keys', 'Keys'], ['tickets', 'Tickets'], ['capacity', 'Capacity'], ['trends', 'Trends']];
+  ['services', 'Services'], ['logs', 'Logs'], ['infra', 'Infra or us'], ['users', 'Users'], ['trainings', 'Trainings'], ['keys', 'Keys'], ['tickets', 'Tickets'], ['capacity', 'Capacity'], ['trends', 'Trends']];
 setInterval(() => { const c = document.getElementById('clock'); if (c) c.textContent = 'Tehran ' + fmt(Date.now() / 1000); }, 15000);
 function nav(page) {
   document.getElementById('tabs').replaceChildren(...TABS.map(([k, t]) => h('a', {href: '#/' + k, class: page === k || (page === 'incident' && k === 'incidents') || (page === 'ticket' && k === 'tickets') ? 'on' : ''}, t)));
@@ -131,8 +131,8 @@ const VIEWS = {};
 VIEWS.overview = async () => {
   const s = await api('/api/state');
   const st = s.status || {}, ig = s.integrations || {};
-  const chips = ['ai', 'litellm', 'keys', 'gitlab', 'grafana', 'langfuse', 'tickets'].map(k => h('span', {class: 'chip ' + (ig[k] ? (ig.errors[k] ? 'warn' : 'ok') : ''),
-    title: ig.errors[k] || (ig[k] ? 'on' : 'off: set its env in secrets/ops.env')}, {ai: 'AI summaries', litellm: 'model test calls', gitlab: 'who changed it', grafana: 'GPU % · usage', langfuse: 'LLM request log', keys: 'LiteLLM keys', tickets: 'ticket site'}[k]));
+  const chips = ['ai', 'litellm', 'keys', 'mlops', 'casdoor', 'gitlab', 'grafana', 'langfuse', 'tickets'].map(k => h('span', {class: 'chip ' + (ig[k] ? (ig.errors[k] ? 'warn' : 'ok') : ''),
+    title: ig.errors[k] || (ig[k] ? 'on' : 'off: set its env in secrets/ops.env')}, {ai: 'AI summaries', litellm: 'model test calls', gitlab: 'who changed it', grafana: 'GPU % · usage', langfuse: 'LLM request log', keys: 'LiteLLM keys', mlops: 'trainings', casdoor: 'logins', tickets: 'ticket site'}[k]));
   return h('div', {},
     h('div', {class: 'row mut small'}, 'Last round ' + ago(st.last) + (st.took != null ? ' (' + st.took + ' s)' : '') + ' · ' +
       (st.namespaces || 0) + ' namespaces read · full read ' + ago(st.slow_last) + ' · probe report ' + ago(s.probe_ts), ' ', chips,
@@ -286,7 +286,7 @@ const LOCKED_USER = [  // what our access still cannot show (2026-10-31: kubecon
   {key: 'failed-login', title: 'Failed logins', shows: 'wrong passwords per user', needs: 'Casdoor writes failed logins as anonymous; only its database has them (access request 45)'},
 ];
 // LLM usage comes from Grafana's Prometheus (LiteLLM counters per key) once a Grafana login is set
-const userLocked = () => LOCKED_USER.filter(l => !(l.key === 'llm' && me.integrations.grafana) && !(l.key === 'failed-login' && me.integrations.casdoor));
+const userLocked = () => LOCKED_USER.filter(l => !(l.key === 'llm' && me.integrations.grafana) && !(l.key === 'failed-login' && me.integrations.casdoor) && !(l.key === 'train' && me.integrations.mlops));
 const big = n => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e4 ? Math.round(n / 1e3) + 'k' : String(n);
 const llmCell = u => !u || !u.requests ? '–' : [big(u.requests) + ' calls · ' + big(u.tokens) + ' tok · $' + u.spend,
   u.failed ? h('span', {class: 'err'}, ' · ' + u.failed + ' failed') : ''];
@@ -307,7 +307,8 @@ VIEWS.users = async () => {
   for (const g of groups) Object.assign(g, {open: sum(g, u => u.open), running: sum(g, u => u.running), restarts: sum(g, u => u.restarts),
     req: sum(g, u => u.use && u.use.requests), failed: sum(g, u => u.use && u.use.failed), spend: sum(g, u => u.use && u.use.spend),
     cpu_h: sum(g, u => u.use && u.use.cpu_h), gpu_h: sum(g, u => u.use && u.use.gpu_h), seen: Math.max(0, ...g.rows.map(u => u.sso ? u.sso.last : 0)),
-    lastLogin: Math.max(0, ...g.rows.map(u => u.login && u.login.last_ok || 0)), loginFail: sum(g, u => u.login && u.login.failed)});
+    lastLogin: Math.max(0, ...g.rows.map(u => u.login && u.login.last_ok || 0)), loginFail: sum(g, u => u.login && u.login.failed),
+    trainRun: sum(g, u => u.train && u.train.running), trainFail: sum(g, u => u.train && u.train.failed), trainDone: sum(g, u => u.train && u.train.completed)});
   groups.sort((a, b) => b.open - a.open || b.seen - a.seen || b.req - a.req);
   const stat = (k, ...v) => h('div', {class: 'stat'}, h('span', {class: 'k'}, k), h('span', {class: 'v'}, ...v));
   const num = n => Math.round(n).toLocaleString('en');
@@ -318,6 +319,7 @@ VIEWS.users = async () => {
     h('div', {class: 'stats'},
       stat('Last active (SSO)', T(g.seen || null)), me.integrations.casdoor ? stat('Last password login', T(g.lastLogin || null)) : '',
       me.integrations.casdoor ? stat('Failed logins · 30 d', g.loginFail ? h('span', {class: 'err'}, g.loginFail) : '0') : '', stat('Open incidents', g.open ? h('span', {class: 'err'}, g.open) : '0'),
+      me.integrations.mlops ? stat('Tasks: running · done · failed', g.trainRun + ' · ' + g.trainDone + ' · ', g.trainFail ? h('span', {class: 'err'}, g.trainFail) : '0') : '',
       stat('Running pods', g.running), stat('LLM calls · 30 d', num(g.req), g.failed ? h('span', {class: 'err'}, ' · ' + num(g.failed) + ' failed') : ''),
       stat('Spend · 30 d', '$' + g.spend.toFixed(2)), stat('CPU-h · GPU-h · 30 d', num(g.cpu_h) + ' · ' + num(g.gpu_h))),
     table([['Namespace / account', u => h('a', {href: '#/user?' + qs({name: u.user})}, h('b', {}, u.user))], ['Runs', u => u.kinds.join(', ')],
@@ -350,6 +352,28 @@ const keyFlags = k => k.flags.length ? k.flags.map(f => [h('span', {class: 'chip
 const keyLimits = k => (k.rpm || k.tpm ? (k.rpm || '–') + ' rpm · ' + (k.tpm || '–') + ' tpm' : 'no limit');
 const keyModels = k => !k.models.length || k.models.includes('all-team-models') ? 'all' : h('span', {title: k.models.join(', ')}, k.models.length + ' models');
 const keyBudget = k => k.budget == null ? h('span', {class: 'mut'}, 'no limit') : '$' + k.spend + ' of $' + k.budget;
+// --- mlops-core tasks: read every 5 min, dashboard only -----------------------------------------------------------------
+const TASK_CHIP = {failed: 'bad', stopped: 'warn', completed: 'ok', in_progress: 'ok', queued: 'warn'};
+const taskStatus = x => [h('span', {class: 'chip ' + (TASK_CHIP[x.status] || '')}, x.status === 'in_progress' ? 'running' : x.status), x.stuck ? [' ', h('span', {class: 'chip warn'}, 'no update')] : ''];
+const taskTable = rows => table([['Task', x => h('span', {dir: 'auto'}, x.name)], ['Type', x => x.type], ['Status', taskStatus], ['Reason', x => h('span', {class: 'small', dir: 'auto'}, x.reason || '')],
+  ['Created', x => T(x.created)], ['Last update', x => T(x.last)]], rows);
+VIEWS.trainings = async q => {
+  const r = await api('/api/tasks'), f = q.status || '', user = q.user || '';
+  const stuck = x => x.stuck, counts = {in_progress: 0, queued: 0, failed: 0, completed: 0};
+  for (const x of r.tasks) if (x.status in counts) counts[x.status]++;
+  const rows = r.tasks.filter(x => (f === 'stuck' ? stuck(x) : !f || x.status === f) && (!user || x.user === user));
+  const go = s => { location.hash = '#/trainings' + (s ? '?' + qs({status: s}) : ''); };
+  const btn = (s, label) => h('button', {class: f === s ? 'primary' : '', onclick: () => go(s)}, label);
+  return h('div', {}, h('h1', {}, 'Trainings · ' + r.tasks.length),
+    h('p', {class: 'mut small'}, 'Tasks in mlops-core, read every 5 min. Read ', T(r.at), '. "No update" = running, but nothing reported for 6 h. Scripts and settings of tasks are not read.'),
+    r.error ? h('div', {class: 'card err small'}, 'Last read failed: ' + r.error + ' (showing the last good read)') : '',
+    h('div', {class: 'row'}, btn('', 'All'), btn('in_progress', 'Running · ' + counts.in_progress), btn('queued', 'Queued · ' + counts.queued), btn('failed', 'Failed · ' + counts.failed),
+      btn('completed', 'Completed · ' + counts.completed), btn('stuck', 'No update · ' + r.tasks.filter(stuck).length)),
+    h('div', {class: 'card'}, table([['Owner', x => [h('a', {href: '#/user?' + qs({name: x.user})}, x.user), x.person ? h('div', {class: 'small mut', dir: 'auto'}, x.person) : '']],
+      ['Task', x => h('span', {dir: 'auto'}, x.name)], ['Type', x => x.type], ['Status', taskStatus], ['Reason', x => h('span', {class: 'small', dir: 'auto'}, x.reason || '')],
+      ['Created', x => T(x.created)], ['Last update', x => T(x.last)]], rows)));
+};
+
 VIEWS.keys = async q => {
   const r = await api('/api/keys'), flag = q.flag || '';
   const flags = [...new Set(r.keys.flatMap(k => k.flags))].sort();
@@ -391,6 +415,7 @@ VIEWS.user = async q => {
     (u.key_rows || []).length ? [h('h2', {}, 'Keys · limits and warnings (LiteLLM)'), h('div', {class: 'card'}, table([['Key', k => h('b', {dir: 'auto'}, k.alias)],
       ['Warnings', keyFlags], ['Budget', keyBudget], ['Rate limit', keyLimits], ['Models', keyModels], ['Expires', k => k.expires ? T(k.expires) : h('span', {class: 'mut'}, 'never')],
       ['Last used', k => k.active ? T(k.active) : h('span', {class: 'mut'}, 'never')]], u.key_rows))] : '',
+    (u.task_rows || []).length ? [h('h2', {}, 'Tasks · newest ' + u.task_rows.length + ' (mlops-core)'), h('div', {class: 'card'}, taskTable(u.task_rows))] : '',
     h('h2', {}, 'Pods · ' + u.pods.length), h('div', {class: 'card'}, table([['Namespace', p => p.ns], ['Pod', p => p.name], ['Phase', p => p.phase],
       ['Ready', p => live(p.ready ? 'ready' : 'not ready', p.since, null, !p.ready)], ['Restarts', p => p.restarts],
       ['CPU / RAM now', p => p.use_cpu == null ? '–' : p.use_cpu.toFixed(2) + ' cores / ' + (p.use_mem / 1073741824).toFixed(1) + ' GiB'],

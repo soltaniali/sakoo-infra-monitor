@@ -421,6 +421,11 @@ def analyze(col, d, ai=None):
         if n:
             q5["answer"] += "; failed logins of %s within 2 h: %d" % (who, n)
             q5["status"] = "warn" if q5["status"] in ("ok", "info") else q5["status"]
+    failed_tasks = [x for x in col.task_rows["rows"] if who and x["user"] == who and x["status"] == "failed" and x["last"]
+                    and moments[0] - NEAR_S <= x["last"] <= moments[-1] + NEAR_S]
+    if failed_tasks:
+        q5["answer"] += "; failed tasks of %s within 2 h: %d" % (who, len(failed_tasks))
+        q5["status"] = "warn" if q5["status"] in ("ok", "info") else q5["status"]
     # older than Langfuse: LiteLLM's own logs, saved once in the background (Collector.backfill_ticket_spend)
     old = json.loads(col.meta("tspend:%d:%s" % (d["id"], alias or "-")) or "null") if d.get("id") else None
     if old and alias and "user_total" in old and not n_req:
@@ -455,10 +460,12 @@ def analyze(col, d, ai=None):
     for m in (log or {}).get("models", []) or [{"model": k, "count": v} for k, v in own.get("models", {}).items()]:
         k = llm_kind(m["model"])
         calls[k] = calls.get(k, 0) + m["count"]
-    agents = [p["name"] for ns, p in col.user_pods().get(who, []) if p["workload"].endswith("clearml-agent")] if who else []
-    seen = (["fine-tune (ClearML agent in user-%s)" % who] if agents else []) + [
+    # real tasks in the week up to the ticket (every user has a ClearML agent, so an agent says nothing)
+    tasks = [x for x in col.task_rows["rows"] if who and x["user"] == who and x["created"] and moments[0] - 7 * 86400 <= x["created"] <= moments[-1] + NEAR_S]
+    n_train, n_data = sum(x["type"] == "training" for x in tasks), sum(x["type"] == "data_processing" for x in tasks)
+    seen = (["fine-tune (%d training tasks in the week before)" % n_train] if n_train else []) + (["data processing %d" % n_data] if n_data else []) + [
         "%s %d" % kv for kv in sorted(calls.items(), key=lambda x: -x[1]) if kv[1]]
     if seen:
         purpose = "from real use: " + ", ".join(seen) + (" · ticket says: %s" % purpose if purpose != "other" else "")
-    q6 = {"status": "info", "answer": purpose, "calls": calls, "agents": agents}
+    q6 = {"status": "info", "answer": purpose, "calls": calls, "tasks": tasks}
     return {"q1": q1, "q2": q2, "q3": q3, "q4": q4, "q5": q5, "q6": q6}
