@@ -19,14 +19,17 @@ Alerts: one Telegram message per round, through the London receiver's POST /aler
 """
 import base64
 import calendar
+import collections
 import concurrent.futures
 import contextlib
+import gzip
 import hashlib
 import hmac
 import json
 import os
 import queue
 import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -61,6 +64,12 @@ probe.TIMEOUT = 25  # the VPN path is slow: 8 s timed out on big lists
 SSO_ORG = "organization_sharif"  # Casdoor organisation of the platform's users (built-in = admins, app = applications)
 SSO_RE = re.compile(r"^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d)\.\d+ .*?subOwner = ([^,]*), subName = ([^,]*), method = \w+, "
                     r"urlPath = ([^,]*),.*?result = (\w+)", re.M)
+LOG_DIR, LOG_CAP_BYTES, LOG_TAIL = DATA / "logs", 5 * 1024 ** 3, 500  # saved logs: <day>/<ns>/<pod>__<container>.log.gz
+LOG_STAMP_RE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\S*Z ")
+LOG_SECRET_RES = (  # logs can hold secrets (data-ingestion-api prints users' S3 keys): masked before they are saved or read
+    re.compile(r"(?i)((?:access|secret|password|passwd|pwd|token|api[_-]?key|authorization|bearer|cookie)[\w-]*[\"']?\s*[:= ]\s*[\"']?(?:bearer\s+)?)[^\s\"',;&]{4,}"),
+    re.compile(r"\b[A-Z0-9]{20}\b"), re.compile(r"(?<![\w/+])[A-Za-z0-9/+]{40}(?![\w/+=])"))
+SERVICE_NS = ("jupyterhub", "mlflow", "dify", "n8nio", "zenml", "langflow", "ragflow", "openwebui", "airflow", "harbor", "gitlab")
 TASK_STUCK_S = 6 * 3600  # a running task with no update for this long is marked "no update"
 LLM_FAIL_MIN, LLM_FAIL_RATE = 20, 0.3  # a key with >= 20 calls in the last hour of which >= 30 % failed: incident (dashboard only)
 RULES = {
@@ -165,6 +174,11 @@ def key_user(m):
     """AIP username of a LiteLLM key from its Prometheus labels: alias '<user>-<key name>', else the key's user email."""
     alias, mail = m.get("api_key_alias") or "None", m.get("user_email") or "None"
     return alias.split("-", 1)[0] if "-" in alias else mail.split("@")[0] if "@" in mail else None
+
+
+def mask_log(line):
+    line = LOG_SECRET_RES[0].sub(r"\1***", tickets.mask(line))
+    return LOG_SECRET_RES[2].sub("***", LOG_SECRET_RES[1].sub("***", line))
 
 
 def slim_task(x, names, t):
@@ -346,6 +360,7 @@ class Collector:
         self.states = {r["key"]: (r["state"], r["since"]) for r in self.rows("SELECT * FROM state_since")}  # liveness
         self.bg, self.tickets_busy, self.tickets_tried = queue.Queue(), False, 0
         self.task_rows = {"at": None, "rows": []}  # last good read of mlops-core's tasks
+        self.log_marks = {}  # (ns, pod, container) -> newest saved log time: scan windows overlap, nothing is saved twice
         self.key_rows = {"at": None, "rows": []}  # last good read: the VPN path to LiteLLM drops every few minutes
         threading.Thread(target=self._bg_loop, daemon=True).start()
 
@@ -1097,17 +1112,26 @@ class Collector:
         def read(job):
             ns, p, c = job
             try:
-                return job, kget("/api/v1/namespaces/%s/pods/%s/log?container=%s&sinceSeconds=%d&tailLines=500"
-                                 % (ns, p["name"], c, ROUND_S * SLOW_EVERY + 30), raw=True)
+                return job, kget("/api/v1/namespaces/%s/pods/%s/log?container=%s&sinceSeconds=%d&tailLines=%d&timestamps=true"
+                                 % (ns, p["name"], c, ROUND_S * SLOW_EVERY + 30, LOG_TAIL), raw=True)
             except Exception:
                 return job, ""
         seen = {}  # (ns, sig) -> [workload, pod, sample line, count]
         with concurrent.futures.ThreadPoolExecutor(WORKERS) as ex:
             for (ns, p, c), text in ex.map(read, jobs):
+                mark, fresh, newest = (ns, p["name"], c), [], None
                 for line in text.splitlines():
+                    if LOG_STAMP_RE.match(line):
+                        stamp, line = line.split(" ", 1)
+                        if stamp > self.log_marks.get(mark, ""):
+                            fresh.append(stamp + " " + mask_log(line))
+                            newest = max(newest or stamp, stamp)
                     if ERROR_RE.search(line[:LEVEL_ZONE]):
                         sig = signature(line) if ns == OUR_NS else signature(ns + " " + line)  # our old signatures stay valid
                         seen.setdefault((ns, sig), [p["workload"], p["name"], line[:500], 0])[3] += 1
+                if fresh:
+                    self.save_log(ns, p["name"], c, t, fresh)
+                    self.log_marks[mark] = newest
         known = {r["sig"] for r in self.rows("SELECT sig FROM signatures")}
         with self.lock:
             self.conn.executemany("INSERT INTO signatures VALUES (?,?,?,?,?,?,?) ON CONFLICT(sig) DO UPDATE SET last=?, count=count+?",
@@ -1120,6 +1144,78 @@ class Collector:
                 sym[key] = ("new-error", ns, wl, "%s (%d× in the last %d min)" % (line[:300], n, ROUND_S * SLOW_EVERY // 60),
                             {"pod": pod, "sample": line})
         self.observe("logs", sym, t)
+
+    @staticmethod
+    def save_log(ns, pod, container, t, lines):
+        path = LOG_DIR / time.strftime("%Y-%m-%d", time.gmtime(t)) / ns / ("%s__%s.log.gz" % (pod, container))
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with gzip.open(path, "at", encoding="utf-8", errors="replace") as f:  # gzip allows appended parts
+            f.write("\n".join(lines) + "\n")
+
+    @staticmethod
+    def prune_logs(t):
+        """Keep 30 days and at most LOG_CAP_BYTES: the oldest days go first."""
+        if not LOG_DIR.exists():
+            return
+        days = sorted(p for p in LOG_DIR.iterdir() if p.is_dir())
+        size = {d: sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) for d in days}
+        keep_from = time.strftime("%Y-%m-%d", time.gmtime(t - RETENTION))
+        for d in days:
+            if d.name < keep_from or sum(size.values()) > LOG_CAP_BYTES:
+                shutil.rmtree(d, ignore_errors=True)
+                del size[d]
+
+    @staticmethod
+    def log_archive(ns=None):
+        """Saved logs: namespaces with their size, or one namespace's pods with the days saved."""
+        days = sorted((p for p in LOG_DIR.iterdir() if p.is_dir()), reverse=True) if LOG_DIR.exists() else []
+        out = {"from": days[-1].name if days else None, "namespaces": {}, "pods": {}}
+        for d in days:
+            for n in d.iterdir():
+                b = sum(f.stat().st_size for f in n.iterdir())
+                out["namespaces"][n.name] = out["namespaces"].get(n.name, 0) + b
+                if n.name == ns:
+                    for f in n.iterdir():
+                        pod, container = f.name[:-len(".log.gz")].split("__", 1)
+                        r = out["pods"].setdefault(pod + "/" + container, {"pod": pod, "container": container, "days": [], "bytes": 0})
+                        r["days"].append(d.name)
+                        r["bytes"] += f.stat().st_size
+        out["pods"] = sorted(out["pods"].values(), key=lambda r: r["days"][0], reverse=True)
+        return out
+
+    @staticmethod
+    def log_read(ns, pod, container, day, find="", tail=2000):
+        """The last lines of one saved day, optionally only those holding `find`. Callers check the names."""
+        path = LOG_DIR / day / ns / ("%s__%s.log.gz" % (pod, container))
+        low = find.lower()
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
+            return "".join(collections.deque((x for x in f if low in x.lower()), maxlen=tail))
+
+    def task_log(self, tid):
+        """The newest log lines of one mlops-core task (kept by mlops-core, so also for pods that are gone)."""
+        if not any(x["id"] == tid for x in self.task_rows["rows"]):
+            raise KeyError("no such task")
+        basic = base64.b64encode((os.environ["MLOPS_KEY"] + ":" + os.environ["MLOPS_SECRET"]).encode()).decode()
+        token = "Bearer " + self.mread("auth.login", "Basic " + basic, {})["token"]
+        r = self.mread("events.get_task_log", token, {"task": tid, "batch_size": 500, "navigate_earlier": True})
+        lines = sorted(r.get("events", []), key=lambda e: e.get("timestamp") or 0)
+        return {"total": r.get("total"), "lines": [{"ts": (e.get("timestamp") or 0) / 1000, "level": e.get("level"), "msg": mask_log(str(e.get("msg")))} for e in lines]}
+
+    def service_load(self):
+        """Non-LLM services, each as a whole (their logs do not say which user): CPU hours and traffic from Prometheus."""
+        if not self.integrations()["grafana"]:
+            return []
+
+        def fetch():
+            sel = 'namespace=~"%s"' % "|".join(SERVICE_NS)
+            out = {ns: {"ns": ns, "cpu_h": 0, "mem_gib": 0, "net_gb": 0} for ns in SERVICE_NS}
+            for field, q in (("cpu_h", 'sum by (namespace) (increase(container_cpu_usage_seconds_total{%s,container!=""}[30d])) / 3600' % sel),
+                             ("mem_gib", 'sum by (namespace) (container_memory_working_set_bytes{%s,container!=""}) / 1073741824' % sel),
+                             ("net_gb", 'sum by (namespace) (increase(container_network_receive_bytes_total{%s}[7d])) / 1000000000' % sel)):
+                for s in self.prom(q):
+                    out[s["metric"]["namespace"]][field] = round(float(s["value"][1]), 1)
+            return sorted(out.values(), key=lambda r: -r["cpu_h"])
+        return self.cached("service_load", 300, fetch) or []
 
     def test_models(self, t):
         """Every 5 min: a 1-token chat call (or a tiny embedding) to each KubeAI model litellm knows. Needs the litellm key."""
@@ -1311,6 +1407,7 @@ class Collector:
             self.conn.execute("DELETE FROM outbox WHERE ts < ?", (t - RETENTION,))
             self.conn.execute("DELETE FROM restarts WHERE day < ?", (time.strftime("%Y-%m-%d", time.gmtime(t - RETENTION)),))
             self.conn.commit()
+        self.prune_logs(t)
         self.set_meta("pruned", str(t))
 
     # --- reads for the web page -----------------------------------------------------------------------------------
@@ -1582,7 +1679,7 @@ class Collector:
                          "gpu": ", ".join("%s×%d" % (k.replace("nvidia.com/", ""), n) for k, n in sorted(g.items())),
                          "gpu_n": sum(g.values()), "metrics": any(p.get("use_cpu") is not None for p in live)})
         rows.sort(key=lambda r: (-r["gpu_n"], -r["cpu_use"]))
-        return {"namespaces": rows, "near_limit": sorted(near, key=lambda r: -r["pct"]), "idle": sorted(idle, key=lambda r: -r["cpu_req"]),
+        return {"services": self.service_load(), "namespaces": rows, "near_limit": sorted(near, key=lambda r: -r["pct"]), "idle": sorted(idle, key=lambda r: -r["cpu_req"]),
                 "gpus": sorted(gpus, key=lambda r: (r["ns"], r["pod"]))}
 
     def trends(self, days=14):

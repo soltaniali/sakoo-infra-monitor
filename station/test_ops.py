@@ -539,6 +539,52 @@ col.task_rows = {"at": None, "rows": []}
 for k in ("MLOPS_URL", "MLOPS_KEY", "MLOPS_SECRET"):
     os.environ.pop(k)
 
+# saved logs: new lines only (scan windows overlap), secrets masked, errors still scanned, oldest days dropped over the cap
+saved_pods, saved_kget, saved_marks = col.pods, ops.kget, dict(col.log_marks)
+col.pods = {"user-uni": [{"name": "w-1", "workload": "w", "phase": "Running", "containers": ["c"], "bad": None}]}
+logs = {"text": "2026-10-30T10:00:00.1Z first\n2026-10-30T10:00:01.1Z secret_key=ABCDsecretVALUE more\n"}
+ops.kget = lambda path, raw=False: logs["text"]
+T3 = ops.calendar.timegm((2026, 10, 30, 10, 1, 0))
+col.scan_logs(T3)
+logs["text"] += "2026-10-30T10:00:02.1Z ERROR third\n"
+col.scan_logs(T3)
+ops.kget = saved_kget
+got = col.log_read("user-uni", "w-1", "c", "2026-10-30")
+assert got.count("first") == 1 and "third" in got and "ABCDsecretVALUE" not in got and "secret_key=***" in got, got
+assert col.log_read("user-uni", "w-1", "c", "2026-10-30", "THIRD").count("\n") == 1
+a = col.log_archive("user-uni")
+assert a["from"] == "2026-10-30" and "user-uni" in a["namespaces"] and a["pods"][0]["pod"] == "w-1" and a["pods"][0]["days"] == ["2026-10-30"], a
+assert "AKIAIOSFODNN7EXAMPLE" not in ops.mask_log("key AKIAIOSFODNN7EXAMPLE") and "abcdef123456" not in ops.mask_log("Authorization: Bearer abcdef123456")
+col.save_log("user-uni", "w-1", "c", ops.calendar.timegm((2026, 1, 1, 0, 0, 0)), ["old"])
+real_cap, ops.LOG_CAP_BYTES = ops.LOG_CAP_BYTES, 10 ** 9
+col.prune_logs(T3)
+ops.LOG_CAP_BYTES = real_cap
+assert not (ops.LOG_DIR / "2026-01-01").exists() and (ops.LOG_DIR / "2026-10-30").exists()
+ops.LOG_CAP_BYTES = 1
+col.prune_logs(T3)
+ops.LOG_CAP_BYTES = real_cap
+assert not (ops.LOG_DIR / "2026-10-30").exists()
+col.pods, col.log_marks = saved_pods, saved_marks
+# service load: one row per service; task log: only tasks we know, masked
+saved_prom, col.prom, col.cache = col.prom, (lambda q, at=None: [{"metric": {"namespace": "dify"}, "value": [0, "15.26"]}]), {}
+assert next(r for r in col.service_load() if r["ns"] == "dify") == {"ns": "dify", "cpu_h": 15.3, "mem_gib": 15.3, "net_gb": 15.3}
+col.prom = saved_prom
+col.task_rows = {"at": 1, "rows": [{"id": "t1", "user": "u"}]}
+real_http, ops.http_json = ops.http_json, lambda m, url, h=None, b=None, timeout=30: {"data": {"token": "x"}} if url.endswith("auth.login") else {
+    "data": {"total": 9, "events": [{"timestamp": 2000, "level": "error", "msg": "password=abcdef1 failed"}, {"timestamp": 1000, "level": "info", "msg": "start"}]}}
+os.environ.update(MLOPS_URL="https://m/core", MLOPS_KEY="k", MLOPS_SECRET="s")
+tl = col.task_log("t1")
+assert tl["total"] == 9 and [x["msg"] for x in tl["lines"]] == ["start", "password=*** failed"], tl
+try:
+    col.task_log("not-ours")
+    raise AssertionError("unknown task must be refused")
+except KeyError:
+    pass
+ops.http_json = real_http
+col.task_rows = {"at": None, "rows": []}
+for k in ("MLOPS_URL", "MLOPS_KEY", "MLOPS_SECRET"):
+    os.environ.pop(k)
+
 # Casdoor login records: real attempts only, a failed name that is no account is not stored, what was typed never is
 known = {"uni"}
 rec = lambda resp, **kw: dict({"name": "r1", "createdTime": "2026-10-30T10:00:00Z", "user": "", "response": resp, "object": ""}, **kw)

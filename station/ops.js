@@ -71,7 +71,7 @@ function showLogin(msg) {
 }
 
 const TABS = [['overview', 'Overview'], ['incidents', 'Incidents'], ['changes', 'Changes'], ['models', 'Models'],
-  ['services', 'Services'], ['logs', 'Logs'], ['infra', 'Infra or us'], ['users', 'Users'], ['trainings', 'Trainings'], ['keys', 'Keys'], ['tickets', 'Tickets'], ['capacity', 'Capacity'], ['trends', 'Trends']];
+  ['services', 'Services'], ['logs', 'Logs'], ['saved-logs', 'Saved logs'], ['infra', 'Infra or us'], ['users', 'Users'], ['trainings', 'Trainings'], ['keys', 'Keys'], ['tickets', 'Tickets'], ['capacity', 'Capacity'], ['trends', 'Trends']];
 setInterval(() => { const c = document.getElementById('clock'); if (c) c.textContent = 'Tehran ' + fmt(Date.now() / 1000); }, 15000);
 function nav(page) {
   document.getElementById('tabs').replaceChildren(...TABS.map(([k, t]) => h('a', {href: '#/' + k, class: page === k || (page === 'incident' && k === 'incidents') || (page === 'ticket' && k === 'tickets') ? 'on' : ''}, t)));
@@ -238,6 +238,27 @@ VIEWS.services = async q => {
     h('h2', {}, 'Warning events (last hour)'), h('div', {class: 'card'}, eventTable(s.events)));
 };
 
+// --- logs the station saved itself: also for pods that are gone -----------------------------------------------------------
+VIEWS['saved-logs'] = async q => {
+  const a = await api('/api/archive?' + qs({ns: q.ns})), mb = b => (b / 1048576).toFixed(1) + ' MB';
+  const names = Object.keys(a.namespaces).sort();
+  const top = [h('h1', {}, 'Saved logs'), h('p', {class: 'mut small'}, a.from ? 'Saved by the station from ' + a.from + ' (UTC days), kept 30 days, at most 5 GB. ' +
+    'Up to 500 lines per container every 5 min, so a very busy pod can have gaps. Secrets are masked before saving.' : 'Nothing saved yet: the first logs arrive within 5 minutes.'),
+    h('div', {class: 'row'}, h('select', {onchange: e => { location.hash = '#/saved-logs?' + qs({ns: e.target.value}); }}, h('option', {value: ''}, 'Choose a namespace…'),
+      names.map(n => h('option', {value: n, selected: n === q.ns}, n + ' · ' + mb(a.namespaces[n])))))];
+  if (!q.ns) return h('div', {}, top);
+  if (!q.pod) return h('div', {}, top, h('div', {class: 'card'}, table([['Pod', r => h('b', {}, r.pod)], ['Container', r => r.container], ['Size', r => mb(r.bytes)],
+    ['Days', r => r.days.map(d => [h('a', {href: '#/saved-logs?' + qs({ns: q.ns, pod: r.pod, container: r.container, day: d})}, d), ' '])]], a.pods)));
+  const find = h('input', {type: 'search', placeholder: 'Find in this day…', value: q.q || ''}), out = h('pre', {}, 'Loading…');
+  const load = async () => {
+    try { out.textContent = (await api('/api/archive_read?' + qs({ns: q.ns, pod: q.pod, container: q.container, day: q.day, q: find.value}))).text || '(no lines)'; }
+    catch (e) { out.textContent = 'Error: ' + e.message; }
+  };
+  load();
+  return h('div', {}, top, h('p', {}, h('a', {href: '#/saved-logs?' + qs({ns: q.ns})}, '← ' + q.ns), ' · ', h('b', {}, q.pod + ' / ' + q.container), ' · ' + q.day),
+    h('form', {class: 'row', onsubmit: e => { e.preventDefault(); load(); }}, find, h('button', {}, 'Find')), h('div', {class: 'card'}, out));
+};
+
 VIEWS.logs = async q => {
   const ns = q.ns || 'aip-mlops-service';
   const s = await api('/api/services?' + qs({ns}));
@@ -282,7 +303,6 @@ const bar = (v, max) => h('span', {style: 'display:inline-block;height:8px;borde
 const LOCKED_USER = [  // what our access still cannot show (2026-10-31: kubeconfig, Grafana Viewer, Langfuse, Casdoor log)
   {key: 'llm', title: 'LLM usage', shows: 'models used, tokens, LLM errors', needs: 'a Grafana login on the station: sh station/set-grafana-login.sh'},
   {key: 'train', title: 'Trainings', shows: 'queued, running and failed mlops-core tasks', needs: 'a read-only mlops-core API key (tasks are in its Elasticsearch; its logs show only hashed user ids)'},
-  {key: 'history', title: 'Log history', shows: 'logs of pods that are gone, 30 days', needs: 'a central log store, which we have no access to; only the running pods\' logs are readable'},
   {key: 'failed-login', title: 'Failed logins', shows: 'wrong passwords per user', needs: 'Casdoor writes failed logins as anonymous; only its database has them (access request 45)'},
 ];
 // LLM usage comes from Grafana's Prometheus (LiteLLM counters per key) once a Grafana login is set
@@ -355,7 +375,14 @@ const keyBudget = k => k.budget == null ? h('span', {class: 'mut'}, 'no limit') 
 // --- mlops-core tasks: read every 5 min, dashboard only -----------------------------------------------------------------
 const TASK_CHIP = {failed: 'bad', stopped: 'warn', completed: 'ok', in_progress: 'ok', queued: 'warn'};
 const taskStatus = x => [h('span', {class: 'chip ' + (TASK_CHIP[x.status] || '')}, x.status === 'in_progress' ? 'running' : x.status), x.stuck ? [' ', h('span', {class: 'chip warn'}, 'no update')] : ''];
-const taskTable = rows => table([['Task', x => h('span', {dir: 'auto'}, x.name)], ['Type', x => x.type], ['Status', taskStatus], ['Reason', x => h('span', {class: 'small', dir: 'auto'}, x.reason || '')],
+const taskLogLink = x => h('a', {href: '#/tasklog?' + qs({id: x.id})}, 'log');
+VIEWS.tasklog = async q => {
+  const r = await api('/api/task_log?' + qs({id: q.id}));
+  return h('div', {}, h('p', {}, h('a', {href: '#/trainings'}, '← trainings')), h('h1', {}, 'Task log'),
+    h('p', {class: 'mut small'}, 'Newest ' + r.lines.length + ' of ' + (r.total == null ? '?' : r.total) + ' lines, from mlops-core. Secrets are masked. Older tasks may have no lines left.'),
+    h('div', {class: 'card'}, h('pre', {}, r.lines.map(l => new Date(l.ts * 1000).toISOString().slice(0, 19) + ' ' + (l.level || '') + ' ' + l.msg).join('\n') || '(no lines)')));
+};
+const taskTable = rows => table([['Task', x => h('span', {dir: 'auto'}, x.name)], ['', taskLogLink], ['Type', x => x.type], ['Status', taskStatus], ['Reason', x => h('span', {class: 'small', dir: 'auto'}, x.reason || '')],
   ['Created', x => T(x.created)], ['Last update', x => T(x.last)]], rows);
 VIEWS.trainings = async q => {
   const r = await api('/api/tasks'), f = q.status || '', user = q.user || '';
@@ -370,7 +397,7 @@ VIEWS.trainings = async q => {
     h('div', {class: 'row'}, btn('', 'All'), btn('in_progress', 'Running · ' + counts.in_progress), btn('queued', 'Queued · ' + counts.queued), btn('failed', 'Failed · ' + counts.failed),
       btn('completed', 'Completed · ' + counts.completed), btn('stuck', 'No update · ' + r.tasks.filter(stuck).length)),
     h('div', {class: 'card'}, table([['Owner', x => [h('a', {href: '#/user?' + qs({name: x.user})}, x.user), x.person ? h('div', {class: 'small mut', dir: 'auto'}, x.person) : '']],
-      ['Task', x => h('span', {dir: 'auto'}, x.name)], ['Type', x => x.type], ['Status', taskStatus], ['Reason', x => h('span', {class: 'small', dir: 'auto'}, x.reason || '')],
+      ['Task', x => h('span', {dir: 'auto'}, x.name)], ['', taskLogLink], ['Type', x => x.type], ['Status', taskStatus], ['Reason', x => h('span', {class: 'small', dir: 'auto'}, x.reason || '')],
       ['Created', x => T(x.created)], ['Last update', x => T(x.last)]], rows)));
 };
 
@@ -508,6 +535,9 @@ VIEWS.capacity = async () => {
   return h('div', {}, h('h1', {}, 'Capacity'),
     h('p', {class: 'mut'}, 'Live use from metrics.k8s.io against what pods requested. Not one of the 8 events: a view to spot waste and pods about to run out of memory.'),
     noMetrics ? h('div', {class: 'card err small'}, 'No usage numbers: metrics.k8s.io answered nothing.') : '',
+    c.services.length ? [h('h2', {}, 'Non-LLM services · whole service, not per user'), h('div', {class: 'card'}, table([['Service', r => h('a', {href: '#/services?' + qs({ns: r.ns})}, r.ns)],
+      ['CPU hours · 30 d', r => r.cpu_h], ['RAM now', r => r.mem_gib + ' GiB'], ['Traffic in · 7 d', r => r.net_gb + ' GB']], c.services),
+      h('div', {class: 'small mut'}, 'From Prometheus (data from 21 Oct). These services\' logs do not say which user, so there is no per-user split. Traffic includes their internal traffic.'))] : '',
     h('h2', {}, 'Pods near their memory limit (85% or more) · ' + c.near_limit.length),
     h('div', {class: 'card'}, table([['Namespace', r => r.ns], ['Pod', r => r.pod], ['Used', r => r.used_gib + ' GiB'], ['Limit', r => r.limit_gib + ' GiB'],
       ['%', r => h('span', {class: r.pct >= 95 ? 'err' : ''}, r.pct + ' %')]], c.near_limit)),

@@ -163,6 +163,14 @@ class Handler(BaseHTTPRequestHandler):
             return COL.logins()
         if what == "tasks":
             return COL.tasks()
+        if what == "task_log":
+            return COL.task_log(name(q, "id"))
+        if what == "archive":
+            return COL.log_archive(name(q, "ns", required=False) or None)
+        if what == "archive_read":
+            if not re.match(r"^\d{4}-\d\d-\d\d$", q.get("day", "")):
+                raise BadRequest("bad day")
+            return {"text": COL.log_read(name(q, "ns"), name(q, "pod"), name(q, "container"), q["day"], q.get("q", "")[:200])}
         if what == "tickets":
             return COL.tickets()
         if what == "ticket":
