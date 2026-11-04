@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS restarts (day TEXT, ns TEXT, wl TEXT, first INTEGER, 
 CREATE TABLE IF NOT EXISTS state_since (key TEXT PRIMARY KEY, state TEXT, since REAL);
 CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY, ts REAL, text TEXT, sent REAL);
 CREATE TABLE IF NOT EXISTS tickets (id INTEGER PRIMARY KEY, sig TEXT, data TEXT, fetched REAL, seen REAL, ai TEXT);
+CREATE TABLE IF NOT EXISTS daily (day TEXT, scope TEXT, name TEXT, metric TEXT, value REAL, PRIMARY KEY (day, scope, name, metric));
 CREATE TABLE IF NOT EXISTS logins (name TEXT PRIMARY KEY, ts REAL, user TEXT, result TEXT);
 CREATE INDEX IF NOT EXISTS logins_user ON logins (user, ts);
 CREATE INDEX IF NOT EXISTS changes_ts ON changes (ts);
@@ -178,6 +179,17 @@ def key_user(m):
     """AIP username of a LiteLLM key from its Prometheus labels: alias '<user>-<key name>', else the key's user email."""
     alias, mail = m.get("api_key_alias") or "None", m.get("user_email") or "None"
     return alias.split("-", 1)[0] if "-" in alias else mail.split("@")[0] if "@" in mail else None
+
+
+TEHRAN_S = 12600  # the page's calendar is Tehran's: +03:30
+
+
+def tday(t):
+    return time.strftime("%Y-%m-%d", time.gmtime(t + TEHRAN_S))
+
+
+def tday_start(day):
+    return calendar.timegm(time.strptime(day, "%Y-%m-%d")) - TEHRAN_S
 
 
 def mask_log(line):
@@ -577,6 +589,15 @@ class Collector:
                 break
         self.set_meta("logins_page", str(back + 3 if back else 0))
 
+    def logins_daily(self, frm=None, to=None):
+        """Password logins per Tehran day."""
+        end = to or time.time()
+        out = {}
+        for x in self.rows("SELECT strftime('%Y-%m-%d', ts, 'unixepoch', '+210 minutes') d, sum(result='ok') ok, sum(result!='ok') bad FROM logins WHERE ts>=? AND ts<=? GROUP BY d",
+                           (frm or end - 30 * 86400, end)):
+            out[x["d"]] = {"ok": x["ok"], "failed": x["bad"]}
+        return out
+
     def logins(self, frm=None, to=None):
         """Failed logins over the platform in the range: who is being tried, and how much."""
         end = to or time.time()
@@ -730,7 +751,100 @@ class Collector:
         start = self.cached("prom_start", 3600, lambda: next((float(s["value"][1]) for s in self.prom("prometheus_tsdb_lowest_timestamp_seconds")), None))
         real = max(frm, start) if start else frm
         real = min(real, to - 60)
-        return {"from": frm, "to": to, "real_from": real, "data_from": start, "cut": bool(start and frm < start - 3600), "secs": int(to - real), "hours": (to - real) / 3600}
+        first = self.one("SELECT min(day) d FROM daily WHERE scope='cluster'")["d"]
+        covered = min(real, tday_start(first)) if first else real  # the station's daily history reaches further back than Prometheus
+        d1, d2 = self.hist_days(frm, real)
+        n = self.one("SELECT count(DISTINCT day) n FROM daily WHERE scope='cluster' AND day>=? AND day<=?", (d1, d2))["n"]
+        hours = (to - real) / 3600
+        return {"from": frm, "to": to, "real_from": real, "data_from": covered, "cut": frm < covered - 3600, "secs": int(to - real), "hours": hours,
+                "hist_hours": n * 24, "all_hours": hours + n * 24, "hist": (d1, d2)}
+
+    @staticmethod
+    def hist_days(frm, real):
+        """The whole Tehran days of the range that ended before Prometheus's history starts."""
+        return tday(frm + (86400 - (frm + TEHRAN_S) % 86400) % 86400), tday(real - 86400)
+
+    def day_rows(self, start, end):
+        """One day's usage: [(scope, name, metric, value)]. Key rows are named '<user>\\t<alias>'."""
+        span, at, out = "%ds" % int(end - start), int(end), []
+        q = lambda query: self.prom(query, at)
+        one = lambda query: next((float(s["value"][1]) for s in q(query)), 0.0)
+        for metric, query in (("cpu_h", 'sum by (namespace) (increase(container_cpu_usage_seconds_total{container!=""}[%s])) / 3600' % span),
+                              ("mem_gib", 'sum by (namespace) (avg_over_time((sum by (namespace) (container_memory_working_set_bytes{container!=""}))[%s:15m])) / 1073741824' % span),
+                              ("gpu_h", GPU_HELD_H % ('namespace!=""', span)),
+                              ("gpu_util", 'avg by (namespace) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{namespace!=""}[%s]))' % span),
+                              ("net_gb", "sum by (namespace) (increase(container_network_receive_bytes_total[%s])) / 1000000000" % span)):
+            out += [("ns", s["metric"]["namespace"], metric, float(s["value"][1])) for s in q(query) if s["metric"].get("namespace")]
+        for metric, m in (("requests", "litellm_proxy_total_requests_metric_total"), ("failed", "litellm_proxy_failed_requests_metric_total"),
+                          ("tokens", "litellm_total_tokens_metric_total"), ("spend", "litellm_spend_metric_total")):
+            for s in q("sum by (api_key_alias, user_email) (increase(%s[%s]))" % (m, span)):
+                who, alias = self.key_owner(s["metric"]), s["metric"].get("api_key_alias") or "None"
+                if who and float(s["value"][1]):
+                    out.append(("key", who + "\t" + alias, metric, float(s["value"][1])))
+        for metric, m in (("calls", "litellm_proxy_total_requests_metric_total"), ("failed", "litellm_proxy_failed_requests_metric_total")):
+            out += [("model", s["metric"]["requested_model"], metric, float(s["value"][1])) for s in q("sum by (requested_model) (increase(%s[%s]))" % (m, span))
+                    if s["metric"].get("requested_model") not in (None, "None") and float(s["value"][1])]
+        busy = {}
+        for s in q('avg by (pod) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{pod=~"model-.*"}[%s]))' % span):
+            busy[s["metric"]["pod"][len("model-"):].rsplit("-", 2)[0]] = float(s["value"][1])
+        out += [("model", name, "gpu_avg", v) for name, v in busy.items()]
+        running = '* on (namespace,pod) group_left () (kube_pod_status_phase{phase="Running"} == 1)'
+        util = [float(s["value"][1]) for s in q("avg by (UUID) (avg_over_time(DCGM_FI_DEV_GPU_UTIL[%s]))" % span)]
+        for metric, value in (("gpu_total", one('sum(kube_node_status_allocatable{resource="nvidia_com_gpu"})')),
+                              ("gpu_held", one('avg_over_time((sum(kube_pod_container_resource_requests{resource="nvidia_com_gpu"} %s))[%s:15m])' % (running, span))),
+                              ("gpu_busy", sum(util) / len(util) if util else 0),
+                              ("cpu_total", one('sum(kube_node_status_allocatable{resource="cpu"})')),
+                              ("cpu_used", one('sum(rate(container_cpu_usage_seconds_total{container!=""}[%s]))' % span)),
+                              ("cpu_reserved", one('avg_over_time((sum(kube_pod_container_resource_requests{resource="cpu"} %s))[%s:15m])' % (running, span))),
+                              ("mem_total", one('sum(kube_node_status_allocatable{resource="memory"})') / 1024 ** 3),
+                              ("mem_used", one('avg_over_time((sum(container_memory_working_set_bytes{container!=""}))[%s:15m])' % span) / 1024 ** 3),
+                              ("mem_reserved", one('avg_over_time((sum(kube_pod_container_resource_requests{resource="memory"} %s))[%s:15m])' % (running, span)) / 1024 ** 3)):
+            out.append(("cluster", "all", metric, value))
+        return out
+
+    def save_daily(self, t):
+        """Every finished Tehran day is saved once, so history outlives Prometheus's ~10 days. A few days per round, oldest first:
+        the first run also saves every whole day Prometheus still holds. Very little data: kept for good."""
+        if not self.integrations()["grafana"]:
+            return
+        start = self.cached("prom_start", 3600, lambda: next((float(s["value"][1]) for s in self.prom("prometheus_tsdb_lowest_timestamp_seconds")), None))
+        if not start:
+            return
+        day, today, done = tday(start + 86400), tday(t), 0
+        while day < today and done < 3:
+            if not self.meta("daily:" + day):
+                begin = tday_start(day)
+                rows = self.day_rows(begin, begin + 86400)
+                with self.lock:
+                    self.conn.executemany("INSERT OR REPLACE INTO daily VALUES (?, ?, ?, ?, ?)", [(day,) + r for r in rows])
+                    self.conn.commit()
+                self.set_meta("daily:" + day, str(t))
+                done += 1
+            day = tday(tday_start(day) + 86400 + 3600)
+
+    def daily(self, scope, frm=None, to=None):
+        """Per Tehran day in the range: {"days": [...], "rows": {day: {name: {metric: value}}}, "partial": today's day or None}.
+        Today has no saved row yet: it comes live from Prometheus, so far. Key rows are summed per user."""
+        end = to or time.time()
+        frm = frm or end - 30 * 86400
+        d1, d2, today = tday(frm), tday(end), tday(time.time())
+        rows = {}
+
+        def put(day, name, metric, value):
+            if scope == "key":
+                name = name.split("\t", 1)[0]
+            cell = rows.setdefault(day, {}).setdefault(name, {})
+            cell[metric] = cell.get(metric, 0) + value
+        for r in self.rows("SELECT day, name, metric, value FROM daily WHERE scope=? AND day>=? AND day<=?", (scope, d1, d2)):
+            put(r["day"], r["name"], r["metric"], r["value"])
+        partial = None
+        if d2 == today and self.integrations()["grafana"]:
+            live = self.cached("day_today:%s" % today, 300, lambda: self.day_rows(tday_start(today), time.time())) or []
+            for s, name, metric, value in live:
+                if s == scope:
+                    put(today, name, metric, value)
+                    partial = today
+        return {"days": sorted(rows), "rows": rows, "partial": partial}
 
     def usage(self, frm=None, to=None):
         """Per user in a date range, from Grafana's Prometheus: LLM calls/tokens/spend/failures per key, CPU core-hours, GPU-hours and
@@ -778,6 +892,20 @@ class Collector:
                     row(s["metric"]["namespace"][5:])[what] += float(s["value"][1])
             for s in self.prom('avg by (namespace) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{namespace=~"user-.*"}[%s]))' % span, at):
                 row(s["metric"]["namespace"][5:])["gpu_util"] = round(float(s["value"][1]), 1)
+            d1, d2 = w["hist"]  # days older than Prometheus: from the daily history
+            for x in self.rows("SELECT name, metric, sum(value) v FROM daily WHERE scope='key' AND day>=? AND day<=? GROUP BY name, metric", (d1, d2)):
+                who, alias = x["name"].split("\t", 1)
+                r = row(who)
+                r[x["metric"]] += x["v"]
+                k = r["keys"].setdefault(alias, {"hash": "", "requests": 0, "tokens": 0, "spend": 0, "failed": 0})
+                k[x["metric"]] += x["v"]
+            for ns, h, u in self.ns_history(d1, d2, 'user-%'):
+                r = row(ns[5:])
+                held = r["gpu_h"]
+                r["gpu_util"] = round((r.get("gpu_util", 0) * held + u * h) / (held + h), 1) if held + h else r.get("gpu_util")
+                r["gpu_h"] = held + h
+            for x in self.rows("SELECT name, sum(value) v FROM daily WHERE scope='ns' AND metric='cpu_h' AND name LIKE 'user-%' AND day>=? AND day<=? GROUP BY name", (d1, d2)):
+                row(x["name"][5:])["cpu_h"] += x["v"]
             for r in users.values():
                 for d in [r] + list(r["keys"].values()):
                     # a share of all calls, so it can never pass 100 %
@@ -790,6 +918,18 @@ class Collector:
             return {"from": w["data_from"], "users": users}
         return self.cached("usage:%d:%d" % (w["from"] // 300, w["to"] // 300), 300, fetch) or {}
 
+    def ns_history(self, d1, d2, like="%"):
+        """(namespace, GPU hours, how busy they were, weighted by those hours) over saved days."""
+        got = {}
+        for x in self.rows("SELECT day, name, metric, value FROM daily WHERE scope='ns' AND metric IN ('gpu_h','gpu_util') AND name LIKE ? AND day>=? AND day<=?", (like, d1, d2)):
+            got.setdefault((x["day"], x["name"]), {})[x["metric"]] = x["value"]
+        out = {}
+        for (_, ns), v in got.items():
+            h, u = v.get("gpu_h", 0), v.get("gpu_util", 0)
+            a = out.setdefault(ns, [0, 0])
+            a[0], a[1] = a[0] + h, a[1] + u * h
+        return [(ns, h, b / h if h else 0) for ns, (h, b) in out.items()]
+
     def resources(self, frm=None, to=None):
         """The whole cluster: what we have, what holds it now, how busy it is, and every namespace's share over the range."""
         if not self.integrations()["grafana"]:
@@ -801,7 +941,10 @@ class Collector:
         def fetch():
             gpu_req = 'kube_pod_container_resource_requests{resource="nvidia_com_gpu"} * on (namespace,pod) group_left () (kube_pod_status_phase{phase="%s"} == 1)'
             total = {r: one('sum(kube_node_status_allocatable{resource="%s"})' % r) for r in ("nvidia_com_gpu", "cpu", "memory")}
-            hours, gib = max(w["hours"], 1 / 60), 1024 ** 3
+            hours, gib = max(w["all_hours"], 1 / 60), 1024 ** 3
+            d1, d2 = w["hist"]
+            hist = {x["metric"]: x["v"] for x in self.rows("SELECT metric, avg(value) v FROM daily WHERE scope='cluster' AND day>=? AND day<=? GROUP BY metric", (d1, d2))}
+            blend = lambda value, metric: (value * w["hours"] + hist.get(metric, value) * w["hist_hours"]) / max(w["all_hours"], 1 / 60)  # weighted by hours
             cards = {}  # one row per physical GPU; a GPU with no pod has no pod label
             for s in self.prom("DCGM_FI_DEV_GPU_UTIL"):
                 m = s["metric"]
@@ -828,6 +971,16 @@ class Collector:
                     ns = s["metric"].get("namespace")
                     if ns:
                         row(ns)[field] = round(float(s["value"][1]), 1)
+            for x in self.rows("SELECT name, metric, sum(value) v FROM daily WHERE scope='ns' AND metric IN ('cpu_h','net_gb') AND day>=? AND day<=? GROUP BY name, metric", (d1, d2)):
+                row(x["name"])[x["metric"]] = round(row(x["name"])[x["metric"]] + x["v"], 1)
+            for x in self.rows("SELECT name, avg(value) v FROM daily WHERE scope='ns' AND metric='mem_gib' AND day>=? AND day<=? GROUP BY name", (d1, d2)):
+                r = row(x["name"])
+                r["mem_gib"] = round((r["mem_gib"] * w["hours"] + x["v"] * w["hist_hours"]) / max(w["all_hours"], 1 / 60), 1)
+            for ns, h, u in self.ns_history(d1, d2):
+                r = row(ns)
+                total_h = r["gpu_h"] + h
+                r["gpu_util"] = round(((r["gpu_util"] or 0) * r["gpu_h"] + u * h) / total_h, 1) if total_h else r["gpu_util"]
+                r["gpu_h"] = round(total_h, 1)
             for r in rows.values():
                 r["cpu_pct"] = round(100 * r["cpu_h"] / (total["cpu"] * hours), 1) if total["cpu"] else None
                 r["gpu_pct"] = round(100 * r["gpu_h"] / (total["nvidia_com_gpu"] * hours), 1) if total["nvidia_com_gpu"] else None
@@ -837,13 +990,13 @@ class Collector:
             return {"window": w, "gpus": sorted(cards.values(), key=lambda c: (str(c["node"]), int(c["gpu"] or 0))),
                     "gpu": {"total": total["nvidia_com_gpu"], "held": held, "waiting": one("sum(%s)" % (gpu_req % "Pending")),
                             "busy_now": round(sum(c["util"] for c in cards.values()) / len(cards), 1) if cards else None,
-                            "busy_avg": round(sum(util) / len(util), 1) if util else None,
-                            "held_avg_pct": round(100 * one("avg_over_time((sum(%s))[%s:15m])" % (gpu_req % "Running", span), at) / total["nvidia_com_gpu"], 1) if total["nvidia_com_gpu"] else None},
+                            "busy_avg": round(blend(sum(util) / len(util), "gpu_busy"), 1) if util else None,
+                            "held_avg_pct": round(100 * blend(one("avg_over_time((sum(%s))[%s:15m])" % (gpu_req % "Running", span), at), "gpu_held") / total["nvidia_com_gpu"], 1) if total["nvidia_com_gpu"] else None},
                     "cpu": {"total": total["cpu"], "used_now": round(one('sum(rate(container_cpu_usage_seconds_total{container!=""}[5m]))'), 1),
-                            "used_avg": round(one('sum(rate(container_cpu_usage_seconds_total{container!=""}[%s]))' % span, at), 1),
+                            "used_avg": round(blend(one('sum(rate(container_cpu_usage_seconds_total{container!=""}[%s]))' % span, at), "cpu_used"), 1),
                             "requested": round(one('sum(kube_pod_container_resource_requests{resource="cpu"} * on (namespace,pod) group_left () (kube_pod_status_phase{phase="Running"} == 1))'), 1)},
                     "mem": {"total": round(total["memory"] / gib, 1), "used_now": round(one('sum(container_memory_working_set_bytes{container!=""})') / gib, 1),
-                            "used_avg": round(one('avg_over_time((sum(container_memory_working_set_bytes{container!=""}))[%s:15m])' % span, at) / gib, 1),
+                            "used_avg": round(blend(one('avg_over_time((sum(container_memory_working_set_bytes{container!=""}))[%s:15m])' % span, at) / gib, "mem_used"), 1),
                             "requested": round(one('sum(kube_pod_container_resource_requests{resource="memory"} * on (namespace,pod) group_left () (kube_pod_status_phase{phase="Running"} == 1))') / gib, 1)},
                     "namespaces": sorted(rows.values(), key=lambda r: (-r["gpu_h"], -r["cpu_h"]))}
         return self.cached("resources:%d:%d" % (w["from"] // 300, w["to"] // 300), 300, fetch) or {}
@@ -987,7 +1140,7 @@ class Collector:
                 except Exception as e:
                     errors.append("%s: %s" % (ns, probe.err(e)))
         self.hosts = {h: ns for ns, inv in self.inv.items() for k, v in inv.items() if v["kind"] == "Ingress" for h in v["hosts"]}
-        for step in ([self.check_probe] + ([self.scan_logs, self.test_models, self.check_llm_keys, self.refresh_keys, self.backfill_ticket_spend, self.refresh_logins, self.refresh_tasks, self.data_check] if slow else []) + [self.judge_changes]):
+        for step in ([self.check_probe] + ([self.scan_logs, self.test_models, self.check_llm_keys, self.refresh_keys, self.backfill_ticket_spend, self.refresh_logins, self.refresh_tasks, self.data_check, self.save_daily] if slow else []) + [self.judge_changes]):
             try:
                 step(t)
             except Exception as e:
@@ -1621,6 +1774,8 @@ class Collector:
             for s in self.prom('avg by (pod) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{pod=~"model-.*"}[%s]))' % span, at):
                 name = s["metric"]["pod"][len("model-"):].rsplit("-", 2)[0]  # model-<name>-<replicaset>-<pod>
                 row(name)["gpu_avg"] = round(float(s["value"][1]), 1)
+            for x in self.rows("SELECT name, metric, sum(value) v FROM daily WHERE scope='model' AND metric IN ('calls','failed') AND day>=? AND day<=? GROUP BY name, metric", w["hist"]):
+                row(x["name"])[x["metric"]] += round(x["v"])
             for r in out.values():
                 r["fail_pct"] = round(100 * min(r["failed"], r["calls"]) / r["calls"], 1) if r["calls"] else None
             return out
@@ -1714,8 +1869,10 @@ class Collector:
             if k:
                 c[k] += 1
             c["last"] = max(c["last"], x["last"] or 0)
+        day = self.daily("key", frm, end)
         for r in rows:
             r["use"], r["sso"], r["login"], r["train"] = use.get(r["user"]), sso.get(r["user"]), logins.get(r["user"]), train.get(r["user"])
+            r["spark"] = [round(day["rows"].get(d, {}).get(r["user"], {}).get("requests", 0)) for d in day["days"]]
             p = next((p for p in people if r["user"] in p["users"]), None)
             r["person"] = p and {"name": p["name"], "users": p["users"], "remove": bool(p.get("remove"))}
         # one person's namespaces next to each other (Avir: aviraip, aviraip2)

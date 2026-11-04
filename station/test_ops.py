@@ -602,6 +602,48 @@ col.data_check(T3 + 60)
 assert col.checks["at"] == n_checks   # once an hour
 for k in ("LITELLM_READ_URL", "LITELLM_READ_KEY"):
     os.environ.pop(k)
+# daily history: a finished Tehran day is saved once, today comes live, and days older than Prometheus still count in a range
+base_day = "2026-10-20"
+START = ops.tday_start(base_day)
+def day_prom(q, at=None):
+    v = lambda x, **m: [{"metric": m, "value": [0, str(x)]}]
+    if "tsdb_lowest" in q: return v(START + 3600)     # a part of the 20th is gone, so the 20th is not saved
+    if q.startswith("sum by (namespace) (increase(container_cpu"): return v(24, namespace="user-uni")
+    if q.startswith("sum by (namespace) (sum_over_time"): return v(12, namespace="user-uni")
+    if 'avg by (namespace) (avg_over_time(DCGM' in q: return v(50, namespace="user-uni")
+    if "sum by (api_key_alias, user_email) (increase(litellm_proxy_total" in q: return v(100, api_key_alias="uni-k9")
+    if "sum by (api_key_alias, user_email) (increase(litellm_proxy_failed" in q: return v(4, api_key_alias="uni-k9")
+    if "sum by (requested_model) (increase(litellm_proxy_total" in q: return [{"metric": {"requested_model": "m1"}, "value": [0, "100"]}]
+    if 'allocatable{resource="nvidia_com_gpu"}' in q: return v(10)
+    if 'allocatable{resource="cpu"}' in q: return v(100)
+    if 'allocatable{resource="memory"}' in q: return v(1024 ** 3 * 200)
+    if "avg by (UUID)" in q: return v(20, UUID="g1")
+    return []
+col.prom, col.cache = day_prom, {}
+col.save_daily(START + 3 * 86400 + 60)    # the 21st and 22nd have ended; the 23rd is today
+saved = sorted(r["day"] for r in col.rows("SELECT DISTINCT day FROM daily"))
+assert saved == ["2026-10-21", "2026-10-22"], saved
+n_rows = col.one("SELECT count(*) n FROM daily")["n"]
+col.save_daily(START + 3 * 86400 + 90)    # already saved: nothing new
+assert col.one("SELECT count(*) n FROM daily")["n"] == n_rows
+d_ = col.daily("cluster", START, START + 3 * 86400)
+assert d_["days"] == saved and d_["rows"]["2026-10-21"]["all"]["gpu_total"] == 10 and d_["rows"]["2026-10-22"]["all"]["gpu_busy"] == 20, d_
+k_ = col.daily("key", START, START + 3 * 86400)
+assert k_["rows"]["2026-10-21"]["uni"]["requests"] == 100 and k_["rows"]["2026-10-21"]["uni"]["failed"] == 4, k_
+# later Prometheus has forgotten those days: the range still counts them, and divides by those hours too
+LATE = START + 40 * 86400
+late_prom = lambda q, at=None: [{"metric": {}, "value": [0, str(LATE - 3600)]}] if "tsdb_lowest" in q else []
+col.prom, col.cache = late_prom, {}
+u_ = col.usage(START, LATE)["users"]["uni"]
+assert u_["requests"] == 200 and u_["failed"] == 8 and u_["fail_pct"] == 4.0 and u_["cpu_h"] == 48 and u_["gpu_h"] == 24 and u_["gpu_util"] == 50.0, u_
+w_ = col.window(START, LATE)
+assert w_["hist_hours"] == 48 and w_["data_from"] == ops.tday_start("2026-10-21") and w_["cut"], w_
+r_ = next(x for x in col.resources(START, LATE)["namespaces"] if x["ns"] == "user-uni")
+assert r_["cpu_h"] == 48 and r_["gpu_h"] == 24, r_
+with col.lock:
+    col.conn.execute("DELETE FROM daily")
+    col.conn.execute("DELETE FROM meta WHERE k LIKE 'daily:%'")
+    col.conn.commit()
 col.prom, col.cache = saved_prom, {}
 # task log: only tasks we know, masked
 col.task_rows = {"at": 1, "rows": [{"id": "t1", "user": "u"}]}

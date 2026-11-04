@@ -171,13 +171,17 @@ class Handler(BaseHTTPRequestHandler):
             res = COL.resources(frm, to) if frm else {}  # the Logs page reads this too, and needs no usage
             return dict(COL.services(ns), use=next((r for r in res.get("namespaces", []) if r["ns"] == ns), None), range=res.get("window"))
         if what == "users":
-            return {"rows": COL.users(frm, to), "range": COL.window(frm, to) if COL.integrations()["grafana"] else None}
+            return {"rows": COL.users(frm, to), "days": COL.daily("key", frm, to)["days"], "range": COL.window(frm, to) if COL.integrations()["grafana"] else None}
         if what == "user":
             return COL.user(name(q, "name"), frm, to)
         if what == "keys":
             return COL.keys()
+        if what == "daily":
+            if q.get("scope") not in ("cluster", "ns", "key", "model"):
+                raise BadRequest("bad scope")
+            return COL.daily(q["scope"], frm, to)
         if what == "logins":
-            return COL.logins(frm, to)
+            return dict(COL.logins(frm, to), daily=COL.logins_daily(frm, to))
         if what == "tasks":
             return COL.tasks(frm, to)
         if what == "task_log":
