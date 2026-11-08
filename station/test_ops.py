@@ -792,3 +792,34 @@ assert "AI: missing time" in col.ticket(7)["answers"]["q1"]["answer"] and col.ti
 for k in ("TICKETS_URL", "TICKETS_USER", "TICKETS_PASSWORD", "AI_URL", "AI_KEY", "AI_MODEL"):
     os.environ.pop(k)
 print("ok (tickets)")
+
+# one user's activity: Prometheus buckets, pod time spans, a burst of wrong passwords as one event
+NOW = time.time() // 3600 * 3600
+col.cache.clear()
+def act_prom(q, at=None, rng=None):
+    if "tsdb_lowest" in q:
+        return [{"metric": {}, "value": [0, str(NOW - 30 * 86400)]}]
+    if not rng:
+        return []
+    pts = list(range(rng[0], rng[1] + 1, rng[2]))[-3:]
+    if "kube_pod_status_phase{namespace=~" in q and "max by" in q:
+        return [{"metric": {"namespace": "user-uni", "pod": "uni-agent-1", "phase": "Pending"}, "values": [[t, "1"] for t in pts[:2]]},
+                {"metric": {"namespace": "user-uni", "pod": "uni-agent-1", "phase": "Running"}, "values": [[pts[2], "1"]]}]
+    if "total_requests" in q and "uni-.*" in q:
+        return [{"metric": {}, "values": [[pts[-1], "40"]]}]
+    if "failed_requests" in q:
+        return [{"metric": {}, "values": [[pts[-1], "30"]]}]
+    return []
+col.prom = act_prom
+col.integrations = lambda: {"grafana": True, "casdoor": False, "mlops": False, "keys": False, "langfuse": False, "litellm": False, "tickets": False, "ai": False, "gitlab": False}
+for i in range(5):
+    col.exec("INSERT INTO logins VALUES (?, ?, ?, ?)", ("act-%d" % i, NOW - 7200 + i * 30, "uni", "wrong password"))
+a = col.activity("uni", NOW - 86400, NOW)
+assert "error" not in a, a
+assert [b["calls"] for b in a["buckets"] if b["calls"]] == [40] and a["buckets"][-1]["failed"] == 30, a["buckets"][-3:]
+assert [p["phase"] for p in a["pods"]] == ["Pending", "Running"] and a["pods"][0]["to"] - a["pods"][0]["from"] == 7200, a["pods"]
+logins = [e for e in a["events"] if e["kind"] == "login"]
+assert [e["text"] for e in logins if e["bad"] and e["ts"] == NOW - 7200] == ["Wrong password ×5"], logins
+assert any(e["kind"] == "llm" and e["bad"] for e in a["events"]) and any(e["kind"] == "pod" and "waited 2 h" in e["text"] for e in a["events"]), a["events"]
+assert ops.dur(3 * 86400 + 4 * 3600) == "3 d 4 h" and ops.dur(600) == "10 min"
+print("ok (activity)")

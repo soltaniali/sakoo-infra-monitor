@@ -494,6 +494,15 @@ const LOCKED_USER = [  // what our access still cannot show (2026-10-31: kubecon
 ];
 // LLM usage comes from Grafana's Prometheus (LiteLLM counters per key) once a Grafana login is set
 const userLocked = () => LOCKED_USER.filter(l => !(l.key === 'llm' && me.integrations.grafana) && !(l.key === 'failed-login' && me.integrations.casdoor) && !(l.key === 'train' && me.integrations.mlops));
+const llmLog = (lg, err) => !lg ? (err ? h('div', {class: 'card err small'}, 'Langfuse: ' + err) : '') : [
+  h('div', {class: 'card'}, h('b', {}, 'Per model'), table([['Model', m => m.model], ['Level', m => m.level === 'ERROR' ? h('span', {class: 'err'}, 'error') : 'ok'],
+    ['Requests', m => m.count], ['Tokens', m => m.tokens], ['p95 latency', m => (m.p95_ms / 1000).toFixed(1) + ' s']], lg.models),
+    h('b', {}, 'Errors · ' + lg.errors.reduce((n, e) => n + e.count, 0) + (lg.errors.length ? ' (last 50 grouped)' : '')),
+    table([['Error', e => h('span', {class: 'small', dir: 'auto'}, e.error)], ['Times', e => e.count], ['Model', e => e.model || '–'], ['Key', e => e.key || '–'],
+      ['Last', e => T(e.last)]], lg.errors),
+    h('b', {}, 'Last requests'), table([['Time', r => T(r.ts)], ['Model', r => r.model || '–'], ['Key', r => r.key || '–'],
+      ['Result', r => r.level === 'ERROR' ? h('span', {class: 'err small'}, r.status || 'error') : 'ok'], ['Latency', r => r.latency_s == null ? '–' : r.latency_s.toFixed(1) + ' s'],
+      ['Tokens', r => r.tokens == null ? '–' : r.tokens]], lg.recent))];
 const big = n => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e4 ? Math.round(n / 1e3) + 'k' : String(n);
 const llmCell = u => !u || !u.requests ? '–' : [big(u.requests) + ' calls · ' + big(u.tokens) + ' tok · $' + u.spend,
   u.failed ? h('span', {class: 'err'}, ' · ' + u.fail_pct + ' % failed') : ''];
@@ -651,13 +660,164 @@ function userCharts(who, ud) {
   return out.length ? charts(out) : '';
 }
 
+// --- one user's activity: every lane on one time line, then the same as a list, day by day --------------------------
+const hmFmt = new Intl.DateTimeFormat('en-GB', {timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: false});
+const wdFmt = new Intl.DateTimeFormat('en-GB', {timeZone: 'UTC', weekday: 'long', day: '2-digit', month: 'long', year: 'numeric'});
+const hm = t => hmFmt.format(new Date(t * 1000));
+const tdayOf = t => new Date((t + 12600) * 1000).toISOString().slice(0, 10);  // Tehran day
+const ACT_KIND = {login: 'Sign-in', llm: 'LLM', task: 'Training', pod: 'Pod', problem: 'Problem', change: 'Change', key: 'Key', ticket: 'Ticket'};
+const TASK_COL = {in_progress: COL(1), completed: COL(3), failed: 'var(--bad)', stopped: COL(4), queued: COL(4)};
+const POD_COL = {Running: COL(1), Pending: COL(4), Failed: 'var(--bad)'};
+const PH_NAME = {Running: 'running', Pending: 'waiting to start', Failed: 'failed'};
+const durTxt = s => s >= 86400 ? Math.floor(s / 86400) + ' d ' + Math.floor(s % 86400 / 3600) + ' h' : s >= 3600 ? Math.floor(s / 3600) + ' h ' + Math.floor(s % 3600 / 60) + ' min' : Math.max(1, Math.round(s / 60)) + ' min';
+// rows of non-overlapping bars: [{from, to, ...}] -> each gets .row; at most `max` rows, the rest share the last
+function pack(items, max) {
+  const ends = [];
+  for (const it of [...items].sort((a, b) => a.from - b.from)) {
+    let r = ends.findIndex(e => e <= it.from);
+    if (r < 0) r = ends.length < max ? ends.length : max - 1;
+    ends[r] = Math.max(ends[r] || 0, it.to);
+    it.row = r;
+  }
+  return Math.max(ends.length, 1);
+}
+function activitySummary(a) {
+  const bk = a.buckets, sum = f => bk.reduce((s, b) => s + (b[f] || 0), 0);
+  const calls = sum('calls'), bad = sum('failed'), gpuH = bk.reduce((s, b) => s + (b.gpu || 0) * (b.t1 - b.t0) / 3600, 0);
+  const util = bk.filter(b => b.gpu && b.gpu_util != null), busy = util.length ? util.reduce((s, b) => s + b.gpu_util * b.gpu, 0) / util.reduce((s, b) => s + b.gpu, 0) : null;
+  const cpuH = bk.reduce((s, b) => s + (b.cpu || 0) * (b.t1 - b.t0) / 3600, 0);
+  const ev = k => a.events.filter(e => e.kind === k), logins = ev('login').filter(e => /password/.test(e.text) || /Wrong/.test(e.text));
+  const ts = a.tasks, st = s => ts.filter(x => x.status === s).length;
+  const activeDays = new Set([...bk.filter(b => (b.calls || b.cpu > 0.05) && b.t1 > a.from && b.t0 < a.to).map(b => tdayOf(Math.max(b.t0, a.from))), ...a.events.filter(e => e.ts >= a.from).map(e => tdayOf(e.ts))]).size;
+  const card = (k, v, sub, bad) => h('div', {class: 'stat'}, h('span', {class: 'k'}, k), h('span', {class: 'v' + (bad ? ' err' : '')}, v), sub ? h('span', {class: 'small mut'}, sub) : '');
+  return h('div', {class: 'stats'},
+    card('Active days', activeDays, 'of ' + ((tehranDay(tdayOf(a.to)) - tehranDay(tdayOf(a.from))) / 86400 + 1)),
+    card('LLM calls', compact(calls), calls ? (bad ? Math.round(1000 * bad / calls) / 10 + ' % failed' : 'none failed') + ' · ' + compact(sum('tokens')) + ' tokens' : '', calls && bad / calls > 0.1),
+    card('Trainings', ts.length, ts.length ? [st('in_progress') && st('in_progress') + ' running', st('completed') && st('completed') + ' done', st('failed') && st('failed') + ' failed', st('queued') && st('queued') + ' queued'].filter(Boolean).join(' · ') : '', st('failed') > 0),
+    card('GPU hours held', compact(Math.round(gpuH)), gpuH ? (busy == null ? 'busy % unknown' : Math.round(busy) + ' % busy') : 'no GPU', gpuH && busy != null && busy < 20),
+    card('CPU core-hours', compact(Math.round(cpuH))),
+    card('Sign-ins', logins.filter(e => !e.bad).reduce((s, e) => s + (+(e.text.match(/×(\d+)/) || [0, 1])[1]), 0),
+      logins.some(e => e.bad) ? logins.filter(e => e.bad).reduce((s, e) => s + (+(e.text.match(/×(\d+)/) || [0, 1])[1]), 0) + ' wrong passwords' : '', logins.some(e => e.bad)),
+    card('Problems', ev('problem').length + ev('pod').filter(e => e.bad).length, ev('ticket').length ? ev('ticket').length + (ev('ticket').length > 1 ? ' tickets' : ' ticket') + ' filed' : '', ev('problem').length > 0));
+}
+function timeline(a) {
+  const W = 960, L = 96, R = 14, x0 = a.from, x1 = a.to, X = t => L + (Math.min(Math.max(t, x0), x1) - x0) / (x1 - x0) * (W - L - R);
+  const lanes = [], add = (name, hh, draw) => lanes.push({name, hh, draw});
+  const bk = a.buckets, maxCalls = Math.max(...bk.map(b => b.calls || 0), 1), maxCpu = Math.max(...bk.map(b => b.cpu || 0), 0.01), maxGpu = Math.max(...bk.map(b => (b.gpu || 0) + (b.slices || 0)), 0);
+  const pods = a.pods.filter(p => p.to >= x0 && p.from <= x1).map(p => Object.assign({}, p)), podNames = [...new Set(pods.map(p => p.pod))].slice(0, 6);
+  const tasks = a.tasks.filter(x => (x.from || x.start) && (x.from || x.start) <= x1 && (x.to || x1) >= x0).map(x => Object.assign({}, x, {from: x.from || x.start, to: Math.max(x.to || a.to, (x.from || x.start) + 60)}));
+  const tRows = pack(tasks, 4);
+  add('Sign-ins', 22, (g, y) => a.events.filter(e => e.kind === 'login').forEach(e => g.append(S('rect', {x: X(e.ts) - 1.5, y: y + 4, width: 3, height: 14, rx: 1, fill: e.bad ? 'var(--bad)' : COL(3)}))));
+  add('LLM calls', 56, (g, y, hh) => bk.forEach(b => {
+    if (!b.calls) return;
+    const w = Math.max(1, X(b.t1) - X(b.t0) - 1), tot = hh * b.calls / maxCalls, bad = hh * Math.min(b.failed, b.calls) / maxCalls;
+    g.append(S('rect', {x: X(b.t0), y: y + hh - tot, width: w, height: Math.max(1, tot - bad), fill: COL(1)}));
+    if (bad) g.append(S('rect', {x: X(b.t0), y: y + hh - bad, width: w, height: bad, fill: COL(2)}));
+  }));
+  add('CPU in use', 40, (g, y, hh) => {
+    let d = '';
+    bk.filter(b => b.cpu != null).forEach((b, i) => { d += (i ? 'L' : 'M') + X(b.t0).toFixed(1) + ' ' + (y + hh - hh * b.cpu / maxCpu).toFixed(1) + 'L' + X(b.t1).toFixed(1) + ' ' + (y + hh - hh * b.cpu / maxCpu).toFixed(1); });
+    if (d) g.append(S('path', {d, fill: 'none', stroke: COL(3), 'stroke-width': 1.6}));
+  });
+  if (maxGpu) add('GPUs held', 30, (g, y, hh) => bk.forEach(b => {
+    const n = (b.gpu || 0) + (b.slices || 0);
+    if (n) g.append(S('rect', {x: X(b.t0), y: y + hh - hh * n / maxGpu, width: Math.max(1, X(b.t1) - X(b.t0) - 0.5), height: hh * n / maxGpu, fill: COL(7), 'fill-opacity': b.gpu_util == null ? 0.5 : 0.25 + 0.75 * Math.min(b.gpu_util, 100) / 100}));
+  }));
+  if (tasks.length) add('Trainings', 12 * tRows + 6, (g, y) => tasks.forEach(x => g.append(S('rect', {x: X(x.from), y: y + 3 + 12 * x.row, width: Math.max(3, X(x.to) - X(x.from)), height: 9, rx: 2, fill: TASK_COL[x.status] || COL(5)}, S('title', {}, x.name + ' · ' + x.status)))));
+  if (podNames.length) add('Pods', 12 * podNames.length + 6, (g, y) => pods.filter(p => podNames.includes(p.pod)).forEach(p => g.append(S('rect', {x: X(p.from), y: y + 3 + 12 * podNames.indexOf(p.pod), width: Math.max(2, X(p.to) - X(p.from)), height: 9, rx: 2, fill: POD_COL[p.phase]}, S('title', {}, p.pod + ' · ' + PH_NAME[p.phase])))));
+  add('Problems · tickets', 22, (g, y) => a.events.filter(e => ['problem', 'ticket', 'change', 'key'].includes(e.kind) || (e.kind === 'llm')).forEach(e => {
+    if (e.kind === 'ticket') g.append(S('path', {d: 'M' + X(e.ts) + ' ' + (y + 4) + 'l6 7-6 7-6-7z', fill: COL(5)}));
+    else if (e.kind === 'problem' || e.kind === 'llm') g.append(S('rect', {x: X(e.ts), y: y + 6, width: Math.max(3, X(e.end || a.to) - X(e.ts)), height: 10, rx: 2, fill: 'var(--bad)', 'fill-opacity': e.kind === 'llm' ? 0.6 : 1}));
+    else g.append(S('circle', {cx: X(e.ts), cy: y + 11, r: 3.5, fill: e.kind === 'key' ? COL(6) : COL(4)}));
+  }));
+  const T0 = 6, H = T0 + lanes.reduce((s, l) => s + l.hh + 8, 0) + 22;
+  const svg = S('svg', {viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': 'What this user did over time: ' + lanes.map(l => l.name).join(', ')});
+  // day grid: one line per Tehran midnight; labels thin out on long ranges
+  const days = [];
+  for (let t = tehranDay(tdayOf(x0)) + 86400; t < x1; t += 86400) days.push(t);
+  const span = (x1 - x0) / 86400, every = Math.max(1, Math.ceil(days.length / 10));
+  days.forEach((t, i) => {
+    svg.append(S('line', {class: 'grid', x1: X(t), x2: X(t), y1: T0, y2: H - 20}));
+    if (i % every === 0) svg.append(S('text', {class: 'tick', x: X(t) + 3, y: H - 6}, dayLabel(tdayOf(t))));
+  });
+  if (span <= 2) for (let t = Math.ceil((x0 + 12600) / 10800) * 10800 - 12600; t < x1; t += 10800) if (!days.includes(t)) svg.append(S('text', {class: 'tick', x: X(t), y: H - 6, 'text-anchor': 'middle'}, hm(t)));
+  if (a.prom_from && a.prom_from > x0 + 3600) svg.append(S('rect', {x: L, y: T0, width: X(a.prom_from) - L, height: H - 20 - T0, fill: 'var(--chip)', 'fill-opacity': 0.5}),
+    S('text', {class: 'tick', x: L + 4, y: H - 24}, 'saved daily totals'));
+  let y = T0;
+  for (const l of lanes) {
+    svg.append(S('text', {class: 'tick', x: 0, y: y + Math.min(l.hh, 22) / 2 + 4}, l.name), S('line', {class: 'grid', x1: L, x2: W - R, y1: y + l.hh + 4, y2: y + l.hh + 4}));
+    const g = S('g', {});
+    l.draw(g, y, l.hh);
+    svg.append(g);
+    y += l.hh + 8;
+  }
+  const cross = S('line', {class: 'cross', y1: T0, y2: H - 20, visibility: 'hidden'});
+  svg.append(cross);
+  const tip = h('div', {class: 'ctip', hidden: true});
+  const at = ev => { const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) / r.width * W; return px < L ? null : x0 + (px - L) / (W - L - R) * (x1 - x0); };
+  svg.addEventListener('mousemove', ev => {
+    const t = at(ev);
+    if (t == null || t > x1) { cross.setAttribute('visibility', 'hidden'); tip.hidden = true; return; }
+    const b = bk.find(b => b.t0 <= t && t < b.t1), lo = b ? b.t0 : t - (x1 - x0) / 200, hi = b ? b.t1 : t + (x1 - x0) / 200;
+    const near = a.events.filter(e => e.ts >= lo && e.ts < hi).slice(0, 5);
+    const run = tasks.filter(x => x.from <= t && t <= x.to).map(x => x.name).slice(0, 3), pd = pods.filter(p => p.from <= t && t <= p.to).map(p => p.pod + ' ' + PH_NAME[p.phase]).slice(0, 3);
+    const rows = [];
+    if (b) rows.push({color: COL(1), name: 'LLM calls', value: compact(b.calls) + (b.failed ? ' · ' + compact(b.failed) + ' failed' : '')},
+      {color: COL(3), name: 'CPU', value: b.cpu == null ? '–' : b.cpu.toFixed(2) + ' cores' + (b.mem != null ? ' · ' + b.mem.toFixed(1) + ' GiB' : '')});
+    if (b && (b.gpu || b.slices)) rows.push({color: COL(7), name: 'GPUs held', value: (b.gpu || 0) + (b.slices ? ' + ' + b.slices + ' slice' : '') + (b.gpu_util != null ? ' · ' + Math.round(b.gpu_util) + ' % busy' : '')});
+    if (run.length) rows.push({name: 'Training', value: run.join(', ')});
+    if (pd.length) rows.push({name: 'Pods', value: pd.join(', ')});
+    near.forEach(e => rows.push({color: e.bad ? 'var(--bad)' : '', name: hm(e.ts), value: e.text.slice(0, 60)}));
+    tipFill(tip, b ? fmt(b.t0) + ' – ' + hm(b.t1) : fmt(t), rows.length ? rows : [{name: 'Nothing here', value: ''}]);
+    tip.hidden = false;
+    const r = svg.getBoundingClientRect(), px = (X(t) / W) * r.width;
+    cross.setAttribute('x1', X(t)); cross.setAttribute('x2', X(t)); cross.setAttribute('visibility', 'visible');
+    tip.style.left = (px > r.width * 0.6 ? px - tip.offsetWidth - 10 : px + 10) + 'px';
+  });
+  svg.addEventListener('mouseleave', () => { cross.setAttribute('visibility', 'hidden'); tip.hidden = true; });
+  svg.addEventListener('click', ev => { const t = at(ev); if (t != null && t <= x1 && span > 1.5) { const d = tdayOf(t); setRange({from: d, to: d}); } });
+  svg.style.cursor = span > 1.5 ? 'zoom-in' : 'crosshair';
+  const legend = h('div', {class: 'legend'}, [[COL(1), 'LLM calls'], [COL(2), 'failed'], [COL(3), 'CPU · sign-in ok'], [COL(7), 'GPU held (darker = busier)'],
+    [COL(1), 'training running'], [COL(3), 'training done'], [COL(4), 'waiting / queued'], ['var(--bad)', 'failed / problem'], [COL(5), 'ticket']].map(([c, n]) => h('span', {class: 'key'}, h('i', {style: 'background:' + c}), n)));
+  return h('div', {class: 'card chart'}, legend, h('div', {class: 'plot', style: 'max-width:none'}, svg, tip),
+    h('div', {class: 'small mut'}, span > 1.5 ? 'Click a day to open just that day. Hover for details.' : 'Hover for details. Use the date range above to go back.'));
+}
+function eventList(a, kind) {
+  const ev = a.events.filter(e => !kind || e.kind === kind), byDay = {};
+  for (const e of ev) (byDay[tdayOf(e.ts)] = byDay[tdayOf(e.ts)] || []).push(e);
+  for (const d of Object.keys(a.logs)) if (!kind) byDay[d] = byDay[d] || [];
+  const link = e => e.task ? h('a', {href: '#/tasklog?' + qs({id: e.task})}, 'log') : e.incident ? h('a', {href: '#/incident?' + qs({id: e.incident})}, 'open') : e.ticket ? h('a', {href: '#/ticket?' + qs({id: e.ticket})}, 'open') : '';
+  const days = Object.keys(byDay).filter(d => tehranDay(d) + 86400 > a.from && tehranDay(d) <= a.to).sort().reverse();
+  if (!days.length) return h('div', {class: 'card mut'}, 'Nothing recorded in this range.');
+  return h('div', {}, days.map(d => h('div', {class: 'card actday'},
+    h('div', {class: 'ph'}, h('b', {}, wdFmt.format(new Date(d + 'T12:00:00Z'))), h('span', {class: 'mut small'}, byDay[d].length + ' events'),
+      h('button', {class: 'small', onclick: () => setRange({from: d, to: d})}, 'time line of this day'),
+      (a.logs[d] || []).map(ns => h('a', {class: 'small', href: '#/saved-logs?' + qs({ns})}, 'saved logs · ' + ns))),
+    byDay[d].length ? byDay[d].map(e => h('div', {class: 'ev'}, h('span', {class: 't'}, h('b', {}, hm(e.ts)), e.end && e.end - e.ts > 120 ? h('span', {class: 'abs'}, '→ ' + (tdayOf(e.end) === d ? hm(e.end) : fmt(e.end)) + ' · ' + durTxt(e.end - e.ts)) : ''),
+      h('span', {}, h('span', {class: 'chip ' + (e.bad ? 'bad' : '')}, ACT_KIND[e.kind] || e.kind)), h('span', {dir: 'auto', class: e.bad ? 'err' : ''}, e.text), link(e))) : h('div', {class: 'small mut'}, 'No events; logs were saved this day.'))));
+}
+function activityPanel(a, q) {
+  const kind = q.kind || '', go = k => { location.hash = '#/user?' + qs({name: q.name, kind: k}); };
+  const kinds = [...new Set(a.events.map(e => e.kind))];
+  const single = (a.to - a.from) <= 86400 + 60, day = tdayOf(a.from + 3600);
+  const shift = n => { const t = tehranDay(day) + n * 86400; if (t < Date.now() / 1000) setRange({from: tdayOf(t + 3600), to: tdayOf(t + 3600)}); };
+  return [h('h2', {}, 'What they did · ', fmt(a.from), ' → ', fmt(a.to), single ? [' ', h('button', {onclick: () => shift(-1)}, '◀ day before'), ' ', h('button', {onclick: () => shift(1)}, 'day after ▶')] : ''),
+    h('div', {class: 'card'}, activitySummary(a)), timeline(a),
+    h('div', {class: 'row'}, h('button', {class: kind ? '' : 'primary', onclick: () => go('')}, 'All · ' + a.events.length),
+      kinds.map(k => h('button', {class: kind === k ? 'primary' : '', onclick: () => go(k)}, ACT_KIND[k] + ' · ' + a.events.filter(e => e.kind === k).length))),
+    eventList(a, kind)];
+}
+
 VIEWS.user = async q => {
-  const u = await api('/api/user?' + Rq({name: q.name}));
-  const ud = me.integrations.grafana ? {key: await api('/api/daily?' + Rq({scope: 'key'})), ns: await api('/api/daily?' + Rq({scope: 'ns'}))} : null;
+  const [u, act, dk, dn] = await Promise.all([api('/api/user?' + Rq({name: q.name})), api('/api/activity?' + Rq({name: q.name})).catch(e => ({error: e.message})),
+    me.integrations.grafana ? api('/api/daily?' + Rq({scope: 'key'})) : null, me.integrations.grafana ? api('/api/daily?' + Rq({scope: 'ns'})) : null]);
+  const ud = dk && dn ? {key: dk, ns: dn} : null;
   return h('div', {}, h('p', {}, h('a', {href: '#/users'}, '← users')),
     h('h1', {dir: 'auto'}, u.person ? u.person.name : u.user, u.person ? h('span', {class: 'mut'}, ' · ' + u.user) : '', u.person && u.person.remove ? [' ', h('span', {class: 'chip warn'}, 'marked to delete')] : ''),
     u.person && u.person.users.length > 1 ? h('p', {}, h('span', {class: 'chip group'}, 'one person · ' + u.person.users.length + ' namespaces'), ' other namespaces: ',
       u.person.users.filter(x => x !== u.user).map(x => [h('a', {href: '#/user?' + qs({name: x})}, x), ' '])) : '',
+    !act ? h('div', {class: 'card mut'}, 'Activity could not be read.') : act.error ? h('div', {class: 'card err'}, 'Activity: ' + act.error) : activityPanel(act, q),
+    h('h2', {}, 'Details'),
     u.limit ? [h('h2', {}, 'Compute limit · what their agent may use'), h('div', {class: 'card'}, h('p', {style: 'margin:0 0 6px'}, limitText(u.limit)),
       u.use ? h('div', {class: 'stats'}, [['Peak CPU', peakBar(u.use.cpu_peak, u.limit.cpu, '')], ['Peak RAM', peakBar(u.use.mem_peak, u.limit.mem_gib, ' GiB')]].map(([k, v]) => h('div', {class: 'stat'}, h('span', {class: 'k'}, k), v))) : '')] : '',
     h('h2', {}, 'Sign-in activity (Casdoor)'), h('div', {class: 'card'}, u.sso ? h('div', {class: 'stats'},

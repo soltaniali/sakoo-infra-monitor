@@ -26,6 +26,7 @@ import gzip
 import hashlib
 import hmac
 import json
+import math
 import os
 import queue
 import re
@@ -187,6 +188,12 @@ TEHRAN_S = 12600  # the page's calendar is Tehran's: +03:30
 
 def tday(t):
     return time.strftime("%Y-%m-%d", time.gmtime(t + TEHRAN_S))
+
+
+def dur(secs):
+    """3 d 4 h / 5 h 10 min / 12 min"""
+    m = int(secs // 60)
+    return "%d d %d h" % (m // 1440, m % 1440 // 60) if m >= 1440 else "%d h %d min" % (m // 60, m % 60) if m >= 60 else "%d min" % m
 
 
 def tday_start(day):
@@ -456,8 +463,9 @@ class Collector:
         return self.cached("litellm", 300, lambda: [m["id"] for m in http_json(
             "GET", url, {"Authorization": "Bearer " + os.environ["LITELLM_KEY"]})["data"]])
 
-    def prom(self, query, at=None):
-        """Instant query on Grafana's Prometheus (GET); at = epoch seconds for history, else now."""
+    def prom(self, query, at=None, rng=None):
+        """Instant query on Grafana's Prometheus (GET); at = epoch seconds for history, else now.
+        rng = (start, end, step): a range query; each series then has "values" [[t, v], ...]."""
         g, tok = os.environ["GRAFANA_URL"].rstrip("/"), os.environ.get("GRAFANA_TOKEN")
         # a token, or a normal Grafana login (basic auth works: the login form is on, no SSO)
         auth = {"Authorization": "Bearer " + tok if tok else "Basic " + base64.b64encode(
@@ -473,7 +481,9 @@ class Collector:
             uid = next(d["uid"] for d in ds if d.get("type") == "prometheus")
             self.set_meta("grafana_uid", uid)
         q = "query=" + urllib.parse.quote(query) + ("&time=%d" % at if at else "")
-        return http_json("GET", "%s/api/datasources/proxy/uid/%s/api/v1/query?%s" % (g, uid, q), auth)["data"]["result"]
+        if rng:
+            q = "query=" + urllib.parse.quote(query) + "&start=%d&end=%d&step=%d" % rng
+        return http_json("GET", "%s/api/datasources/proxy/uid/%s/api/v1/%s?%s" % (g, uid, "query_range" if rng else "query", q), auth)["data"]["result"]
 
     def gpu_util(self):
         """{pod name: GPU utilization %} from Grafana's Prometheus (DCGM exporter)."""
@@ -1947,6 +1957,127 @@ class Collector:
                 "incidents": self.rows("SELECT id, ns, obj, symptom, owner, cause, opened, closed, state FROM incidents WHERE ns IN (%s) "
                                        "ORDER BY id DESC LIMIT 50" % q, ns_list),
                 "changes": self.rows("SELECT * FROM changes WHERE ns IN (%s) ORDER BY ts DESC LIMIT 50" % q, ns_list)}
+
+    def activity(self, who, frm=None, to=None):
+        """Everything one user did in the range, on one time line: time buckets (LLM calls, CPU, RAM, GPUs) and events
+        (sign-ins, trainings, pods, problems, tickets, keys). Prometheus gives buckets of 1 h or more; days older than
+        Prometheus come from the daily history, one bucket per day. Read only."""
+        now = to or time.time()
+        frm = frm or now - 7 * 86400
+        safe = re.sub(r"[^\w.-]", "", who)
+        ns_list = sorted({ns for ns, _ in self.user_pods().get(who) or []} | {"user-" + safe})
+        on = self.integrations()
+
+        def fetch():
+            buckets, events, pods, tasks_ = {}, [], [], []
+            b = lambda t0, t1: buckets.setdefault(int(t0), {"t0": int(t0), "t1": int(t1), "calls": 0, "failed": 0, "tokens": 0, "cpu": None, "mem": None,
+                                                           "gpu": None, "slices": None, "gpu_util": None})
+            w = self.window(frm, now) if on["grafana"] else None
+            if w and w["real_from"] < now - 600:
+                step = 3600 * max(1, math.ceil((now - w["real_from"]) / 3600 / 168))  # at most ~168 buckets
+                rng = (int(w["real_from"] - w["real_from"] % 3600 + step), int(now), step)
+                sel = 'namespace=~"%s"' % "|".join(n for n in ns_list if n.startswith("user-"))
+                held = 'sum(kube_pod_container_resource_requests{resource%s,%s} * on (namespace,pod) group_left () (kube_pod_status_phase{phase="Running"} == 1))'
+                for field, q in (("calls", 'sum(increase(litellm_proxy_total_requests_metric_total{api_key_alias=~"%s-.*"}[%ds]))' % (safe, step)),
+                                 ("failed", 'sum(increase(litellm_proxy_failed_requests_metric_total{api_key_alias=~"%s-.*"}[%ds]))' % (safe, step)),
+                                 ("tokens", 'sum(increase(litellm_total_tokens_metric_total{api_key_alias=~"%s-.*"}[%ds]))' % (safe, step)),
+                                 ("cpu", 'sum(rate(container_cpu_usage_seconds_total{%s,container!=""}[%ds]))' % (sel, step)),
+                                 ("mem", 'sum(max_over_time(container_memory_working_set_bytes{%s,container!=""}[%ds])) / 1073741824' % (sel, step)),
+                                 ("gpu", held % ('="nvidia_com_gpu"', sel)), ("slices", held % ('=~"nvidia_com_mig.*"', sel)),
+                                 ("gpu_util", 'avg(avg_over_time(DCGM_FI_DEV_GPU_UTIL{%s}[%ds]))' % (sel, step))):
+                    for sr in self.prom(q, rng=rng):
+                        for t, v in sr["values"]:
+                            v = float(v)
+                            if v == v:  # not NaN
+                                b(t - step, t)[field] = round(v) if field in ("calls", "failed", "tokens") else round(v, 2)
+                # each pod: when it ran, waited or failed (a waiting pod holds nothing; often it waits for a GPU)
+                for s2 in (sel, 'namespace="jupyterhub",pod=~"jupyter-%s.*"' % safe):
+                    per = {}
+                    for sr in self.prom('max by (namespace, pod, phase) (kube_pod_status_phase{%s,phase=~"Running|Pending|Failed"} == 1)' % s2, rng=rng):
+                        for t, _ in sr["values"]:
+                            per.setdefault((sr["metric"]["namespace"], sr["metric"]["pod"]), []).append((float(t), sr["metric"]["phase"]))
+                    for (ns, pod), pts in per.items():
+                        seg = None
+                        for t, ph in sorted(pts):
+                            if seg and seg["phase"] == ph and t - seg["to"] <= step * 1.5:
+                                seg["to"] = t
+                                continue
+                            seg = {"ns": ns, "pod": pod, "phase": ph, "from": t - step, "to": t}
+                            pods.append(seg)
+            if w:  # days older than Prometheus
+                d1, d2 = w["hist"]
+                for x in self.rows("SELECT day, metric, sum(value) v FROM daily WHERE scope='key' AND name LIKE ? AND day>=? AND day<=? GROUP BY day, metric",
+                                   (safe + "\t%", d1, d2)):
+                    f = {"requests": "calls", "failed": "failed", "tokens": "tokens"}.get(x["metric"])
+                    if f:
+                        b(tday_start(x["day"]), tday_start(x["day"]) + 86400)[f] = round(x["v"])
+                for x in self.rows("SELECT day, metric, sum(value) v FROM daily WHERE scope='ns' AND name IN (%s) AND day>=? AND day<=? GROUP BY day, metric"
+                                   % ",".join("?" * len(ns_list)), ns_list + [d1, d2]):
+                    f = {"cpu_h": "cpu", "gpu_h": "gpu", "slice_h": "slices", "gpu_util": "gpu_util"}.get(x["metric"])
+                    if f:  # hours in a day -> the day's average
+                        b(tday_start(x["day"]), tday_start(x["day"]) + 86400)[f] = round(x["v"] if f == "gpu_util" else x["v"] / 24, 2)
+            for r in buckets.values():
+                if r["calls"] >= LLM_FAIL_MIN and r["failed"] >= LLM_FAIL_RATE * r["calls"]:
+                    events.append({"ts": r["t0"], "end": r["t1"], "kind": "llm", "bad": True, "text": "%d of %d LLM calls failed" % (r["failed"], r["calls"])})
+            # sign-ins: a burst of the same result within 10 min is one event
+            last = None
+            for x in self.rows("SELECT ts, result FROM logins WHERE user=? AND ts>=? AND ts<=? ORDER BY ts", (who, frm, now)):
+                if last and last["ok"] == (x["result"] == "ok") and x["ts"] - last["end"] <= 600:
+                    last["n"], last["end"] = last["n"] + 1, x["ts"]
+                    continue
+                last = {"ts": x["ts"], "end": x["ts"], "kind": "login", "ok": x["result"] == "ok", "n": 1}
+                events.append(last)
+            for e in events:
+                if e["kind"] == "login":
+                    e.update(bad=not e["ok"], text=("Signed in with password" if e["ok"] else "Wrong password") + (" ×%d" % e["n"] if e["n"] > 1 else ""))
+            sso, sso_from = self.sso().get("users", {}).get(who), self.sso().get("from")
+            if sso and frm <= sso["last"] <= now:
+                events.append({"ts": sso["last"], "kind": "login", "text": "Last request on the platform (%d SSO requests since %s)" % (sso["requests"], tday(sso_from or 0))})
+            for x in self.tasks(frm, now)["tasks"]:
+                if x["user"] != who:
+                    continue
+                end = x["ended"] or (now if x["status"] in ("in_progress", "queued") else x["last"])
+                tasks_.append({"id": x["id"], "name": x["name"], "status": x["status"], "type": x["type"], "from": x["created"], "start": x["started"], "to": end})
+                if x["created"] and x["created"] >= frm:
+                    events.append({"ts": x["created"], "kind": "task", "task": x["id"], "text": "Created %s task “%s”" % (x["type"] or "", x["name"])})
+                if x["status"] in ("completed", "failed", "stopped") and end:
+                    events.append({"ts": end, "kind": "task", "bad": x["status"] == "failed", "task": x["id"],
+                                   "text": "Task “%s” %s" % (x["name"], x["status"]) + (": " + x["reason"] if x["status"] != "completed" and x["reason"] else "")})
+            first = (w or {}).get("real_from", 0) + 3600
+            for p in pods:
+                if p["phase"] == "Pending" and p["to"] - p["from"] >= 3600:
+                    events.append({"ts": p["from"], "end": p["to"], "kind": "pod", "bad": True, "text": "Pod %s waited %s to start (often: no free GPU)" % (p["pod"], dur(p["to"] - p["from"]))})
+                elif p["phase"] == "Running" and p["from"] > first:
+                    events.append({"ts": p["from"], "kind": "pod", "text": "Pod %s started" % p["pod"]})
+                elif p["phase"] == "Failed":
+                    events.append({"ts": p["from"], "kind": "pod", "bad": True, "text": "Pod %s failed" % p["pod"]})
+            q = ",".join("?" * len(ns_list))
+            for i in self.rows("SELECT id, obj, symptom, opened, closed FROM incidents WHERE ns IN (%s) AND opened<=? AND (closed IS NULL OR closed>=?)" % q, ns_list + [now, frm]):
+                events.append({"ts": i["opened"], "end": i["closed"], "kind": "problem", "bad": True, "incident": i["id"], "text": "%s: %s" % (i["symptom"], i["obj"])})
+            for c in self.rows("SELECT ts, type, name, verdict FROM changes WHERE ns IN (%s) AND ts>=? AND ts<=?" % q, ns_list + [frm, now]):
+                events.append({"ts": c["ts"], "kind": "change", "bad": c["verdict"] == "bad", "text": "%s: %s" % (c["type"], c["name"])})
+            for k in self.key_rows["rows"]:
+                if k["user"] == who and k.get("created") and frm <= k["created"] <= now:
+                    events.append({"ts": k["created"], "kind": "key", "text": "LLM key %s created" % k["alias"]})
+            use = self.usage(frm, now).get("users", {}) if on["grafana"] else {}
+            for r in self.rows("SELECT id, data FROM tickets"):
+                d = json.loads(r["data"])
+                u = tickets.ticket_user(self, d, use)[0]
+                if u and (u == who or u.startswith(who + "-")) and d.get("created") and frm <= d["created"] <= now:
+                    events.append({"ts": d["created"], "kind": "ticket", "ticket": r["id"], "text": "Filed ticket #%s: %s" % (d.get("number") or r["id"], d.get("subject") or "")})
+            logs = {}
+            if LOG_DIR.exists():
+                for d in LOG_DIR.iterdir():
+                    have = [n for n in ns_list if (d / n).is_dir()]
+                    if have:
+                        logs[d.name] = have
+            for e in events:
+                e.pop("ok", None)
+                e.pop("n", None)
+            return {"buckets": sorted(buckets.values(), key=lambda r: r["t0"]), "events": sorted(events, key=lambda e: -e["ts"]),
+                    "pods": pods, "tasks": tasks_, "logs": logs, "from": frm, "to": now, "namespaces": ns_list, "prom_from": w and w["real_from"]}
+        key = "act:%s:%d:%d" % (who, frm // 300, now // 300)
+        return self.cached(key, 300, fetch) or {"error": self.integ_err.get(key) or "no data"}
 
     def tickets(self):
         """Support tickets, newest activity first, each with the six answers (computed now, against current data)."""

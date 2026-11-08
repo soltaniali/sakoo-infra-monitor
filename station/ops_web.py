@@ -174,6 +174,8 @@ class Handler(BaseHTTPRequestHandler):
             return {"rows": COL.users(frm, to), "days": COL.daily("key", frm, to)["days"], "range": COL.window(frm, to) if COL.integrations()["grafana"] else None}
         if what == "user":
             return COL.user(name(q, "name"), frm, to)
+        if what == "activity":
+            return COL.activity(name(q, "name"), frm, to)
         if what == "keys":
             return COL.keys()
         if what == "daily":
