@@ -27,7 +27,7 @@ Iran probe station 85.198.48.95 (AIP-IRAN, user mlops, ~/station, Docker)
 
 ## 2. Status snapshot (2026-11-14)
 
-- Remote `github.com/soltaniali/sakoo-infra-monitor`, branch `main`, last pushed commit `2a5705a` (2026-11-14, shared namespaces → MLOps). Uncommitted: new-user alert/tile, GPU holder names.
+- Remote `github.com/soltaniali/sakoo-infra-monitor`, branch `main`, last pushed commit `2a5705a` (2026-11-14, shared namespaces → MLOps). Local commit `233ef77` (new-user alert/tile, GPU holder names) deployed, not pushed.
 - Automation level **L1: diagnose only.** The station kubeconfig can write in
   `aip-mlops-service`; code uses a single GET helper (`ops.kget`). A read-only ServiceAccount was requested from the admins.
 
@@ -64,7 +64,7 @@ No Docker Hub from Iran: build elsewhere, `docker save | gzip`, scp, `docker loa
 
 ## 6. Change log
 
-- 2026-11-14 — new `user-*` namespace = `new-user` change: Telegram alert + overview tile 9; Capacity GPU list names the holder workload/model.
+- 2026-11-14 — new `user-*` namespace = `new-user` change: Telegram alert + overview tile 9; Capacity GPU list names the holder workload/model. `233ef77`, deployed.
 - 2026-11-14 — shared namespaces (gitlab, casdoor, …) assigned to MLOps instead of the namespace name.
 - 2026-11-14 — alerts carry `Assignees:` with exact person names from the asset list; deployed to the station.
 - 2026-11-13 — `AGENTS.md` added.
