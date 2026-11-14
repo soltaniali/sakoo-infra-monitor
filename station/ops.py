@@ -269,7 +269,7 @@ def assignee(owner, obj=None, ctx=None, model=False):
             next((a.get("person") for a in assets for n in names(a) if n and (obj.startswith(n + "-") or n.startswith(obj + "-"))), None)
     if not person and model:
         person = next((a.get("person") for a in assets if a.get("name") == "kubeai"), None)
-    return person or ("MLOps" if owner == "us" else owner)
+    return person or "MLOps"  # shared namespaces (gitlab, casdoor, …) too, until they get an owner (Ali, 2026-11-14)
 
 
 def alertable(ns, owner):

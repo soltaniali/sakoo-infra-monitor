@@ -51,7 +51,7 @@ No Docker Hub from Iran: build elsewhere, `docker save | gzip`, scp, `docker loa
 - Only short alert texts leave Iran (to London/Telegram); logs and inventory stay on the station.
 - Visible text says "AIP", not "Sakoo". Times shown in Tehran time.
 - Owner of every failure is explicit (infra / us / capacity / monitor) — keep that mapping when adding checks.
-- Every alert ends with `Assignees:` (`ops.assignee`): Infra for infra/capacity, else the person from `assets` in `probe-station.json` (name, Service or prefix match; KubeAI models → the `kubeai` person), else MLOps.
+- Every alert ends with `Assignees:` (`ops.assignee`): Infra for infra/capacity, else the person from `assets` in `probe-station.json` (name, Service or prefix match; KubeAI models → the `kubeai` person), else MLOps — also for shared namespaces like gitlab, casdoor (Ali, 2026-11-14).
 - Commits: plain imperative sentence, often prefixed by area (`Ops: …`, `Station: …`, `Dashboard: …`).
 
 ## 5. Traps
@@ -64,6 +64,7 @@ No Docker Hub from Iran: build elsewhere, `docker save | gzip`, scp, `docker loa
 
 ## 6. Change log
 
+- 2026-11-14 — shared namespaces (gitlab, casdoor, …) assigned to MLOps instead of the namespace name.
 - 2026-11-14 — alerts carry `Assignees:` with exact person names from the asset list; deployed to the station.
 - 2026-11-13 — `AGENTS.md` added.
 - 2026-11-14 `ea35e6c` — new station checks (agents, datasets, Grafana, Langfuse, allowed hosts), ops report (fa).

@@ -9,7 +9,7 @@ Read `AGENTS.md` first (layout, commands, rules).
 
 ## Recent changes
 
-- 2026-11-14 — Every OPEN/CLOSED alert ends with `Assignees: <name>` (`ops.assignee`, `Collector.is_model`). Infra/capacity → `Infra`; otherwise the person from `assets` in `station/probe-station.json` by exact asset/Service name, then name prefix; KubeAI models → the `kubeai` asset's person; fallback `MLOps` (owner `us`) or the team name.
+- 2026-11-14 — Every OPEN/CLOSED alert ends with `Assignees: <name>` (`ops.assignee`, `Collector.is_model`). Infra/capacity → `Infra`; otherwise the person from `assets` in `station/probe-station.json` by exact asset/Service name, then name prefix; KubeAI models → the `kubeai` asset's person; fallback `MLOps`, also for shared namespaces like gitlab and casdoor (Ali: "consider them as mlops for now").
 
 ## Open work / next steps
 
