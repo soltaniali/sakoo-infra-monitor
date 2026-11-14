@@ -65,7 +65,7 @@ No Docker Hub from Iran: build elsewhere, `docker save | gzip`, scp, `docker loa
 
 ## 6. Change log
 
-- 2026-11-14 — page data cached 15 min with background refresh + gzip (`ops_web.page_data`); alerts unchanged (60 s rounds). Deployed, not pushed.
+- 2026-11-14 — page data cached 15 min with background refresh + gzip (`ops_web.page_data`); alerts unchanged (60 s rounds). `38666e2`, deployed and pushed.
 - 2026-11-14 — new `user-*` namespace = `new-user` change: Telegram alert + overview tile 9; Capacity GPU list names the holder workload/model. `233ef77`, deployed.
 - 2026-11-14 — shared namespaces (gitlab, casdoor, …) assigned to MLOps instead of the namespace name.
 - 2026-11-14 — alerts carry `Assignees:` with exact person names from the asset list; deployed to the station.
