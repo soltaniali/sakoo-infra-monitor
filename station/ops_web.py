@@ -131,16 +131,40 @@ def page_data(what, q):
     return val
 
 
+PAGE_KEYS = ops.DATA / "page-keys.json"  # which pages were opened: kept over restarts, so a restart starts warm
+WEEK = {"_len": str(7 * 86400)}  # the page's default range
+DEFAULT_PAGES = [("users", WEEK), ("daily", dict(WEEK, scope="key")), ("logins", WEEK), ("tickets", {}), ("capacity", WEEK),
+                 ("daily", dict(WEEK, scope="cluster")), ("models", WEEK), ("daily", dict(WEEK, scope="model")), ("keys", {}),
+                 ("tasks", WEEK), ("trends", WEEK), ("changes", WEEK), ("namespaces", {})]
+
+
 def page_warmer():
-    """Every 15 min, refresh the pages someone opened in the last 2 days, so the next visit is instant."""
+    """At start, compute the default pages and the ones opened before the restart; then every 15 min refresh the pages
+    someone opened in the last 2 days, so a visit is instant."""
+    try:
+        known = [(x["what"], x["q"], x["used"]) for x in json.loads(PAGE_KEYS.read_text())]
+    except (OSError, ValueError, KeyError, TypeError):
+        known = []
+    with page_lock:
+        for what, q, used in [(w, q, time.time()) for w, q in DEFAULT_PAGES] + known:
+            key = what + "?" + urllib.parse.urlencode(sorted(q.items()))
+            pages.setdefault(key, {"at": 0, "val": None, "what": what, "q": q, "used": used, "busy": False})
+    first = True
     while True:
-        time.sleep(60)
+        if not first:
+            time.sleep(60)
+        first = False
         with page_lock:
             for k in [k for k, e in pages.items() if time.time() - e["used"] > 2 * 86400]:
                 del pages[k]
             todo = [k for k, e in pages.items() if time.time() - e["at"] > PAGE_TTL and not e["busy"]]
             for k in todo:
                 pages[k]["busy"] = True
+            keys = [{"what": e["what"], "q": e["q"], "used": e["used"]} for e in pages.values()]
+        try:
+            PAGE_KEYS.write_text(json.dumps(keys))
+        except OSError:
+            pass
         for k in todo:  # one at a time: Prometheus and the VPN are the slow part
             page_refresh(k)
 

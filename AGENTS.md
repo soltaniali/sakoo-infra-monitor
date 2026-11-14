@@ -56,6 +56,7 @@ No Docker Hub from Iran: build elsewhere, `docker save | gzip`, scp, `docker loa
 
 ## 5. Traps
 
+- Prometheus is 3.x: `increase()`/`rate()` drop `__name__`, so never group by `__name__` after them; query each metric apart.
 - Page data is up to 15 min old by design (`ops_web.PAGE_TTL`); add an endpoint to `LIVE` if it must be fresh.
 - VPN accepts no foreign IPs; London cannot reach the cluster; cluster cannot reach Telegram.
 - The Iran host's NTP is blocked: the probe takes its clock from the receiver.
@@ -65,6 +66,7 @@ No Docker Hub from Iran: build elsewhere, `docker save | gzip`, scp, `docker loa
 
 ## 6. Change log
 
+- 2026-11-14 — tickets StopIteration fixed (Prometheus 3 drops `__name__` after `increase()`); page cache warms at start. Deployed.
 - 2026-11-14 — page data cached 15 min with background refresh + gzip (`ops_web.page_data`); alerts unchanged (60 s rounds). `38666e2`, deployed and pushed.
 - 2026-11-14 — new `user-*` namespace = `new-user` change: Telegram alert + overview tile 9; Capacity GPU list names the holder workload/model. `233ef77`, deployed.
 - 2026-11-14 — shared namespaces (gitlab, casdoor, …) assigned to MLOps instead of the namespace name.

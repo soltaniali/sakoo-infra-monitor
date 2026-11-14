@@ -278,6 +278,8 @@ assert call("/api/namespaces?from=%d&to=%d" % (now_ - 86400, now_), cookie=cooki
 first = next(iter(ops_web.pages.values()))["at"]
 assert call("/api/namespaces?from=%d&to=%d" % (now_ - 86400 + 60, now_ + 60), cookie=cookie)[0] == 200
 assert len(ops_web.pages) == 1 and next(iter(ops_web.pages.values()))["at"] == first, ops_web.pages.keys()
+to_ = str(int(time.time() // 900 * 900))  # the page's own "last 7 days" request hits the entry warmed at start
+assert ops_web.page_key("daily", {"from": str(int(to_) - 7 * 86400), "to": to_, "scope": "key"})[0] == "daily?" + urllib.parse.urlencode(sorted(dict(ops_web.WEEK, scope="key").items()))
 req = urllib.request.Request(base + "/ops.js", headers={"Accept-Encoding": "gzip"})
 with opener.open(req, timeout=10) as r:
     assert r.headers["Content-Encoding"] == "gzip" and b"function" in __import__("gzip").decompress(r.read())
@@ -387,8 +389,9 @@ old = dict(rows[0], **dict(d, created=time.time() - 400 * 86400))
 old["messages"] = [dict(d["messages"][0], ts=old["created"])]
 assert tickets.analyze(col, old)["q5"]["answer"].startswith("no data"), tickets.analyze(col, old)["q5"]
 # key usage from LiteLLM's Prometheus counters (Grafana)
-col.prom = lambda q, at=None: [{"metric": {"__name__": "litellm_requests_metric_total", "model": "m1"}, "value": [0, "12"]},
-                               {"metric": {"__name__": "litellm_total_tokens_metric_total", "model": "m1"}, "value": [0, "3400"]}]
+# Prometheus 3 drops __name__ after increase(): one query per metric, no name in the answer
+col.prom = lambda q, at=None: ([{"metric": {"model": "m1"}, "value": [0, "12"]}] if "proxy_total_requests" in q else
+                               [{"metric": {"model": "m1"}, "value": [0, "3400"]}] if "total_tokens" in q else [])
 os.environ.update(GRAFANA_URL="https://g", GRAFANA_TOKEN="t")
 q4 = tickets.analyze(col, dict(rows[0], **d))["q4"]
 assert q4["answer"] == "12 requests, 3400 tokens in 30 days" and q4["locked"] is None, q4
@@ -402,7 +405,7 @@ def fake_prom(q, at=None):
         return [{"metric": {"api_key_alias": "uni-k1", "hashed_api_key": "h1", "model": "m1"}, "value": [0, "1.234"]}]
     if "container_cpu_usage_seconds_total" in q:
         return [{"metric": {"namespace": "user-uni"}, "value": [0, "7.6"]}]
-    if "api_key_alias=~\"uni-.*\"" in q:
+    if "api_key_alias=~\"uni-.*\"" in q and "proxy_total_requests" in q:
         return [{"metric": {"__name__": "litellm_requests_metric_total", "model": "m1"}, "value": [0, "15"]}]
     return []
 col.prom, col.cache = fake_prom, {}

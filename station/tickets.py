@@ -40,8 +40,10 @@ LOCKED = {
 }
 # LiteLLM's Prometheus counters, per API key (label hashed_api_key = sha256 of the key); names differ between versions
 # proxy_total_requests = every call; litellm_requests_metric counts successes only
-USAGE_Q = ('sum by (__name__, model, requested_model) (increase({__name__=~"litellm_(proxy_total_requests|total_tokens|spend|proxy_failed_requests)_metric(_total)?'
-           '|litellm_total_tokens(_total)?", %s}[%s]))')
+# one query per metric: Prometheus 3 drops __name__ after increase(), so a single query cannot tell them apart
+USAGE_Q = {"requests": "litellm_proxy_total_requests_metric(_total)?", "tokens": "litellm_total_tokens(_metric)?(_total)?",
+           "spend": "litellm_spend_metric(_total)?", "failed": "litellm_proxy_failed_requests_metric(_total)?"}
+USAGE_SUM = 'sum by (model, requested_model) (increase({__name__=~"%s", %s}[%s]))'
 PLATFORM_S, PLATFORM_BAD = 1800, 0.3  # platform-wide: 30 min each side of the filing time; a model with >= 30 % failed is "failing"
 USERS_FILE = "ticket-users.json"  # in OPS_DATA, edited by hand: {"requester name on the ticket site": "AIP username" or "key alias"}
 
@@ -62,13 +64,13 @@ def key_usage(col, selectors, at):
     out = []
     for key, sel in selectors:
         for label, rng, when in (("last 30 days", "30d", None), ("24 h around the ticket", "24h", at + 12 * 3600)):
-            rows = col.cached("key:%s:%s" % (sel, label), 900, lambda: col.prom(USAGE_Q % (sel, rng), when)) or []
-            for r in rows:
-                v = float(r["value"][1])
-                if v:
-                    name = r["metric"].get("__name__", "")
-                    out.append({"key": key, "period": label, "model": r["metric"].get("requested_model") or r["metric"].get("model", "?"), "value": round(v, 2),
-                                "metric": next(k for k in ("failed", "tokens", "spend", "requests") if k in name)})
+            for metric, names in USAGE_Q.items():
+                q = USAGE_SUM % (names, sel, rng)
+                for r in col.cached("key:%s:%s:%s" % (sel, label, metric), 900, lambda: col.prom(q, when)) or []:
+                    v = float(r["value"][1])
+                    if v:
+                        out.append({"key": key, "period": label, "model": r["metric"].get("requested_model") or r["metric"].get("model", "?"),
+                                    "value": round(v, 2), "metric": metric})
     return out
 
 
