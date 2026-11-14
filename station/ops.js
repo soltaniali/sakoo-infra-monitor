@@ -62,7 +62,7 @@ let range = {days: 7};
 try { range = JSON.parse(localStorage.getItem('ops-range')) || range; } catch (e) { /* no storage: the default */ }
 const tehranDay = d => Date.parse(d + 'T00:00:00+03:30') / 1000;  // a date picked on the page means a Tehran day
 function rangeNow() {
-  const now = Math.floor(Date.now() / 300000) * 300;  // 5-min steps: the server's cache follows
+  const now = Math.floor(Date.now() / 900000) * 900;  // 15-min steps: the server keeps page data 15 min
   if (range.from && range.to) return {from: tehranDay(range.from), to: Math.min(tehranDay(range.to) + 86399, now)};
   return {from: now - (range.days || 7) * 86400, to: now};
 }

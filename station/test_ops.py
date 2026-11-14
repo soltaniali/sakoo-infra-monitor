@@ -272,6 +272,15 @@ assert call("/api/logs?ns=kube-system&pod=x&container=app", cookie=cookie)[0] ==
 code, body, _ = call("/api/logs?ns=%s&pod=training-api-abc-3&container=app&tail=5" % NS, cookie=cookie)
 assert code == 200 and "redis" in json.loads(body)["text"], body
 assert call("/api/incident?id=%d" % tr["id"], cookie=cookie)[0] == 200
+# page data: computed once, then served from the 15-min cache; a moving range is one entry; big bodies are gzipped
+n_calls, now_ = len(calls), int(time.time())
+assert call("/api/namespaces?from=%d&to=%d" % (now_ - 86400, now_), cookie=cookie)[0] == 200
+first = next(iter(ops_web.pages.values()))["at"]
+assert call("/api/namespaces?from=%d&to=%d" % (now_ - 86400 + 60, now_ + 60), cookie=cookie)[0] == 200
+assert len(ops_web.pages) == 1 and next(iter(ops_web.pages.values()))["at"] == first, ops_web.pages.keys()
+req = urllib.request.Request(base + "/ops.js", headers={"Accept-Encoding": "gzip"})
+with opener.open(req, timeout=10) as r:
+    assert r.headers["Content-Encoding"] == "gzip" and b"function" in __import__("gzip").decompress(r.read())
 assert call("/api/summarize", {"incident": tr["id"]}, cookie=cookie)[0] == 400        # LLM not configured
 assert call("/", cookie="")[0] == 200 and call("/ops.js")[0] == 200
 for _ in range(5):

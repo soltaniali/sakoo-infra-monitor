@@ -9,6 +9,7 @@ Read `AGENTS.md` first (layout, commands, rules).
 
 ## Recent changes
 
+- 2026-11-14 — Speed: page data (users, capacity, models, tickets, trends, …) is cached 15 min in `ops_web.py` (`page_data`, `PAGE_TTL`), served at once and refreshed in the background (`page_warmer`; pages opened in the last 2 days). A range ending now is one cache entry (`page_key`). Live/cheap endpoints stay uncached (`LIVE`: state, incidents, logs…), so errors show and alert at once (collector still every 60 s). JSON and ops.js are gzipped (ops.js 100 KB → 30 KB). Measured before on the station (7 d): users 14 s, capacity 14 s, tickets 19 s, models 4 s. Deployed; backups `~/station/ops_web.py.bak-20261114`, `ops.js.bak2-20261114`. After a restart the first visit of each page is still slow once.
 - 2026-11-14 — New user = new `user-*` namespace: change type `new-user`, Telegram `🆕 NEW USER user-x/user-x: x (Real name)`, overview tile 9 "New users" (7 days), filter on Changes. Capacity "Each GPU" shows the pod's workload / KubeAI model (or user's real name) instead of only the namespace (`cards[].service`).
 - 2026-11-14 — Every OPEN/CLOSED alert ends with `Assignees: <name>` (`ops.assignee`, `Collector.is_model`). Infra/capacity → `Infra`; otherwise the person from `assets` in `station/probe-station.json` by exact asset/Service name, then name prefix; KubeAI models → the `kubeai` asset's person; fallback `MLOps`, also for shared namespaces like gitlab and casdoor (Ali: "consider them as mlops for now").
 
@@ -16,4 +17,4 @@ Read `AGENTS.md` first (layout, commands, rules).
 
 - `llm-proxy` (LiteLLM) alerts say `MLOps` on purpose (Ali, 2026-11-14): no single owner.
 - Deploy a code change: `scp station/ops.py AIP-IRAN:~/station/ops.py`, then `ssh AIP-IRAN docker exec sakoo-probe-station pkill -f ops_web.py` (restarts in 10 s).
-- Nothing unpushed (2026-11-14).
+- Speed commit is local, not pushed (2026-11-14).

@@ -12,6 +12,7 @@ OPS_ALLOW_CIDRS="a.b.c.d/24,...": only these client addresses may connect (when 
 The API only reads: the collector sends GET requests to Kubernetes, and nothing here can change the cluster.
 """
 import getpass
+import gzip
 import hashlib
 import hmac
 import ipaddress
@@ -39,6 +40,11 @@ HEADERS = {"Content-Security-Policy": "default-src 'self'; style-src 'self' 'uns
 ALLOW = [ipaddress.ip_network(c.strip(), strict=False) for c in os.environ.get("OPS_ALLOW_CIDRS", "").split(",") if c.strip()]
 sessions, fails, lock = {}, {}, threading.Lock()
 COL = None  # the collector, set in main()
+# Page data: computed once, kept 15 min, refreshed in the background, so a page never waits for Prometheus/Casdoor/LiteLLM.
+# Alerts do not wait for this: the collector still reads the cluster every minute and sends errors to Telegram at once.
+PAGE_TTL = 900
+LIVE = {"me", "state", "incidents", "incident", "logs", "task_log", "archive", "archive_read"}  # cheap or must be fresh
+pages, page_lock = {}, threading.Lock()  # key -> {"at", "val", "what", "q", "used", "busy"}
 USE_TLS = False
 
 
@@ -79,6 +85,66 @@ def time_range(q):
     return frm, to
 
 
+def page_key(what, q):
+    """A range that ends now ("last 7 days") is keyed by its length, so it stays one cache entry as time moves on."""
+    # ponytail: a picked range that ends today is treated the same, so its start drifts by up to 2 days; key by dates if that matters
+    q = dict(q)
+    if q.get("to") and float(q["to"]) > time.time() - 2 * PAGE_TTL and q.get("from"):
+        q["_len"] = str(int(float(q.pop("to")) - float(q.pop("from"))))
+    return what + "?" + urllib.parse.urlencode(sorted(q.items())), q
+
+
+def page_args(q):
+    """The stored query, with a moving range set to end at the latest 15-min step."""
+    q = dict(q)
+    if "_len" in q:
+        q["to"] = str(int(time.time() // PAGE_TTL * PAGE_TTL))
+        q["from"] = str(int(q["to"]) - int(q.pop("_len")))
+    return q
+
+
+def page_refresh(key):
+    e = pages[key]
+    try:
+        val = Handler.api(None, e["what"], page_args(e["q"]), None)
+        with page_lock:
+            e.update(at=time.time(), val=val)
+    except Exception as ex:  # keep the last good data
+        print("[ops] refresh %s failed: %s" % (key, ops.probe.err(ex)), flush=True)
+    finally:
+        e["busy"] = False
+
+
+def page_data(what, q):
+    key, stored = page_key(what, q)
+    with page_lock:
+        e = pages.get(key)
+        if e and e["val"] is not None:
+            e["used"] = time.time()
+            if time.time() - e["at"] > PAGE_TTL and not e["busy"]:  # old: serve it now, refresh behind
+                e["busy"] = True
+                threading.Thread(target=page_refresh, args=(key,), daemon=True).start()
+            return e["val"]
+    val = Handler.api(None, what, page_args(stored), None)  # first visit: compute (errors go to the caller)
+    with page_lock:
+        pages[key] = {"at": time.time(), "val": val, "what": what, "q": stored, "used": time.time(), "busy": False}
+    return val
+
+
+def page_warmer():
+    """Every 15 min, refresh the pages someone opened in the last 2 days, so the next visit is instant."""
+    while True:
+        time.sleep(60)
+        with page_lock:
+            for k in [k for k, e in pages.items() if time.time() - e["used"] > 2 * 86400]:
+                del pages[k]
+            todo = [k for k, e in pages.items() if time.time() - e["at"] > PAGE_TTL and not e["busy"]]
+            for k in todo:
+                pages[k]["busy"] = True
+        for k in todo:  # one at a time: Prometheus and the VPN are the slow part
+            page_refresh(k)
+
+
 def name(q, key, required=True):
     v = q.get(key, "")
     if (v or required) and not NAME_RE.match(v):
@@ -100,7 +166,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def send(self, code, body, ctype="application/json", extra=()):
         if not isinstance(body, bytes):
-            body = json.dumps(body, default=str).encode()
+            body = json.dumps(body, default=str, separators=(",", ":")).encode()
+        if len(body) > 1024 and "gzip" in self.headers.get("Accept-Encoding", ""):  # JSON shrinks ~10x on the slow link
+            body, extra = gzip.compress(body, 5), list(extra) + [("Content-Encoding", "gzip"), ("Vary", "Accept-Encoding")]
         self.send_response(code)
         for k, v in list(HEADERS.items()) + list(extra):
             self.send_header(k, v)
@@ -143,7 +211,8 @@ class Handler(BaseHTTPRequestHandler):
         if not user:
             return self.send(401, {"error": "login required"})
         try:
-            return self.send(200, self.api(path[5:], q, user))
+            what = path[5:]
+            return self.send(200, self.api(what, q, user) if what in LIVE else page_data(what, q))
         except (BadRequest, KeyError, ValueError) as e:
             return self.send(400, {"error": str(e)})
         except Exception as e:
@@ -151,7 +220,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(502, {"error": ops.probe.err(e)})
 
     def api(self, what, q, user):
-        if what == "me":
+        if what == "me":  # self is None for cached pages: only "me" uses the user
             return {"user": user, "integrations": COL.integrations()}
         frm, to = time_range(q)
         if what == "state":
@@ -167,7 +236,7 @@ class Handler(BaseHTTPRequestHandler):
         if what == "namespaces":
             return COL.namespaces_info()
         if what == "services":
-            ns = self.known_ns(q)
+            ns = Handler.known_ns(q)
             res = COL.resources(frm, to) if frm else {}  # the Logs page reads this too, and needs no usage
             return dict(COL.services(ns), use=next((r for r in res.get("namespaces", []) if r["ns"] == ns), None), range=res.get("window"))
         if what == "users":
@@ -205,7 +274,7 @@ class Handler(BaseHTTPRequestHandler):
         if what == "infra":
             return COL.infra()
         if what == "logs":
-            ns, pod, container = self.known_ns(q), name(q, "pod"), name(q, "container")
+            ns, pod, container = Handler.known_ns(q), name(q, "pod"), name(q, "container")
             tail = min(max(int(q.get("tail", 300)), 1), 3000)
             return {"text": COL.log_text(ns, pod, container, tail, q.get("previous") == "1")}
         raise BadRequest("unknown API " + what)
@@ -269,7 +338,7 @@ class Handler(BaseHTTPRequestHandler):
             text = COL.incident_text(int(b["incident"]))
         else:
             q = {k: str(b.get(k, "")) for k in ("ns", "pod", "container")}
-            ns = self.known_ns(q)
+            ns = Handler.known_ns(q)
             text = "Kubernetes pod %s/%s, container %s. Log:\n%s" % (ns, name(q, "pod"), name(q, "container"),
                                                                     COL.log_text(ns, q["pod"], q["container"], 400, bool(b.get("previous"))))
         print("[ops] %s asked for a summary" % user, flush=True)
@@ -362,6 +431,7 @@ def main():
         print(json.dumps({"tiles": COL.state()["tiles"], "status": COL.status}, indent=1, default=str))
         return
     threading.Thread(target=COL.run_forever, daemon=True).start()
+    threading.Thread(target=page_warmer, daemon=True).start()
     port = int(os.environ.get("OPS_PORT", 8443))
     srv = Server((os.environ.get("OPS_BIND", "0.0.0.0"), port), Handler)
     if TLS[0].exists() and TLS[1].exists():
