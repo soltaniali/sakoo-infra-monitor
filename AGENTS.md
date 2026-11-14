@@ -25,14 +25,9 @@ Iran probe station 85.198.48.95 (AIP-IRAN, user mlops, ~/station, Docker)
 - `station/` — container (OpenVPN ×2 + probe + ops), `ops.py` collector (8 maintenance events: bug, down, feature, new service, new model, model info, logs, infra-or-us), `ops_web.py` (scrypt users, `adduser`), `tickets.py` (support tickets vs monitoring data), integrations: GitLab, Grafana, Langfuse, LiteLLM keys, Casdoor logins, mlops-core trainings. `set-*.sh` scripts write secrets interactively.
 - Public HTTPS for the ops page: `85.198.48.95:8443` (`OPS_ALLOW_CIDRS`).
 
-## 2. Status snapshot (2026-11-13)
+## 2. Status snapshot (2026-11-14)
 
-- Remote `github.com/soltaniali/sakoo-infra-monitor`, branch `main`, last commit `e2c8872` (2026-11-08, per-user timeline).
-- **Uncommitted:** 10 modified files (+400/−95: dashboard, probe, receiver,
-  station ops/tickets/tests) and new station checks (`access-check2.py`,
-  `agent-deep-check.py`, `agent-queue-check.py`, `dataset-check.py`,
-  `grafana-check.py`, `langfuse-check.py`, `check-allowed-hosts.ps1`), and
-  `docs/sakoo-ops-report-fa.{html,pdf}`. Review and commit in logical pieces.
+- Remote `github.com/soltaniali/sakoo-infra-monitor`, branch `main`, last pushed commit `2e8342d` (2026-11-14, Assignees line). Working tree clean.
 - Automation level **L1: diagnose only.** The station kubeconfig can write in
   `aip-mlops-service`; code uses a single GET helper (`ops.kget`). A read-only ServiceAccount was requested from the admins.
 
@@ -71,7 +66,7 @@ No Docker Hub from Iran: build elsewhere, `docker save | gzip`, scp, `docker loa
 
 - 2026-11-14 — alerts carry `Assignees:` with exact person names from the asset list; deployed to the station.
 - 2026-11-13 — `AGENTS.md` added.
-- uncommitted — new station checks (agents, datasets, Grafana, Langfuse, allowed hosts), ops report (fa).
+- 2026-11-14 `ea35e6c` — new station checks (agents, datasets, Grafana, Langfuse, allowed hosts), ops report (fa).
 - 2026-11-08 `e2c8872` — per-user timeline with day-by-day event list.
 - 2026-11-04 — GPU slices, GPU wait list, agent limits; daily usage history/charts; date range + whole-cluster view; pod logs saved on station; mlops-core trainings.
 - 2026-11-01…03 — Casdoor login records; LiteLLM keys tab; tickets checks; users page by person; Grafana/Langfuse per-user usage.
