@@ -266,7 +266,7 @@ code, _, hd = call("/api/login", {"user": "ali", "password": "correct horse 1"})
 cookie = hd["Set-Cookie"].split(";")[0]
 assert code == 200 and "HttpOnly" in hd["Set-Cookie"] and "SameSite=Strict" in hd["Set-Cookie"], hd
 code, body, hd = call("/api/state", cookie=cookie)
-assert code == 200 and len(json.loads(body)["tiles"]) == 8 and "default-src 'self'" in hd["Content-Security-Policy"]
+assert code == 200 and len(json.loads(body)["tiles"]) == 9 and "default-src 'self'" in hd["Content-Security-Policy"]
 assert call("/api/logs?ns=%s&pod=../etc&container=app" % NS, cookie=cookie)[0] == 400
 assert call("/api/logs?ns=kube-system&pod=x&container=app", cookie=cookie)[0] == 400
 code, body, _ = call("/api/logs?ns=%s&pod=training-api-abc-3&container=app&tail=5" % NS, cookie=cookie)
@@ -923,3 +923,16 @@ ops.http_json = saved_http
 for k in ("LITELLM_URL", "LITELLM_KEY", "LITELLM_MODEL"):
     os.environ.pop(k)
 print("ok (false alarms)")
+
+# --- a new user (user-* namespace) alerts and counts on the overview; a GPU names its real holder
+c2.alerts, ops.kget = [], lambda path, raw=False: {"items": [{"metadata": {"name": n}} for n in json.loads(c2.meta("namespaces") or "[]") + ["user-zed"]]}
+if not c2.meta("namespaces"):
+    c2.set_meta("namespaces", json.dumps(["aip-mlops-service"]))
+c2.refresh_namespaces(NOW2)
+assert any("NEW USER user-zed/user-zed: zed" in a for a in c2.alerts), c2.alerts
+assert next(t for t in c2.state()["tiles"] if t["n"] == 9)["value"] >= 1
+ops.kget = fake_kget
+col.pods, col.cache = {"user-uni": [{"name": "w", "workload": "w-trainer"}]}, {}
+col.prom = res_prom
+assert col.resources(T3 - 86400, T3)["gpus"][0]["service"] == "w-trainer"
+print("ok (new user, GPU holder)")

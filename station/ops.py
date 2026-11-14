@@ -999,7 +999,11 @@ class Collector:
                 for s in self.prom(q):
                     if s["metric"].get("UUID") in cards:
                         cards[s["metric"]["UUID"]][field] = float(s["value"][1])
-            for c in cards.values():
+            people = self.people()
+            who = lambda ns: next((p["name"] for p in people if ns and ns.startswith("user-") and ns[5:] in p["users"]), None)
+            for c in cards.values():  # the real holder: workload / KubeAI model of the pod, or the user's real name
+                pod = next((p for p in self.pods.get(c["ns"], []) if p["name"] == c["pod"]), None)
+                c["service"] = who(c["ns"]) or (pod["workload"] if pod else c["pod"])
                 used, free = c.pop("mem_used", None), c.pop("mem_free", None)
                 c["mem_used"], c["mem_total"] = (round(used / 1024), round((used + free) / 1024)) if used is not None and free is not None else (None, None)
             rows = {}
@@ -1038,8 +1042,6 @@ class Collector:
             if pending:
                 for s in self.prom('kube_pod_created{pod=~"%s"}' % "|".join(sorted({m.get("pod", "") for m in pending}))):
                     since[s["metric"].get("pod")] = float(s["value"][1])
-            people = self.people()
-            who = lambda ns: next((p["name"] for p in people if ns and ns.startswith("user-") and ns[5:] in p["users"]), None)
             waiting = [{"ns": m.get("namespace"), "pod": m.get("pod"), "kind": "slice" if is_slice(m) else "full GPU", "since": since.get(m.get("pod")), "person": who(m.get("namespace"))} for m in pending]
             held = one("sum(%s)" % (gpu_req % "Running"))
             return {"window": w, "gpus": sorted(cards.values(), key=lambda c: (str(c["node"]), int(c["gpu"] or 0))),
@@ -1167,7 +1169,11 @@ class Collector:
         known = json.loads(self.meta("namespaces") or "null")
         if known is not None:
             for ns in sorted(set(names) - set(known)):
-                self.add_change(t, ns, "Namespace", ns, "new-namespace", "", ns, {})
+                if ns.startswith("user-"):  # the platform makes user-<name> when a user signs up
+                    who = next((x["name"] for x in self.people() if ns[5:] in x["users"]), None)
+                    self.add_change(t, ns, "Namespace", ns, "new-user", "", ns[5:] + (" (%s)" % who if who else ""), {})
+                else:
+                    self.add_change(t, ns, "Namespace", ns, "new-namespace", "", ns, {})
             for ns in sorted(set(known) - set(names)):
                 self.add_change(t, ns, "Namespace", ns, "removed-namespace", ns, "", {})
                 self.exec("DELETE FROM inventory WHERE ns=?", (ns,))
@@ -1261,10 +1267,10 @@ class Collector:
         watch = typ in ("release", "config", "new-service", "new-model")
         cid = self.exec("INSERT INTO changes (ts, ns, kind, name, type, before, after, info, verdict) VALUES (?,?,?,?,?,?,?,?,?)",
                         (t, ns, kind, name, typ, before, after, json.dumps(info), "watching" if watch else ""))
-        if alertable(ns, owner_of(ns, name)) and typ != "new-namespace" or (typ == "new-namespace" and not ns.startswith("user-")):
+        if alertable(ns, owner_of(ns, name)) and typ != "new-namespace" or typ == "new-user" or (typ == "new-namespace" and not ns.startswith("user-")):
             label = {"release": "RELEASE", "config": "CONFIG CHANGE", "new-service": "NEW SERVICE", "new-host": "NEW HOSTNAME",
                      "new-model": "NEW MODEL", "model-changed": "MODEL CHANGED", "removed": "REMOVED", "model-removed": "MODEL REMOVED",
-                     "new-namespace": "NEW NAMESPACE", "removed-namespace": "NAMESPACE REMOVED", "configmap": "CONFIGMAP CHANGED"}.get(typ, typ.upper())
+                     "new-namespace": "NEW NAMESPACE", "new-user": "NEW USER", "removed-namespace": "NAMESPACE REMOVED", "configmap": "CONFIGMAP CHANGED"}.get(typ, typ.upper())
             what = "%s → %s" % (before, after) if before and after else (after or before)
             extra = (" · gaps: " + ", ".join(info["gaps"])) if info.get("gaps") else ""
             self.alerts.append("🆕 %s %s/%s: %s%s" % (label, ns, name, what, extra))
@@ -1760,8 +1766,9 @@ class Collector:
         incs = self.rows("SELECT id, ns, obj, symptom, owner, cause, detail, opened, last_seen, scope FROM incidents "
                          "WHERE state='open' ORDER BY opened DESC")
         changes = self.rows("SELECT * FROM changes WHERE ts>=? ORDER BY ts DESC", (t - 86400,))
-        week = {r["type"]: r["n"] for r in self.rows("SELECT type, count(*) n FROM changes WHERE ts>=? AND ns NOT LIKE 'user-%' "
+        week = {r["type"]: r["n"] for r in self.rows("SELECT type, count(*) n FROM changes WHERE ts>=? AND (ns NOT LIKE 'user-%' OR type='new-user') "
                                                      "GROUP BY type", (t - 7 * 86400,))}
+        new_users = [c["after"] for c in changes if c["type"] == "new-user"]
         models = [o for o in self.inv.get(OUR_NS, {}).values() if o["kind"] == "Model"]
         sigs = self.one("SELECT count(*) n, sum(first>=?) new FROM signatures WHERE last>=?", (t - 86400, t - 86400))
         res = self.probe.get("results", {})
@@ -1790,6 +1797,8 @@ class Collector:
             {"n": 8, "title": "Infra or us", "value": "%d · %d" % (probe_down["infra"], probe_down["us"] + probe_down["asset"]),
              "sub": "probe checks down: infra · ours" + (" · probe has %d problems" % probe_down["monitor"] if probe_down["monitor"] else ""),
              "status": "bad" if probe_down["infra"] or probe_down["us"] or probe_down["asset"] else "ok", "link": "#/infra"},
+            {"n": 9, "title": "New users", "value": week.get("new-user", 0), "status": "info", "link": "#/changes?type=new-user&days=7",
+             "sub": "7 days · " + (", ".join(new_users[:3]) + (" …" if len(new_users) > 3 else "") if new_users else "none in 24 h")},
         ]
         unsent = self.rows("SELECT ts, text FROM outbox WHERE sent IS NULL ORDER BY id DESC LIMIT 50")
         return {"tiles": tiles, "incidents": incs, "unsent": unsent, "changes": changes[:40], "status": self.status, "now": t,

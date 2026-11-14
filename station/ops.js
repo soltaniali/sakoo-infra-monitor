@@ -36,7 +36,7 @@ function ago(t) {
 const OWNER = o => o === 'us' ? 'MLOps (us)' : o === 'infra' ? 'Infra team' : o === 'capacity' ? 'Capacity (cluster full)' : o === 'asset' ? 'MLOps asset' : o === 'monitor' ? 'Probe' : 'Team ' + o;
 const SYM = {crashloop: 'Crash loop', oomkilled: 'Out of memory', 'image-pull': 'Image pull', pending: 'Pending', flapping: 'Restarting',
   'probe-failing': 'Probe failing', down: 'Down', 'model-down': 'Model down', 'new-error': 'New error', endpoint: 'Endpoint check', infra: 'Infra check', 'llm-failing': 'LLM calls failing'};
-const CHG = {release: 'Release', config: 'Config change', 'new-service': 'New service', 'new-host': 'New hostname', 'new-namespace': 'New namespace',
+const CHG = {release: 'Release', config: 'Config change', 'new-service': 'New service', 'new-host': 'New hostname', 'new-namespace': 'New namespace', 'new-user': 'New user',
   removed: 'Removed', 'removed-namespace': 'Namespace removed', 'new-model': 'New model', 'model-changed': 'Model changed', 'model-removed': 'Model removed'};
 const verdictChip = v => v ? h('span', {class: 'chip ' + ({bad: 'bad', 'not ready': 'bad', healthy: 'ok', ready: 'ok', watching: 'warn'}[v] || '')}, v) : '';
 
@@ -367,10 +367,10 @@ VIEWS.changes = async q => {
   const go = o => { location.hash = '#/changes?' + qs(Object.assign({type}, o)); };
   return h('div', {}, h('div', {class: 'row'},
     h('select', {onchange: e => go({type: e.target.value})}, [['', 'All changes'], ['release', 'Features / releases (3)'], ['new-service', 'New services (4)'],
-      ['new-model', 'Models (5)'], ['removed', 'Removed']].map(([v, t]) => h('option', {value: v, selected: v === type}, t))),
+      ['new-model', 'Models (5)'], ['new-user', 'New users (9)'], ['removed', 'Removed']].map(([v, t]) => h('option', {value: v, selected: v === type}, t))),
     h('span', {class: 'mut'}, rows.length + ' changes')), h('div', {class: 'card'}, changeTable(rows)),
     h('p', {class: 'mut small'}, 'Result: a release is "watching" for 15 min, then "healthy" or "bad" (an incident opened on it). ' +
-      'Changes in user-* namespaces are listed but not sent to Telegram.'));
+      'Changes in user-* namespaces are listed but not sent to Telegram, except a new user.'));
 };
 
 // a model keeps its color whatever the range shows: fixed order over all names; past 7, they fold into Other
@@ -949,7 +949,7 @@ function clusterView(r, d) {
     charts(lineChart({title: 'GPUs per day', note: 'Share of all ' + g.total + ' GPUs', days, partial: part, unit: ' %', yMax: 100, series: [{name: 'Held', color: COL(2), values: days.length ? series('gpu_held', 'gpu_total') : []}, {name: 'Computing', color: COL(1), values: days.length ? pick(d, 'all', 'gpu_busy').map(v => v == null ? null : +v.toFixed(1)) : []}]}),
       lineChart({title: 'CPU and RAM used per day', note: 'Share of all CPU and RAM', days, partial: part, unit: ' %', series: [{name: 'RAM', color: COL(2), values: days.length ? series('mem_used', 'mem_total') : []}, {name: 'CPU', color: COL(1), values: days.length ? series('cpu_used', 'cpu_total') : []}]})),
     h('h2', {}, 'Each GPU · who holds it, and is it working?'),
-    barList('Busy over the date range', 'Sorted by how much it works. A bar near zero means a GPU held but idle.', [...r.gpus].sort((a, b) => (b.util_avg || 0) - (a.util_avg || 0)).map(x => ({label: x.node + ' #' + x.gpu, sub: x.ns ? x.ns + ' · ' + x.model : 'free · ' + x.model, value: x.util_avg || 0, title: 'now ' + x.util + ' %, memory ' + x.mem_used + ' / ' + x.mem_total + ' GiB', href: x.ns ? '#/services?' + qs({ns: x.ns}) : null})), v => v + ' %', 100),
+    barList('Busy over the date range', 'Sorted by how much it works. A bar near zero means a GPU held but idle.', [...r.gpus].sort((a, b) => (b.util_avg || 0) - (a.util_avg || 0)).map(x => ({label: x.node + ' #' + x.gpu, sub: x.ns ? (x.service ? x.service + ' (' + x.ns + ')' : x.ns) + ' · ' + x.model : 'free · ' + x.model, value: x.util_avg || 0, title: 'now ' + x.util + ' %, memory ' + x.mem_used + ' / ' + x.mem_total + ' GiB', href: x.ns ? '#/services?' + qs({ns: x.ns}) : null})), v => v + ' %', 100),
     r.slices.pods.length ? h('details', {class: 'tablewrap'}, h('summary', {}, 'Who holds the ' + r.slices.total + ' GPU slices (' + r.slices.held + ' held)'), h('div', {class: 'card'}, h('p', {class: 'small mut', style: 'margin:0 0 6px'}, 'The GPU exporter does not report slices per pod, so how busy they are is not known.'),
       table([['Namespace', x => h('a', {href: '#/services?' + qs({ns: x.ns})}, x.ns)], ['Pod', x => h('span', {class: 'small mut'}, x.pod)], ['Slices', x => x.n]], r.slices.pods))) : '',
     h('details', {class: 'tablewrap'}, h('summary', {}, 'Table: each GPU'), h('div', {class: 'card'}, table([['Node', x => x.node], ['GPU', x => x.gpu], ['Model', x => x.model],
