@@ -5,7 +5,7 @@ Read `AGENTS.md` first (layout, commands, rules).
 ## Current state (2026-11-14)
 
 - Station (AIP-IRAN `~/station`, container `sakoo-probe-station`) runs the local `station/ops.py` (deployed 2026-11-14; backup `~/station/ops.py.bak-20261111`).
-- Committed `233ef77` (not pushed; last pushed `2a5705a`). Deployed 2026-11-14 (`ops.py` + `ops.js`; backups `~/station/*.bak-20261114`).
+- Committed and pushed `233ef77` (+ docs `4eaad99`). Deployed 2026-11-14 (`ops.py` + `ops.js`; backups `~/station/*.bak-20261114`).
 
 ## Recent changes
 
@@ -16,4 +16,4 @@ Read `AGENTS.md` first (layout, commands, rules).
 
 - `llm-proxy` (LiteLLM) alerts say `MLOps` on purpose (Ali, 2026-11-14): no single owner.
 - Deploy a code change: `scp station/ops.py AIP-IRAN:~/station/ops.py`, then `ssh AIP-IRAN docker exec sakoo-probe-station pkill -f ops_web.py` (restarts in 10 s).
-- `233ef77` not pushed yet (2026-11-14).
+- Nothing unpushed (2026-11-14).
