@@ -5,7 +5,7 @@ Claude Code, …). Read next: [README.md](README.md) (probe → receiver →
 Telegram), [station/README.md](station/README.md) (probe station, ops
 dashboard), `docs/2026-10-21-ops-dashboard-design.md` (decisions).
 
-**Last updated:** 2026-11-13
+**Last updated:** 2026-11-14
 
 ## 1. What it is
 
@@ -56,6 +56,7 @@ No Docker Hub from Iran: build elsewhere, `docker save | gzip`, scp, `docker loa
 - Only short alert texts leave Iran (to London/Telegram); logs and inventory stay on the station.
 - Visible text says "AIP", not "Sakoo". Times shown in Tehran time.
 - Owner of every failure is explicit (infra / us / capacity / monitor) — keep that mapping when adding checks.
+- Every alert ends with `Assignees:` (`ops.assignee`): Infra for infra/capacity, else the person from `assets` in `probe-station.json` (name, Service or prefix match; KubeAI models → the `kubeai` person), else MLOps.
 - Commits: plain imperative sentence, often prefixed by area (`Ops: …`, `Station: …`, `Dashboard: …`).
 
 ## 5. Traps
@@ -68,6 +69,7 @@ No Docker Hub from Iran: build elsewhere, `docker save | gzip`, scp, `docker loa
 
 ## 6. Change log
 
+- 2026-11-14 — alerts carry `Assignees:` with exact person names from the asset list; deployed to the station.
 - 2026-11-13 — `AGENTS.md` added.
 - uncommitted — new station checks (agents, datasets, Grafana, Langfuse, allowed hosts), ops report (fa).
 - 2026-11-08 `e2c8872` — per-user timeline with day-by-day event list.

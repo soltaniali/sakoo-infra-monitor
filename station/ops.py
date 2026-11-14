@@ -255,6 +255,23 @@ def slim_key(k, u, t):
             "expires": exp, "active": active, "created": created, "flags": flags}
 
 
+def assignee(owner, obj=None, ctx=None, model=False):
+    """Who follows up an alert: anything infra-side (nodes, GPU, capacity, Harbor, Ceph) is Infra; else the asset's
+    person from the probe asset list (same names as the status list), matched by asset or Service name, also as a
+    prefix (mlops-pgdb-rw → mlops-pgdb). KubeAI models belong to the kubeai asset's person."""
+    if owner in ("infra", "capacity"):
+        return "Infra"
+    person = ((ctx or {}).get("meta") or {}).get("person")
+    assets = probe.CFG.get("assets", [])
+    if not person and obj:
+        names = lambda a: [a.get("name")] + a.get("services", [])
+        person = next((a.get("person") for a in assets if obj in names(a)), None) or \
+            next((a.get("person") for a in assets for n in names(a) if n and (obj.startswith(n + "-") or n.startswith(obj + "-"))), None)
+    if not person and model:
+        person = next((a.get("person") for a in assets if a.get("name") == "kubeai"), None)
+    return person or ("MLOps" if owner == "us" else owner)
+
+
 def alertable(ns, owner):
     return not ns.startswith("user-") or owner == "us"  # users' own workloads: dashboard only
 
@@ -380,6 +397,7 @@ class Collector:
         self.n = 0
         self.pods, self.events, self.inv, self.read_at = {}, {}, {}, {}  # ns -> latest read
         self.namespaces, self.forbidden, self.hosts = [], {}, {}
+        self.blind = False  # this round could not read our namespace: the path to AIP is down
         self.since, self.restart_hist = {}, {}
         self.alerts, self.probe, self.probe_seen = [], {}, None
         self.status = {"last": None, "took": None, "errors": [], "slow_last": None}
@@ -397,7 +415,6 @@ class Collector:
     def rows(self, sql, args=()):
         with self.lock:
             return [dict(r) for r in self.conn.execute(sql, args)]
-        self.blind = False  # this round could not read our namespace: the path to AIP is down
 
     def one(self, sql, args=()):
         r = self.rows(sql, args)
@@ -1172,6 +1189,7 @@ class Collector:
         targets = [OUR_NS] + ([n for n in self.namespaces if n != OUR_NS and t - self.forbidden.get(n, 0) > 3600] if slow else [])
         with concurrent.futures.ThreadPoolExecutor(WORKERS) as ex:
             snaps = list(ex.map(self.read_ns, targets))
+        self.blind = isinstance(snaps[0], str)
         for ns, snap in zip(targets, snaps):
             if isinstance(snap, str):
                 errors.append(snap)
@@ -1189,7 +1207,6 @@ class Collector:
         # tried, not only synced: while the site is down, one login every SYNC_S and not one per round
         if tickets.enabled() and not self.tickets_busy and t - max(float(self.meta("tickets_synced") or 0), self.tickets_tried) > tickets.SYNC_S:
             self.tickets_busy, self.tickets_tried = True, t
-        self.blind = isinstance(snaps[0], str)
             self.bg.put(("tickets", None))
         self.flush_alerts()
         if t - float(self.meta("pruned") or 0) > 86400:
@@ -1429,6 +1446,9 @@ class Collector:
         seen, unread = {}, set()  # (ns, sig) -> [workload, pod, sample line, count]; (ns, workload) whose log could not be read
         with concurrent.futures.ThreadPoolExecutor(WORKERS) as ex:
             for (ns, p, c), text in ex.map(read, jobs):
+                if text is None:
+                    unread.add((ns, p["workload"]))
+                    continue
                 mark, fresh, newest = (ns, p["name"], c), [], None
                 for line in text.splitlines():
                     if LOG_STAMP_RE.match(line):
@@ -1446,9 +1466,6 @@ class Collector:
         with self.lock:
             self.conn.executemany("INSERT INTO signatures VALUES (?,?,?,?,?,?,?) ON CONFLICT(sig) DO UPDATE SET last=?, count=count+?",
                                   [(s, ns, wl, t, t, n, line, t, n) for (ns, s), (wl, _, line, n) in seen.items()])
-                if text is None:
-                    unread.add((ns, p["workload"]))
-                    continue
             self.conn.commit()
         sym, new = {}, {}  # new: (ns, workload) -> this round's new error lines, in log order
         for (ns, sig), (wl, pod, line, n) in seen.items():
@@ -1456,6 +1473,15 @@ class Collector:
             if key in open_keys:
                 sym[key] = ("new-error", ns, wl, "%s (%d× in the last %d min)" % (line[:300], n, ROUND_S * SLOW_EVERY // 60),
                             {"pod": pod, "sample": line})
+            elif sig not in known and not learning.get(ns, True):
+                new.setdefault((ns, wl), []).append((key, pod, line, n))
+        for (ns, wl), lines in new.items():  # one traceback is many new lines: one incident per workload, not one per line
+            key, pod, line, n = lines[-1]  # the last line of a traceback is the error itself
+            more = " (+%d more new error lines)" % (len(lines) - 1) if len(lines) > 1 else ""
+            sym[key] = ("new-error", ns, wl, "%s (%d× in the last %d min)%s" % (line[:300], n, ROUND_S * SLOW_EVERY // 60, more),
+                        {"pod": pod, "sample": "\n".join(x[2] for x in lines)})
+        for ns, wl in unread:  # no log, no verdict: "quiet for 30 min" counts only the time the log could be read
+            self.exec("UPDATE incidents SET last_seen=? WHERE state='open' AND scope='logs' AND ns=? AND obj=?", (t, ns, wl))
         self.observe("logs", sym, t)
 
     @staticmethod
@@ -1473,15 +1499,6 @@ class Collector:
         days = sorted(p for p in LOG_DIR.iterdir() if p.is_dir())
         size = {d: sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) for d in days}
         keep_from = time.strftime("%Y-%m-%d", time.gmtime(t - RETENTION))
-            elif sig not in known and not learning.get(ns, True):
-                new.setdefault((ns, wl), []).append((key, pod, line, n))
-        for (ns, wl), lines in new.items():  # one traceback is many new lines: one incident per workload, not one per line
-            key, pod, line, n = lines[-1]  # the last line of a traceback is the error itself
-            more = " (+%d more new error lines)" % (len(lines) - 1) if len(lines) > 1 else ""
-            sym[key] = ("new-error", ns, wl, "%s (%d× in the last %d min)%s" % (line[:300], n, ROUND_S * SLOW_EVERY // 60, more),
-                        {"pod": pod, "sample": "\n".join(x[2] for x in lines)})
-        for ns, wl in unread:  # no log, no verdict: "quiet for 30 min" counts only the time the log could be read
-            self.exec("UPDATE incidents SET last_seen=? WHERE state='open' AND scope='logs' AND ns=? AND obj=?", (t, ns, wl))
         for d in days:
             if d.name < keep_from or sum(size.values()) > LOG_CAP_BYTES:
                 shutil.rmtree(d, ignore_errors=True)
@@ -1668,10 +1685,10 @@ class Collector:
                          d["change_id"], t, t, int(send)))
         if send:
             icon = {"infra": "🔴", "us": "🟠"}.get(d["owner"], "🟡")
-            who = {"infra": "infra team", "us": "MLOps"}.get(d["owner"], "team " + d["owner"])
-            self.alerts.append("%s OPEN #%d %s · %s/%s · %s\n%s\nCause: %s\nFix: %s%s" % (
+            who = {"infra": "infra team", "us": "MLOps", "capacity": "capacity full, nothing is down"}.get(d["owner"], "team " + d["owner"])
+            self.alerts.append("%s OPEN #%d %s · %s/%s · %s\n%s\nCause: %s\nFix: %s%s\nAssignees: %s" % (
                 icon, iid, symptom, ns, obj, who, detail[:200], d["cause"][:300], d["fix"][:300],
-                "\n%s#/incident?id=%d" % (OPS_URL, iid) if OPS_URL else ""))
+                "\n%s#/incident?id=%d" % (OPS_URL, iid) if OPS_URL else "", assignee(d["owner"], obj, ctx, self.is_model(ns, obj, symptom))))
         if self.integrations()["ai"]:
             self.bg.put(("litellm", iid))
         return iid
@@ -1679,7 +1696,11 @@ class Collector:
     def close(self, r, t):
         self.exec("UPDATE incidents SET state='closed', closed=? WHERE id=?", (t, r["id"]))
         if r["alerted"]:
-            self.alerts.append("✅ CLOSED #%d %s · %s/%s (open %d min)" % (r["id"], r["symptom"], r["ns"], r["obj"], (t - r["opened"]) // 60))
+            self.alerts.append("✅ CLOSED #%d %s · %s/%s (open %d min)\nAssignees: %s" % (
+                r["id"], r["symptom"], r["ns"], r["obj"], (t - r["opened"]) // 60, assignee(r["owner"], r["obj"], model=self.is_model(r["ns"], r["obj"], r["symptom"]))))
+
+    def is_model(self, ns, obj, symptom):
+        return symptom.startswith("model") or "Model/%s/%s" % (ns, obj) in self.inv.get(ns, {})
 
     def flush_alerts(self):
         """Send unsent alerts as one Telegram message through London. Every alert is kept in `outbox`: while London
