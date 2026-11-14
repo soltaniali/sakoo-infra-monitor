@@ -11,12 +11,14 @@ container: tun0 = cluster VPN (se-user15, 172.30.151-153.0/24)  ─┐
 
 | Check | Path | Owner when it fails |
 |---|---|---|
-| `probe VPN cluster` / `probe VPN endpoints` | own tunnel | monitor (not Sakoo) |
+| `probe VPN cluster` / `probe VPN endpoints` | own tunnel; also when the cluster tunnel is "connected" but nothing answers through it while the public address does | monitor (not Sakoo) |
+| `network path to AIP` | a host or asset URL gives no HTTP answer through the cluster VPN but answers over the public IP (endpoints VPN). Without the endpoints VPN: a failed connect/TLS, or two or more silent hostnames in one round. The hosts and assets it hides are not reported that round | monitor (the probe's path, not the apps) |
 | `ingress (MetalLB/traefik)` | all hosts via 172.30.153.101 fail | infra |
-| `host <name>` | one host fails or returns 5xx | us |
+| `host <name>` | one host returns 5xx or has no route, or gives no answer on both paths | us |
 | `node <name> (kubelet)` | 172.30.153.11-15:10250 | infra |
 | `kubernetes API` | 172.30.153.100:6443/livez | infra |
-| `k8s GPU/CPU/RAM capacity`, `node not ready`, `volumes (Ceph)`, `Harbor reachable` | Warning events, last 10 min, in `event_namespaces` | infra |
+| `k8s GPU/CPU/RAM capacity` | FailedScheduling "Insufficient ..." events, last 10 min, in `event_namespaces` | capacity (cluster full, nothing is down) |
+| `k8s node not ready`, `volumes (Ceph)`, `Harbor reachable` | Warning events, last 10 min, in `event_namespaces` | infra |
 | `public edge (public IP/firewall/NAT)` | internal path works, all hosts via 185.220.226.23 fail | infra |
 
 ## Files in `secrets/` (never commit; `.gitignore` covers them)
@@ -77,7 +79,7 @@ ops.py (collector, every 60 s) ────────┼─▶ /data/ops.db �
 | 8 | infra or us | the probe's checks grouped by owner | Infra or us |
 
 A symptom within 30 min after a change of the same object is linked to it ("bad release a → b", fix: roll back).
-Owner: `aip-mlops-service` and per-user ClearML agents = MLOps; capacity, Ceph, Harbor and probe infra checks = infra team;
+Owner: `aip-mlops-service` and per-user ClearML agents = MLOps; Ceph, Harbor and probe infra checks = infra team; cluster full = capacity (not an outage);
 any other namespace = its team. Incidents in `user-*` namespaces are on the page but not sent to Telegram (except our agents).
 An incident closes after 2 clean rounds (a new log error: after 30 quiet minutes). The first hour only learns the error
 signatures that already exist.

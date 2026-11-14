@@ -12,6 +12,7 @@ Result format: {check_name: [ok, detail, owner]}, owner = "infra" | "us" | "moni
 """
 import base64
 import calendar
+import concurrent.futures
 import email.utils
 import hashlib
 import hmac
@@ -66,8 +67,44 @@ def sync_clock():
         pass
 
 
+INGRESS, PUBLIC, PATH = "ingress (MetalLB/traefik)", "public edge (public IP/firewall/NAT)", "network path to AIP"
+
+
+class NoPath(OSError):
+    """TCP connect or TLS handshake failed. Traefik ends TLS, so this is the network path or traefik, never an app."""
+
+
 def err(e):
+    if isinstance(e, NoPath):
+        return str(e)  # already the text of the real error
     return "%s: %s" % (type(e).__name__, e) if str(e) else type(e).__name__
+
+
+def no_answer(e):
+    """Which part gave no HTTP answer: "path" (connect/TLS), "read" (request sent, no reply), None (a bad certificate)."""
+    return "path" if isinstance(e, NoPath) else None if isinstance(e, ssl.SSLCertVerificationError) else "read"
+
+
+def pmap(fn, items):
+    """fn over items at the same time. One by one, a dead path costs a full timeout per check: the round then takes
+    minutes and the receiver calls the probe silent."""
+    with concurrent.futures.ThreadPoolExecutor(32) as ex:
+        return list(ex.map(fn, items))
+
+
+def tls_connect(host, ip=None, port=443):
+    """TLS socket to ip (or host) with host as SNI, like curl --resolve. Raises NoPath when connect or handshake fails."""
+    try:
+        s = socket.create_connection((ip or host, port), timeout=TIMEOUT)
+        try:
+            return ssl.create_default_context().wrap_socket(s, server_hostname=host)
+        except BaseException:
+            s.close()
+            raise
+    except ssl.SSLCertVerificationError:
+        raise  # a bad certificate is a finding of its own
+    except OSError as e:
+        raise NoPath(err(e)) from None
 
 
 def get(url, insecure=False, headers=None, ctx=None):
@@ -91,10 +128,9 @@ def check_dns(name):
 
 def check_host(host, ip=None):
     """TCP + TLS to the ingress, certificate expiry, and the HTTP status of /. With ip, connect there and send
-    host as SNI and Host header (like curl --resolve). Returns (tls_ok, detail, http_status or None)."""
+    host as SNI and Host header (like curl --resolve). Returns (tls_ok, detail, http_status or None, no_answer(error))."""
     try:
-        ctx = ssl.create_default_context()
-        with socket.create_connection((ip or host, 443), timeout=TIMEOUT) as s, ctx.wrap_socket(s, server_hostname=host) as t:
+        with tls_connect(host, ip) as t:
             days = (ssl.cert_time_to_seconds(t.getpeercert()["notAfter"]) - now()) / 86400
             t.sendall(b"GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: sakoo-infra-probe\r\nConnection: close\r\n\r\n" % host.encode())
             data = b""
@@ -109,12 +145,12 @@ def check_host(host, ip=None):
         line = head.split(b"\r\n")[0].split()
         code = int(line[1]) if len(line) > 1 and line[1].isdigit() else None
         if days < CERT_WARN_DAYS:
-            return False, "certificate expires in %.0f days" % days, code
+            return False, "certificate expires in %.0f days" % days, code, None
         if code == 404 and body.startswith(b"404 page not found"):  # traefik's own page: no route for this host
-            return False, "traefik has no route for this host (404 page not found)", code
-        return True, "HTTP %s, cert %.0f days left" % (code, days), code
+            return False, "traefik has no route for this host (404 page not found)", code, None
+        return True, "HTTP %s, cert %.0f days left" % (code, days), code, None
     except (OSError, ssl.SSLError) as e:
-        return False, err(e), None
+        return False, err(e), None, no_answer(e)
 
 
 def check_tcp(ip, port):
@@ -224,85 +260,138 @@ def check_events():
                 if e.get("reason") == reason and all(n.lower() in msg.lower() for n in needles):
                     obj = e.get("involvedObject", {})
                     hits[name].append("%s/%s: %s" % (ns, obj.get("name", "?"), msg[:140]))
-    if len(errors) == len(CFG.get("event_namespaces", [])):  # read nothing: rule results would be false "OK"s
+    spaces = CFG.get("event_namespaces", [])
+    if errors and len(errors) == len(spaces):  # read nothing: rule results would be false "OK"s
         return {"kubernetes events": (False, "; ".join(errors), "monitor")}
-    res = {"k8s " + name: (not h, ("%d events, e.g. %s" % (len(h), h[0])) if h else "no events", "infra")
-           for name, h in hits.items()}
-    if errors:  # cannot read events: the API is checked separately, so this is a probe/RBAC problem
-        res["kubernetes events"] = (False, "; ".join(errors), "monitor")
+    # capacity reached = the cluster is full, nothing is down: its own owner, not "infra down"
+    res = {"k8s " + name: (not h, ("%d events, e.g. %s" % (len(h), h[0])) if h else "no events",
+                           "capacity" if name.endswith("capacity") else "infra") for name, h in hits.items()}
+    # cannot read events: the API is checked separately, so this is a probe/RBAC problem. Reported when fine too:
+    # a result that only exists while it fails never recovers, and the receiver then never alerts it again
+    res["kubernetes events"] = (not errors, "; ".join(errors) or "read %d namespaces" % len(spaces), "monitor")
     return res
 
 
 def fetch(url, ip=None):
     """(status, first 300 bytes of the body) over TLS to ip (or the URL's host), SNI = URL host. Raises on network errors."""
     u = urllib.parse.urlsplit(url)
-    with socket.create_connection((ip or u.hostname, u.port or 443), timeout=TIMEOUT) as s:
-        with ssl.create_default_context().wrap_socket(s, server_hostname=u.hostname) as t:
-            t.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: sakoo-infra-probe\r\nConnection: close\r\n\r\n"
-                       % (u.path or "/", u.hostname)).encode())
-            data = b""
-            while len(data) < 2000:
-                chunk = t.recv(2000)
-                if not chunk:
-                    break
-                data += chunk
+    with tls_connect(u.hostname, ip, u.port or 443) as t:
+        t.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: sakoo-infra-probe\r\nConnection: close\r\n\r\n"
+                   % (u.path or "/", u.hostname)).encode())
+        data = b""
+        while len(data) < 2000:
+            chunk = t.recv(2000)
+            if not chunk:
+                break
+            data += chunk
     head, _, body = data.partition(b"\r\n\r\n")
     line = head.split(b"\r\n")[0].split()
     return (int(line[1]) if len(line) > 1 and line[1].isdigit() else 0), body[:300]
 
 
-def check_assets():
+def check_assets(net=None):
     """MLOps assets (the asset list): each must have a ready pod behind its Kubernetes Service, and, if it has an
-    external URL, its app must answer through traefik (status < 500, and not traefik's fallback page)."""
-    ns, assets = CFG.get("assets_namespace", "aip-mlops-service"), CFG.get("assets", [])
+    external URL, its app must answer through traefik (status < 500, and not traefik's fallback page).
+    An asset whose URL gave no HTTP answer at all is noted in net (name -> (hostname, no_answer)) for path_check."""
+    ns, assets, ip = CFG.get("assets_namespace", "aip-mlops-service"), CFG.get("assets", []), CFG.get("ingress_ip")
     server, ctx = kube()
     code, body = get("%s/api/v1/namespaces/%s/endpoints" % (server, ns), ctx=ctx)
     if code != 200:
         return {"asset list": (False, "cannot read endpoints in %s: HTTP %d" % (ns, code), "monitor")}
     ready = {e["metadata"]["name"]: sum(len(x.get("addresses", [])) for x in e.get("subsets", []))
              for e in json.loads(body)["items"]}
-    fallback = {}  # host -> body of a path no app serves, to recognise a route that has disappeared
-    res = {}
-    for a in assets:
-        label = a["name"]
+
+    def no_such_path(host):  # body of a path no app serves, to recognise a route that has disappeared
+        try:
+            return fetch("https://%s/sakoo-probe-no-such-path" % host, ip)[1]
+        except (OSError, ssl.SSLError) as e:
+            return e
+    hosts = sorted({urllib.parse.urlsplit(a["url"]).hostname for a in assets if a.get("url")})
+    fallback = dict(zip(hosts, pmap(no_such_path, hosts)))
+
+    def one(a):
         problems = ["%s: no ready pod" % svc if svc in ready else "%s: no such Service" % svc
                     for svc in a.get("services", [a["name"]]) if not ready.get(svc)]
-        url, tested = a.get("url"), "pods"
+        url, tested, gone = a.get("url"), "pods", None
         if url and not problems:
-            host = urllib.parse.urlsplit(url).hostname
+            u = urllib.parse.urlsplit(url)
             try:
-                if host not in fallback:
-                    fallback[host] = fetch("https://%s/sakoo-probe-no-such-path" % host, CFG.get("ingress_ip"))[1]
-                status, sample = fetch(url, CFG.get("ingress_ip"))
+                if isinstance(fallback[u.hostname], Exception):
+                    raise fallback[u.hostname]
+                status, sample = fetch(url, ip)
                 want = a.get("expect")  # health endpoint: must be 200 and contain this text
-                u = urllib.parse.urlsplit(url)  # short form: path on mlopsapipilot, else host/path
+                # short form: path on mlopsapipilot, else host/path
                 short = (u.path or "/") if u.hostname.startswith("mlopsapipilot.") else u.hostname.split(".")[0] + (u.path or "/")
                 tested = "%s %d" % (short, status)
                 if want and (status != 200 or want.encode() not in sample):
                     problems.append("%s answered HTTP %d without %r: %r" % (url, status, want, sample[:80]))
                 elif status >= 500 or status == 0:
                     problems.append("%s answered HTTP %d" % (url, status))
-                elif urllib.parse.urlsplit(url).path not in ("", "/") and sample == fallback[host]:
+                elif u.path not in ("", "/") and sample == fallback[u.hostname]:
                     problems.append("%s has no route (traefik serves the fallback page)" % url)
             except (OSError, ssl.SSLError) as e:
                 problems.append("%s: %s" % (url, err(e)))
+                gone = no_answer(e) and (u.hostname, no_answer(e), url)
         n = sum(ready.get(svc, 0) for svc in a.get("services", [a["name"]]))
         meta = {"person": a.get("person", "?"), "value": a.get("value", "?"), "test": tested, "pods": n}
-        res[label] = (not problems, "; ".join(problems) or "%d ready pod(s), %s" % (n, tested),
-                      a.get("owner", "asset"), meta)
+        return (not problems, "; ".join(problems) or "%d ready pod(s), %s" % (n, tested), a.get("owner", "asset"), meta), gone
+
+    res = {"asset list": (True, "%d assets" % len(assets), "monitor")}  # reported when fine too, so its alert recovers
+    for a, (r, gone) in zip(assets, pmap(one, assets)):
+        res[a["name"]] = r
+        if gone and net is not None:
+            net[a["name"]] = gone
     return res
 
 
 def host_checks(res, ip, label, owner_if_all_fail):
     """Check every host over one path; one alert if all fail, else per-host results. Returns True if any answered."""
-    hosts = {h: check_host(h, ip) for h in CFG.get("hosts", [])}
+    names = CFG.get("hosts", [])
+    hosts = dict(zip(names, pmap(lambda h: check_host(h, ip), names)))
     if not hosts:
         return True
-    if not any(ok or code for ok, _, code in hosts.values()):
+    if not any(ok or code for ok, _, code, _ in hosts.values()):
         res[label] = (False, "all %d hostnames fail: %s" % (len(hosts), next(iter(hosts.values()))[1]), owner_if_all_fail)
         return False
-    res[label] = (True, "%d/%d hostnames answer" % (sum(bool(c) for _, _, c in hosts.values()), len(hosts)), owner_if_all_fail)
+    res[label] = (True, "%d/%d hostnames answer" % (sum(bool(c) for _, _, c, _ in hosts.values()), len(hosts)), owner_if_all_fail)
     return hosts
+
+
+def answers(url, ip):
+    """True if url answers over ip with a status below 500: the app is fine on that path."""
+    try:
+        return 0 < fetch(url, ip)[0] < 500
+    except (OSError, ssl.SSLError):
+        return False
+
+
+def path_check(res, net, public_ip=None):
+    """net: checks that got no HTTP answer through the cluster VPN, name -> (hostname, "path" | "read", url).
+    With public_ip (the second VPN works), each one is asked again over the public address users take: it answers
+    there = the probe's cluster path dropped it, not the app (one result for the path, none for the app); no answer
+    there either = the app (or traefik) is really broken, and its failure stays. Without a second path: a failed
+    connect or TLS handshake, or no answer from two or more hostnames in one round, is taken as the path."""
+    if not res.get(INGRESS, (True,))[0]:  # ingress down: its own alert says it all
+        for name in net:
+            res.pop(name, None)
+        return
+    if public_ip:
+        ok = dict(zip(net, pmap(lambda n: answers(net[n][2], public_ip), list(net))))
+        hidden = sorted(n for n in net if ok[n])
+        for n in net:
+            if ok[n]:
+                res.pop(n, None)
+            elif n in res:
+                r = res[n]
+                res[n] = r[:1] + (r[1] + " (no answer over the public IP either)",) + r[2:]
+    else:
+        flaky = any(part == "path" for _, part, _ in net.values()) or len({h for h, _, _ in net.values()}) > 1
+        hidden = sorted(net) if flaky else []
+        for n in hidden:
+            res.pop(n, None)
+    res[PATH] = (not hidden, "%d checks get no answer through the cluster VPN (%s)%s: unstable network between the probe and "
+                 "AIP, not the apps" % (len(hidden), ", ".join(hidden[:4]), " but answer over the public IP" if public_ip else "")
+                 if hidden else "stable", "monitor")
 
 
 def run_checks():
@@ -314,32 +403,44 @@ def run_checks():
     cluster_ok = res.get("probe VPN cluster", (True,))[0]
     public_ok = res.get("probe VPN endpoints", (True,))[0]
 
+    tcp, http = CFG.get("tcp_checks", {}), CFG.get("http_checks", {})
     if cluster_ok:
+        net = {}  # checks that got no HTTP answer, for path_check
         for name in CFG.get("dns_names", []):
             res["dns " + name] = check_dns(name) + ("infra",)
-        hosts = host_checks(res, CFG.get("ingress_ip"), "ingress (MetalLB/traefik)", "infra")
+        hosts = host_checks(res, CFG.get("ingress_ip"), INGRESS, "infra")
         if isinstance(hosts, dict):
-            for h, (ok, detail, code) in hosts.items():
+            for h, (ok, detail, code, gone) in hosts.items():
                 if code and code >= 500:  # traefik answered, the app behind it did not: ours
                     ok, detail = False, "HTTP %d from the app behind traefik" % code
                 res["host " + h] = (ok, detail, "infra" if "certificate" in detail else "us")
-        for name, (ip, port) in CFG.get("tcp_checks", {}).items():
-            res[name] = check_tcp(ip, port) + ("infra",)
-        for name, c in CFG.get("http_checks", {}).items():
+                if gone:
+                    net["host " + h] = (h, gone, "https://%s/" % h)
+        for name, r in zip(tcp, pmap(lambda a: check_tcp(*a), tcp.values())):
+            res[name] = r + ("infra",)
+        for name, c in http.items():
             res[name] = check_http(c["url"], c.get("healthy_text"), c.get("insecure", False)) + (c.get("owner", "infra"),)
         if CFG.get("kubeconfig") and res.get("kubernetes API", (True,))[0]:  # API down is already its own alert
             res.update(check_events())
             if CFG.get("assets"):
                 try:
-                    res.update(check_assets())
+                    res.update(check_assets(net))
                 except Exception as e:
                     res["asset list"] = (False, err(e), "monitor")
         if CFG.get("nodes"):
             res.update(check_nodes())
+        path_check(res, net, CFG.get("public_ip") if public_ok else None)
 
-    # the public path users take: public IP -> edge firewall/NAT -> traefik. Only meaningful if traefik itself is up.
-    if public_ok and CFG.get("public_ip") and res.get("ingress (MetalLB/traefik)", (True,))[0]:
-        host_checks(res, CFG["public_ip"], "public edge (public IP/firewall/NAT)", "infra")
+    # the public path users take: public IP -> edge firewall/NAT -> traefik. Only meaningful if traefik itself is up,
+    # or as the second opinion when nothing at all answers through the cluster VPN.
+    inner = [res[n][0] for n in (INGRESS, *tcp, *http) if n in res]
+    dead = len(inner) > 1 and not any(inner)
+    if public_ok and CFG.get("public_ip") and (dead or res.get(INGRESS, (True,))[0]):
+        host_checks(res, CFG["public_ip"], PUBLIC, "infra")
+    if dead and res.get(PUBLIC, (False,))[0]:  # users reach AIP, so it is up: the probe's own path is broken, not infra
+        res = {k: v for k, v in res.items() if k.startswith("probe VPN") or k == PUBLIC}
+        res["probe VPN cluster"] = (False, "%s is connected but nothing answers through it (ingress, Kubernetes API, nodes), while "
+                                    "the public address answers: AIP is up, the probe's VPN path is broken" % vpn.get("cluster", "VPN"), "monitor")
     return res
 
 

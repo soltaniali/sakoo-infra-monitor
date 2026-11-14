@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<title>گزارش داشبورد عملیات سکو</title>
+<style>
+@page { size: A4; margin: 16mm 14mm; }
+* { box-sizing: border-box; }
+body { font-family: "Vazirmatn", "Segoe UI", Tahoma, sans-serif; font-size: 10.5pt; line-height: 1.75; color: #1d1d1b; margin: 0; direction: rtl; text-align: right; }
+h1 { font-size: 20pt; margin: 0 0 4px; }
+h2 { font-size: 13.5pt; margin: 22px 0 8px; padding: 4px 10px; border-right: 4px solid #1971c2; background: #eef4fb; page-break-after: avoid; }
+.meta { color: #6b6b66; font-size: 9.5pt; margin-bottom: 10px; }
+.lead { background: #f7f7f5; border: 1px solid #e4e4e0; border-radius: 6px; padding: 10px 12px; }
+table { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 9.5pt; page-break-inside: auto; }
+tr { page-break-inside: avoid; }
+th { background: #1d1d1b; color: #fff; font-weight: 600; padding: 6px 8px; text-align: right; }
+td { border-bottom: 1px solid #e4e4e0; padding: 5px 8px; vertical-align: top; }
+tr:nth-child(even) td { background: #fafaf8; }
+code, .ltr { direction: ltr; unicode-bidi: isolate; font-family: Consolas, monospace; font-size: 9pt; background: #f0efec; padding: 0 3px; border-radius: 3px; }
+pre { direction: ltr; text-align: left; background: #1d1d1b; color: #f0efec; padding: 8px 10px; border-radius: 6px; font-size: 8.5pt; white-space: pre-wrap; }
+ol, ul { padding-right: 22px; padding-left: 0; margin: 6px 0; }
+li { margin: 3px 0; }
+.check li { list-style: "☐  "; }
+.tag { display: inline-block; padding: 0 8px; border-radius: 9px; font-size: 8.5pt; background: #f0efec; }
+.infra { background: #fbebeb; } .us { background: #f9ece7; } .team { background: #e7f1fb; }
+.note { color: #6b6b66; font-size: 9.5pt; }
+svg { width: 100%; height: auto; }
+</style>
+</head>
+<body>
+
+<h1>گزارش داشبورد عملیات سکو</h1>
+<div class="meta">2026-10-21 · تهیه‌کننده: علی</div>
+<div class="lead">داشبورد عملیات سکو هشت رویداد رایج نگهداری سکو را خودکار پیدا می‌کند و برای هر مشکل می‌گوید چه دیده، علت احتمالی چیست، مال کدام تیم است و راه‌حل پیشنهادی چیست. آدرس: <span class="ltr">https://85.198.48.95:8443</span>. داشبورد فقط می‌خواند و هیچ تغییری در کلاستر نمی‌دهد؛ درست کردن مشکل کار ماست.</div>
+
+<h2>۱. هشت رویداد و این‌که داشبورد هر کدام را چطور می‌بیند</h2>
+<p>هر هشت رویداد پوشش دارد. داشبورد 59 namespace از 85 namespace سکو را می‌خواند؛ 26 تای بقیه مال زیرساخت است و اجازه‌ی خواندنشان را نداریم.</p>
+<table>
+<tr><th>#</th><th>رویداد</th><th>داشبورد چطور پیدایش می‌کند</th><th>کجا ببینی</th><th>هنوز کم دارد</th></tr>
+<tr><td>1</td><td>باگ در سرویس</td><td>کرش پشت سر هم (CrashLoopBackOff)، کمبود حافظه (OOMKilled)، ری‌استارت پشت سر هم، probe ناموفق، خطای تازه در لاگ <code>aip-mlops-service</code></td><td>Incidents</td><td>خطای لاگ فقط برای <code>aip-mlops-service</code>؛ نرخ خطای 5xx نیست</td></tr>
+<tr><td>2</td><td>سرویس پایین است</td><td>pod آماده کمتر از تعداد خواسته‌شده، مدل KubeAI بدون نسخه‌ی آماده، pod در Pending، دانلود نشدن image، رد شدن چک probe</td><td>Incidents</td><td>namespaceهای زیرساخت را فقط probe از بیرون می‌بیند</td></tr>
+<tr><td>3</td><td>اضافه شدن فیچر</td><td>عوض شدن تگ image یا تنظیمات pod؛ 15 دقیقه بعد حکم healthy یا bad</td><td>Changes</td><td>اسم تغییردهنده (با توکن GitLab)؛ تغییر ConfigMap</td></tr>
+<tr><td>4</td><td>سرویس جدید</td><td>Deployment، StatefulSet، hostname یا namespace تازه، با کمبودهایش (readiness probe، سقف حافظه، تگ <code>latest</code>)</td><td>Changes</td><td>CronJob و DaemonSet</td></tr>
+<tr><td>5</td><td>مدل جدید</td><td>Model تازه یا تغییرکرده در KubeAI و این‌که تا 30 دقیقه آماده شد یا نه</td><td>Changes، Models</td><td>تماس آزمایشی و زمان پاسخ؛ namespace <code>llm-serving</code> بسته است</td></tr>
+<tr><td>6</td><td>چک کردن اطلاعات مدل</td><td>engine، resource profile، منبع وزن‌ها، replicaها، podها و ری‌استارت‌ها</td><td>Models</td><td>درصد GPU (توکن Grafana) و ثبت در litellm</td></tr>
+<tr><td>7</td><td>نگهداری و خواندن لاگ</td><td>لاگ زنده‌ی هر pod در 59 namespace، فیلتر «فقط خطا»، لاگ container قبلی</td><td>Logs</td><td>خلاصه با LLM؛ لاگ containerهای از بین رفته</td></tr>
+<tr><td>8</td><td>health check زیرساخت: MLOps یا زیرساخت؟</td><td>همه‌ی چک‌های probe، جدا شده بر اساس مالک</td><td>Infra or us</td><td>—</td></tr>
+</table>
+<p class="note">رویدادهای 3 تا 5 فقط با داده‌ی آزمایشی تست شده‌اند؛ از روشن شدن داشبورد هنوز تغییر واقعی روی سکو دیده نشده.</p>
+
+<h2>۲. داشبورد چطور کار می‌کند</h2>
+<svg viewBox="0 0 760 420" direction="rtl" font-size="13" font-family="Segoe UI, Tahoma">
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8a8a84"/></marker></defs>
+<text x="380" y="34" text-anchor="middle" font-size="15" font-weight="600">همه‌ی کار در یک container روی سرور AIP-IRAN انجام می‌شود</text>
+<text x="380" y="56" text-anchor="middle" font-size="11.5" fill="#6b6b66">کلاستر فقط خوانده می‌شود؛ هشدارها از لندن به تلگرام می‌روند</text>
+<rect x="216" y="76" width="328" height="320" rx="8" fill="#f2f2ef" stroke="#8a8a84"/>
+<text x="380" y="98" text-anchor="middle" font-weight="600">container sakoo-probe-station · دو VPN</text>
+<g fill="none" stroke="#8a8a84" stroke-width="1.25">
+<path d="M596 144H528" marker-end="url(#a)"/><path d="M380 212V172" marker-end="url(#a)"/><path d="M380 324V284" marker-end="url(#a)"/>
+<path d="M232 248H164" marker-end="url(#a)"/><path d="M232 352H164" marker-end="url(#a)"/><path d="M528 240H596" marker-end="url(#a)"/>
+<path d="M528 362H572V256H596" marker-end="url(#a)"/><path d="M666 268V324" marker-end="url(#a)"/></g>
+<g fill="#fff" stroke="#8a8a84" stroke-width="1.25">
+<rect x="232" y="116" width="296" height="56" rx="8"/><rect x="232" y="324" width="296" height="56" rx="8"/>
+<rect x="24" y="212" width="140" height="168" rx="8"/><rect x="596" y="116" width="140" height="56" rx="8"/>
+<rect x="596" y="212" width="140" height="56" rx="8"/><rect x="596" y="324" width="140" height="56" rx="8"/></g>
+<rect x="232" y="212" width="296" height="72" rx="8" fill="#e7f1fb" stroke="#1971c2" stroke-width="2"/>
+<g text-anchor="middle">
+<text x="380" y="140" font-weight="600">ops_web.py · صفحه و login</text><text x="380" y="156" font-size="11.5" fill="#6b6b66">پورت 8443، HTTPS، یک حساب برای هر نفر</text>
+<text x="380" y="236" font-weight="600">ops.py · جمع‌آوری و تشخیص</text><text x="380" y="252" font-size="11.5">aip-mlops-service هر دقیقه، بقیه هر 5 دقیقه</text><text x="380" y="268" font-size="11.5">تغییر و incident را در ops.db می‌نویسد</text>
+<text x="380" y="348" font-weight="600">probe.py · چک از بیرون</text><text x="380" y="364" font-size="11.5" fill="#6b6b66">هر 60 ثانیه؛ مالک هر چک: ما یا زیرساخت</text>
+<text x="94" y="236" font-weight="600">کلاستر سکو</text><text x="94" y="256" font-size="11.5" fill="#6b6b66">Kubernetes API</text><text x="94" y="272" font-size="11.5" fill="#6b6b66">59 namespace</text><text x="94" y="288" font-size="11.5" fill="#6b6b66">ingress و hostname</text>
+<text x="666" y="140" font-weight="600">مرورگر تیم</text><text x="666" y="156" font-size="11.5" fill="#6b6b66">85.198.48.95:8443</text>
+<text x="666" y="236" font-weight="600">سرور لندن</text><text x="666" y="252" font-size="11.5" fill="#6b6b66">104.194.143.68</text>
+<text x="666" y="348" font-weight="600">تلگرام</text><text x="666" y="364" font-size="11.5" fill="#6b6b66">پیام Sakoo ops</text>
+<g font-size="11.5" fill="#6b6b66"><text x="562" y="136">ورود</text><text x="446" y="197">داده‌ی صفحه</text><text x="446" y="309">نتیجه‌ی چک‌ها</text><text x="198" y="240">فقط GET</text><text x="198" y="344">چک</text><text x="562" y="232">هشدار</text><text x="550" y="354">گزارش</text><text x="702" y="300">ارسال</text></g>
+</g></svg>
+<p>همه‌ی اجزا در یک container داکر روی سرور AIP-IRAN هستند و از راه دو VPN به سکو وصل می‌شوند. <code>ops.py</code> فقط با درخواست GET می‌خواند و هیچ‌وقت چیزی را در کلاستر عوض نمی‌کند. هشدارها از سرور لندن به تلگرام می‌روند، چون سرور ایران به تلگرام دسترسی ندارد.</p>
+
+<h2>۳. ورود و کار روزانه</h2>
+<p>برای ورود فقط مرورگر لازم داری؛ VPN و kubectl لازم نیست.</p>
+<ol>
+<li>از علی بخواه برایت حساب بسازد. موقع ساختن، رمز را خودت تایپ کن (دست‌کم 10 حرف).</li>
+<li>آدرس <span class="ltr">https://85.198.48.95:8443</span> را باز کن. مرورگر هشدار امنیتی می‌دهد چون گواهی HTTPS را خودمان ساخته‌ایم (self-signed)؛ یک بار قبولش کن.</li>
+<li>نام کاربری و رمز را وارد کن. ورود 12 ساعت معتبر است. 5 بار رمز اشتباه، آن IP را 15 دقیقه می‌بندد.</li>
+</ol>
+<p><b>هر روز صبح، به همین ترتیب:</b></p>
+<ul class="check">
+<li>Overview را باز کن و هشت کاشی را نگاه کن. نوار قرمز کنار کاشی یعنی مشکل باز داریم.</li>
+<li>بالای صفحه ببین «Last round» کمتر از دو دقیقه پیش باشد؛ اگر نیست، به علی خبر بده.</li>
+<li>هر incident تازه را باز کن و «Likely cause» و «Owner» را بخوان.</li>
+<li>اگر Owner «Infra team» یا تیم دیگری است، متن «Message for the owner» را با Copy بردار و برای همان تیم بفرست.</li>
+<li>اگر Owner «MLOps (us)» است، به علی بگو و «Suggested fix» را هم بفرست. خودت چیزی روی کلاستر عوض نکن.</li>
+<li>Changes را برای 24 ساعت گذشته نگاه کن. release با حکم «bad» یعنی بعد از آن deploy مشکل پیدا شده.</li>
+</ul>
+<p>بین روز لازم نیست صفحه را باز نگه داری؛ incidentها و تغییرهای مهم با عنوان «Sakoo ops» در تلگرام می‌آیند (OPEN، CLOSED، RELEASE، NEW MODEL). مشکل‌های namespaceهای <code>user-*</code> فقط در داشبورد هستند، مگر agent کاربر که مال ماست.</p>
+
+<h2>۴. صفحه‌های داشبورد</h2>
+<table>
+<tr><th>صفحه</th><th>چه نشان می‌دهد</th><th>کی سراغش بروی</th></tr>
+<tr><td>Overview</td><td>هشت کاشی، incidentهای باز، تغییرهای 24 ساعت، زمان آخرین خواندن</td><td>اول هر روز</td></tr>
+<tr><td>Incidents</td><td>incidentهای باز یا بسته، فیلتر Bugs و Down</td><td>وقتی کاشی 1 یا 2 قرمز است</td></tr>
+<tr><td>صفحه‌ی یک incident</td><td>علت، راه‌حل، مالک، تغییر مرتبط، لاگ، podها، eventها، پیام آماده برای مالک</td><td>برای تصمیم و خبر دادن</td></tr>
+<tr><td>Changes</td><td>release، سرویس، hostname، namespace و مدل تازه، با حکم healthy یا bad</td><td>بعد از هر deploy یا خرابی ناگهانی</td></tr>
+<tr><td>Models</td><td>10 مدل KubeAI، آماده بودن، podها و نود</td><td>سؤال درباره‌ی یک مدل</td></tr>
+<tr><td>Services</td><td>workloadها، hostnameها، podها و eventهای یک ساعت اخیر هر namespace</td><td>بررسی یک سرویس</td></tr>
+<tr><td>Logs</td><td>لاگ زنده‌ی هر container، «errors only» و «previous container»</td><td>پیدا کردن علت کرش</td></tr>
+<tr><td>Infra or us</td><td>چک‌های probe به تفکیک زیرساخت، endpointهای ما، assetها و خود probe</td><td>وقتی چند سرویس با هم خراب شده‌اند</td></tr>
+</table>
+
+<h2>۵. خواندن یک incident</h2>
+<p>علت را قانون‌های ثابت حدس می‌زنند، نه آدم؛ پس قبل از فرستادن، شواهد پایین صفحه را هم نگاه کن.</p>
+<table>
+<tr><th>فیلد</th><th>یعنی چه</th></tr>
+<tr><td>What we see</td><td>آنچه واقعاً دیده شد، مثلاً «pod in CrashLoopBackOff, 22844 restarts»</td></tr>
+<tr><td>Likely cause</td><td>حدس داشبورد؛ اگر سرویس در 30 دقیقه‌ی قبل عوض شده باشد: «bad release a → b»</td></tr>
+<tr><td>Suggested fix</td><td>قدم بعدی؛ برای release بد: برگشت به تگ قبلی با MR در <code>prod/prod-cluster</code></td></tr>
+<tr><td>Owner</td><td>کسی که باید درستش کند</td></tr>
+<tr><td>Linked change</td><td>تغییری که احتمالاً باعث مشکل شده</td></tr>
+<tr><td>Message for the owner</td><td>متن آماده برای کپی و فرستادن</td></tr>
+<tr><td>شواهد</td><td>لاگ، podها، Warning eventها، تغییرهای دو ساعت قبل، چک‌های probe</td></tr>
+</table>
+<p><b>قانون مالک:</b></p>
+<ul>
+<li><span class="tag infra">زیرساخت</span> کمبود GPU/CPU/RAM، مشکل Ceph یا Harbor، چک‌های زیرساختی probe. سکو پایین است یا جا ندارد ← کار زیرساخت.</li>
+<li><span class="tag us">ما (MLOps)</span> هر چیز در <code>aip-mlops-service</code>، agentهای mlops-core کاربران، endpointهای خودمان. سکو سالم ولی سرویس ما خراب ← کار ما.</li>
+<li><span class="tag team">تیم دیگر</span> هر namespace دیگر، مثل <code>zenml</code> یا <code>openwebui</code> (از روی اسم namespace؛ فهرست واقعی تیم‌ها هنوز نیست).</li>
+</ul>
+<p><b>مثال واقعی، incident 3:</b> pod سرویس <code>openwebui</code> تا امروز 22844 بار ری‌استارت شده. خط آخر لاگ container قبلی:</p>
+<pre>ValueError: No embedding model is loaded. Set RAG_EMBEDDING_MODEL to a valid SentenceTransformer model name, or configure an external RAG_EMBEDDING_ENGINE (ollama, openai, azure_openai).</pre>
+<p>یعنی مدل embedding تنظیم نشده و برنامه همان اول کار می‌میرد؛ صاحب <code>openwebui</code> باید <code>RAG_EMBEDDING_MODEL</code> را تنظیم کند.</p>
+<p>داشبورد مشکل‌های مرتبط را هم به هم وصل می‌کند: probe از <code>zenmlpilot.aipsharif.ir</code> جواب 503 گرفت (incident 9) و داشبورد علتش را incident 8 نوشت، یعنی کرش <code>zenml-sso-gateway</code>. اول 8 باید درست شود.</p>
+
+<h2>۶. وضعیت امروز</h2>
+<p>روز اول (2026-10-21) داشبورد 10 مشکل واقعی باز پیدا کرد؛ بعضی چند روز بود کسی متوجهشان نشده بود. وضعیت لحظه‌ای را در خود داشبورد ببین.</p>
+<table>
+<tr><th>#</th><th>کجا</th><th>چه شده</th><th>علت</th><th>مالک</th></tr>
+<tr><td>1</td><td><code>aip-mlops-service</code> / مدل <code>chronos-t5-large</code></td><td>Pending، حدود 27 ساعت</td><td>تکه‌ی GPU نوع <code>mig-1g.10gb</code> خالی نیست</td><td><span class="tag infra">زیرساخت</span></td></tr>
+<tr><td>4</td><td><code>user-amraei</code> / agent mlops-core</td><td>Pending، حدود 4 روز</td><td>همان کمبود <code>mig-1g.10gb</code></td><td><span class="tag infra">زیرساخت</span></td></tr>
+<tr><td>5</td><td><code>user-arman</code> / agent mlops-core</td><td>Pending</td><td>همان کمبود <code>mig-1g.10gb</code></td><td><span class="tag infra">زیرساخت</span></td></tr>
+<tr><td>6</td><td><code>user-nimazolfagharian</code> / agent mlops-core</td><td>Pending، حدود 11 روز</td><td>init container <code>init-k8s-glue</code> تمام نمی‌شود</td><td><span class="tag us">ما</span></td></tr>
+<tr><td>7</td><td><code>user-zarei</code> / agent mlops-core</td><td>Pending، حدود 8 روز</td><td>همان <code>init-k8s-glue</code></td><td><span class="tag us">ما</span></td></tr>
+<tr><td>2</td><td><code>cs-project</code> / <code>cs-project-rag-api</code></td><td>Pending، حدود 18 روز</td><td>init container <code>wait-for-elasticsearch-restore</code> تمام نمی‌شود</td><td><span class="tag team">cs-project</span></td></tr>
+<tr><td>3</td><td><code>openwebui</code></td><td>کرش پشت سر هم، 22844 ری‌استارت</td><td><code>RAG_EMBEDDING_MODEL</code> تنظیم نشده</td><td><span class="tag team">openwebui</span></td></tr>
+<tr><td>8</td><td><code>zenml</code> / <code>zenml-sso-gateway</code></td><td>کرش پشت سر هم</td><td>container بلافاصله بعد از شروع بیرون می‌آید</td><td><span class="tag team">zenml</span></td></tr>
+<tr><td>9</td><td><code>zenmlpilot.aipsharif.ir</code></td><td>جواب 503</td><td>همان کرش incident 8</td><td><span class="tag team">zenml</span></td></tr>
+<tr><td>10</td><td><code>studiopilot.aipsharif.ir</code></td><td>جواب 503</td><td>هنوز معلوم نیست؛ namespace آن در فهرست ما نیست</td><td><span class="tag us">ما (موقت)</span></td></tr>
+</table>
+<p>پنج ردیف اول به کار روزانه‌ی ما مربوط است. یک مدل و دو agent منتظر GPU هستند؛ درست کردنش کار زیرساخت است، ولی پیگیری‌اش با ماست. دو agent دیگر در init container گیر کرده‌اند و این کار خودمان است.</p>
+
+<h2>۷. قانون‌های ایمنی</h2>
+<p>مهم‌ترین قانون: روی کلاستر prod مستقیم چیزی را عوض نکن. کلاستر با Flux از مخزن Git ساخته می‌شود و هر تغییر دستی یا برمی‌گردد یا چیزی را پاک می‌کند.</p>
+<ul>
+<li>دستورهای <code>kubectl delete</code>، <code>apply</code>، <code>patch</code>، <code>edit</code> و <code>exec</code> را روی prod اجرا نکن. تغییر فقط با MR در <code>prod/prod-cluster</code>؛ Flux بعد از merge در 1 تا 10 دقیقه اعمالش می‌کند.</li>
+<li>قبل از هر دستور kubectl، با <code>kubectl config current-context</code> ببین روی کدام کلاستری.</li>
+<li>داشبورد عمداً فقط می‌خواند و دکمه‌ی تعمیر ندارد؛ تصمیم را آدم می‌گیرد.</li>
+<li>رمز، توکن یا محتوای پوشه‌ی <code>secrets</code> را در تلگرام، چت یا تیکت نفرست.</li>
+<li>لینک و رمز داشبورد را بیرون از تیم نده؛ پشت رمزش لاگ 59 namespace است.</li>
+<li>متن «Message for the owner» را قبل از فرستادن بخوان؛ اگر خطی اطلاعات کاربر یا کلید داشت، پاکش کن.</li>
+</ul>
+
+<h2>۸. کارهای باقی‌مانده</h2>
+<table>
+<tr><th>کار</th><th>مسئول</th><th>وضعیت</th></tr>
+<tr><td>وارد کردن توکن GitLab و Grafana با <code>ssh -t AIP-IRAN sh station/set-ops-tokens.sh</code></td><td>علی</td><td>منتظر</td></tr>
+<tr><td>فهرست IPهای تیم برای محدود کردن صفحه (<code>OPS_ALLOW_CIDRS</code>)</td><td>علی</td><td>شروع نشده</td></tr>
+<tr><td>ساختن حساب برای هر هم‌تیمی</td><td>علی</td><td>شروع نشده</td></tr>
+<tr><td>ServiceAccount فقط‌خواندنی برای داشبورد</td><td>ادمین‌های کلاستر</td><td>شروع نشده</td></tr>
+<tr><td>اجازه‌ی خواندن <code>llm-serving</code></td><td>ادمین‌های کلاستر</td><td>شروع نشده</td></tr>
+<tr><td>فهرست «namespace به تیم» برای مالک واقعی</td><td>علی</td><td>شروع نشده</td></tr>
+<tr><td>کلید litellm برای خلاصه‌ی لاگ (اختیاری)</td><td>علی</td><td>شروع نشده</td></tr>
+<tr><td>کد: خطای لاگ همه‌ی namespaceها، CronJob و DaemonSet، تغییر ConfigMap</td><td>Claude</td><td>شروع نشده</td></tr>
+<tr><td>کد: تماس آزمایشی مدل و زمان پاسخ، لینک incident در تلگرام</td><td>Claude</td><td>شروع نشده</td></tr>
+<tr><td>چک اولین تغییر واقعی در Changes (تأیید رویدادهای 3 تا 5)</td><td>تیم</td><td>منتظر</td></tr>
+</table>
+
+<h2>۹. واژه‌نامه</h2>
+<table>
+<tr><th>اصطلاح</th><th>یعنی</th></tr>
+<tr><td>namespace</td><td>پوشه‌ای در Kubernetes که سرویس‌های یک تیم یا کاربر را جدا نگه می‌دارد</td></tr>
+<tr><td>pod</td><td>کوچک‌ترین واحد اجرا؛ یک یا چند container که با هم بالا می‌آیند</td></tr>
+<tr><td>container</td><td>برنامه‌ای که از یک image ساخته شده و اجرا می‌شود</td></tr>
+<tr><td>init container</td><td>container که قبل از container اصلی اجرا می‌شود و باید تمام شود</td></tr>
+<tr><td>Deployment / StatefulSet</td><td>تعریف سرویس: کدام image، چند نسخه، چه تنظیماتی</td></tr>
+<tr><td>replica</td><td>یک نسخه‌ی در حال اجرا؛ «1/1 ready» یعنی یکی خواستیم و یکی آماده است</td></tr>
+<tr><td>image tag</td><td>نسخه‌ی image مثل <code>training-api:1.5.13</code>؛ عوضش یعنی release تازه</td></tr>
+<tr><td>CrashLoopBackOff</td><td>container بالا می‌آید و زود می‌میرد؛ Kubernetes بین تلاش‌ها بیشتر صبر می‌کند</td></tr>
+<tr><td>OOMKilled</td><td>container از سقف حافظه‌اش بیشتر خواست و کشته شد</td></tr>
+<tr><td>Pending</td><td>pod هنوز اجرا نشده: جا نیست، volume وصل نمی‌شود، یا init container تمام نشده</td></tr>
+<tr><td>ImagePullBackOff</td><td>image دانلود نمی‌شود: تگ نیست یا Harbor در دسترس نیست</td></tr>
+<tr><td>readiness probe</td><td>چکی که Kubernetes می‌زند تا بفهمد container آماده‌ی درخواست است</td></tr>
+<tr><td>Ingress / hostname</td><td>آدرس بیرونی سرویس مثل <code>mlopsapipilot.aipsharif.ir</code></td></tr>
+<tr><td>event</td><td>پیام Kubernetes درباره‌ی یک شیء؛ حدود یک ساعت بعد پاک می‌شود</td></tr>
+<tr><td>KubeAI Model</td><td>تعریف مدل در KubeAI: با کدام موتور (مثل vLLM) و روی چه GPU</td></tr>
+<tr><td>MIG (<code>mig-1g.10gb</code>)</td><td>تکه‌ای از یک GPU تقسیم‌شده با 10 گیگابایت حافظه</td></tr>
+<tr><td>probe</td><td>برنامه‌ی ما روی AIP-IRAN که هر 60 ثانیه سکو را از بیرون چک می‌کند</td></tr>
+<tr><td>GitOps / Flux</td><td>همه‌ی تغییرهای prod از مخزن Git می‌آید و Flux اعمالش می‌کند</td></tr>
+<tr><td>release</td><td>نسخه‌ی تازه‌ی deploy‌شده؛ 15 دقیقه بعد healthy یا bad می‌شود</td></tr>
+</table>
+</body>
+</html>

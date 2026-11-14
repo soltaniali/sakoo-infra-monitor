@@ -33,7 +33,7 @@ function ago(t) {
   if (s < 0) return 'in ' + ago(t + 2 * s).replace(' ago', '');
   return s < 90 ? Math.round(s) + ' s ago' : s < 5400 ? Math.round(s / 60) + ' min ago' : s < 172800 ? Math.round(s / 3600) + ' h ago' : Math.round(s / 86400) + ' d ago';
 }
-const OWNER = o => o === 'us' ? 'MLOps (us)' : o === 'infra' ? 'Infra team' : o === 'asset' ? 'MLOps asset' : o === 'monitor' ? 'Probe' : 'Team ' + o;
+const OWNER = o => o === 'us' ? 'MLOps (us)' : o === 'infra' ? 'Infra team' : o === 'capacity' ? 'Capacity (cluster full)' : o === 'asset' ? 'MLOps asset' : o === 'monitor' ? 'Probe' : 'Team ' + o;
 const SYM = {crashloop: 'Crash loop', oomkilled: 'Out of memory', 'image-pull': 'Image pull', pending: 'Pending', flapping: 'Restarting',
   'probe-failing': 'Probe failing', down: 'Down', 'model-down': 'Model down', 'new-error': 'New error', endpoint: 'Endpoint check', infra: 'Infra check', 'llm-failing': 'LLM calls failing'};
 const CHG = {release: 'Release', config: 'Config change', 'new-service': 'New service', 'new-host': 'New hostname', 'new-namespace': 'New namespace',
@@ -1009,9 +1009,9 @@ VIEWS.trends = async () => {
 
 VIEWS.infra = async () => {
   const r = await api('/api/infra');
-  const groups = [['infra', 'Infra team owns these'], ['us', 'Ours: endpoints'], ['asset', 'Ours: MLOps assets'], ['monitor', 'The probe itself']];
+  const groups = [['infra', 'Infra team owns these'], ['capacity', 'Capacity: cluster full, nothing is down'], ['us', 'Ours: endpoints'], ['asset', 'Ours: MLOps assets'], ['monitor', 'The probe itself']];
   return h('div', {}, h('h1', {}, 'Infra or us?'),
-    h('p', {class: 'mut'}, 'Probe report ' + ago(r.ts) + '. Rule: platform down or out of capacity = infra; platform up but our service fails = us.'),
+    h('p', {class: 'mut'}, 'Probe report ' + ago(r.ts) + '. Rule: platform down = infra; cluster full = capacity (not an outage); platform up but our service fails = us.'),
     groups.map(([o, title]) => {
       const rows = r.results.filter(x => x.owner === o).sort((a, b) => a.ok - b.ok || a.name.localeCompare(b.name));
       if (!rows.length) return '';

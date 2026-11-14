@@ -35,6 +35,10 @@ report(False)
 assert sent == [], sent                                   # 1st failure: quiet
 report(False)
 assert len(sent) == 1 and "INFRA DOWN" in sent[0], sent
+probe.report({"k8s GPU capacity": [False, "1 events", "capacity"]})
+probe.report({"k8s GPU capacity": [False, "1 events", "capacity"]})
+assert "CAPACITY FULL" in sent[-1] and "INFRA DOWN" not in sent[-1], sent
+sent.pop()
 report(False)
 assert len(sent) == 1, sent                               # no repeat
 report(True)
@@ -100,8 +104,66 @@ assert r["a"][0] and r["a"][2] == "asset", r                                 # a
 assert not r["b"][0] and "no ready pod" in r["b"][1], r
 assert not r["c"][0] and "no route" in r["c"][1], r  # route gone: traefik fallback page
 assert not r["d"][0] and "502" in r["d"][1], r
+assert r["asset list"][0], r                                # reported when fine too, so its alert can recover
+probe.CFG["event_namespaces"], saved_get = ["n1"], probe.get
+probe.get = lambda url, **kw: (200, b'{"items": []}')
+ev = probe.check_events()
+assert ev["kubernetes events"][0] and ev["k8s GPU capacity"][0], ev          # same: present when fine
+assert ev["k8s GPU capacity"][2] == "capacity" and ev["k8s nodes ready"][2] == "infra", ev   # cluster full is not infra down
+probe.get = saved_get
 
-import tempfile as _t                                      # VPN check: interface up but OpenVPN reconnecting = down
+# --- false alarms when the network is the problem, not AIP (seen 2026-11-02, 11-03, 11-06)
+UP, GONE = (True, "HTTP 200", 200, None), (False, "TimeoutError: timed out", None, "path")
+HUNG = (False, "TimeoutError: The read operation timed out", None, "read")
+probe.CFG["hosts"] = ["h%d" % i for i in range(20)]       # checks run at the same time: 20 dead hosts cost one timeout,
+probe.check_host = lambda h, ip=None: time.sleep(0.3) or GONE              # not 20 (a slow round looked like a silent probe)
+t0 = time.time()
+assert probe.host_checks({}, None, "x", "infra") is False and time.time() - t0 < 2, time.time() - t0
+
+
+def one_round(hosts, inner_ok=True, public=None, assets=(), public_ip="1.2.3.4"):
+    """One probe round with canned answers. hosts: check_host result per hostname over the cluster VPN; public: over the
+    public IP (default: same as hosts). Asset URLs never answer over the cluster VPN."""
+    probe.CFG.update(hosts=list(hosts), ingress_ip="10.0.0.1", public_ip=public_ip, tcp_checks={"node a": ["10.0.0.2", 1]},
+                     http_checks={"kubernetes API": {"url": "https://api/livez"}}, assets=list(assets), kubeconfig="x")
+    pub = public or hosts
+    probe.check_host = lambda h, ip=None: pub[h] if ip == "1.2.3.4" else hosts[h]
+
+    def fetch(url, ip=None):
+        code = pub.get(probe.urllib.parse.urlsplit(url).hostname, GONE)[2] if ip == "1.2.3.4" else None
+        if not code:
+            raise probe.NoPath("TimeoutError: timed out")
+        return code, b""
+    probe.fetch = fetch
+    probe.check_tcp = lambda ip, port: (inner_ok, "x")
+    probe.check_http = lambda url, *a: (inner_ok, "x")
+    probe.check_events = lambda: {}
+    return probe.run_checks()
+
+
+ALL_UP = {"h1": UP, "h2": UP, "h3": UP, "h": UP}
+r = one_round({"h1": UP, "h2": GONE, "h3": HUNG}, public=ALL_UP)   # no answer through the cluster VPN, answer over the public IP:
+assert "host h2" not in r and "host h3" not in r and r["host h1"][0], r      # the probe's path, not the apps
+assert not r[probe.PATH][0] and r[probe.PATH][2] == "monitor" and "2 checks" in r[probe.PATH][1], r
+r = one_round({"h1": UP, "h2": UP, "h3": HUNG}, public={"h1": UP, "h2": UP, "h3": HUNG})   # no answer on both paths: that app
+assert not r["host h3"][0] and r["host h3"][2] == "us" and "public IP either" in r["host h3"][1] and r[probe.PATH][0], r
+r = one_round({"h1": UP, "h2": UP, "h3": HUNG}, public={"h1": UP, "h2": UP, "h3": (True, "HTTP 503", 503, None)})
+assert not r["host h3"][0], r                               # traefik answers 5xx over the public IP: the app is broken
+r = one_round({"h1": UP, "h2": GONE, "h3": HUNG}, public_ip=None)   # no second path: 2+ hostnames silent = the path
+assert "host h2" not in r and "host h3" not in r and not r[probe.PATH][0], r
+r = one_round({"h1": UP, "h2": UP, "h3": HUNG}, public_ip=None)     # no second path, one hostname silent: that app
+assert not r["host h3"][0] and r[probe.PATH][0], r
+r = one_round({"h1": UP}, public=ALL_UP, assets=[{"name": "a", "url": "https://h/a"}, {"name": "b"}])
+assert "a" not in r and not r[probe.PATH][0] and not r["b"][0], r             # a answers over the public IP; b has no ready pod
+r = one_round({"h1": UP}, public={"h1": UP}, assets=[{"name": "a", "url": "https://h/a"}])
+assert not r["a"][0] and "public IP either" in r["a"][1], r                   # no answer on both paths: asset down
+r = one_round({"h1": GONE, "h2": GONE}, inner_ok=False, public={"h1": UP, "h2": UP})
+assert set(r) == {"probe VPN cluster", probe.PUBLIC}, r    # nothing answers through the cluster VPN but users reach AIP:
+assert not r["probe VPN cluster"][0] and r["probe VPN cluster"][2] == "monitor" and r[probe.PUBLIC][0], r   # the probe's path, not infra
+r = one_round({"h1": GONE, "h2": GONE}, inner_ok=False)    # both paths dead: infra
+assert not r[probe.INGRESS][0] and r[probe.INGRESS][2] == "infra" and not r[probe.PUBLIC][0] and not r["kubernetes API"][0], r
+
+import tempfile as _t                                     # VPN check: interface up but OpenVPN reconnecting = down
 log = Path(_t.mkdtemp()) / "vpn.log"
 LOG = ["x Initialization Sequence Completed", "x [srv] Inactivity timeout (--ping-restart), restarting",
        "2026-11-20 01:00:43 TCP: connect to [AF_INET]5.202.5.212:7071 failed: Operation timed out",

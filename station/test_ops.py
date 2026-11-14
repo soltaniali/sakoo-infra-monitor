@@ -123,7 +123,7 @@ assert nb["owner"] == "user-x" and nb["alerted"] == 0, nb                  # use
 [ag] = inc(obj="y-agent-clearml-agent")
 assert ag["owner"] == "us" and ag["alerted"] == 1, ag                       # per-user ClearML agents are ours
 [m2] = inc(obj="m2", symptom="pending")
-assert m2["owner"] == "infra" and "no free nvidia.com/gpu" in m2["cause"], m2
+assert m2["owner"] == "capacity" and "no free nvidia.com/gpu" in m2["cause"], m2                # cluster full, not infra down
 assert not inc(obj="m2", symptom="model-down") and not inc(obj="m3"), q("SELECT obj, symptom FROM incidents")  # pod explains it; m3 in grace
 alerts = sent_text()
 assert "OPEN #%d crashloop" % tr["id"] in alerts and "RELEASE aip-mlops-service/training-api" in alerts, alerts
@@ -143,7 +143,7 @@ old["status"]["conditions"].append({"type": "PodScheduled", "status": "False", "
 K["llm-team"]["pods"].append(old)
 col.run_round()
 [big] = inc(obj="big")
-assert big["owner"] == "infra" and "no free nvidia.com/gpu" in big["cause"], big
+assert big["owner"] == "capacity" and "no free nvidia.com/gpu" in big["cause"], big
 K["llm-team"]["pods"].pop()
 stuck = pod("agent-abc-1", "agent", phase="Pending", ready=False, waiting="PodInitializing")  # an init container that never ends
 stuck["spec"]["initContainers"] = [{"name": "wait-db"}]
@@ -170,6 +170,7 @@ assert any(c["type"] == "removed" and c["name"] == "router" for c in q("SELECT *
 
 # 5. release verdict after 15 min: bad (an incident opened on it); new model: ready
 col.exec("UPDATE changes SET ts = ts - 1200")
+col.exec("UPDATE incidents SET opened = opened - 1200")                     # the crash loop lasted those 20 min, not a restart blip
 col.judge_changes(time.time())
 ch = {c["name"]: c for c in q("SELECT * FROM changes")}
 assert ch["training-api"]["verdict"] == "bad" and ch["m3"]["verdict"] == "ready", ch
@@ -177,15 +178,17 @@ assert ch["training-api"]["verdict"] == "bad" and ch["m3"]["verdict"] == "ready"
 # 6. probe results: infra check = infra, our asset = us (with pods as evidence), no Telegram (London alerts those)
 clear_out()
 Path(os.environ["PROBE_RESULTS"]).write_text(json.dumps({"ts": time.time(), "results": {
-    "k8s GPU capacity": [False, "2 events", "infra"], "probe VPN cluster": [True, "tun0 connected", "monitor"],
+    "k8s GPU capacity": [False, "2 events", "capacity"], "harbor reachable": [False, "timeout", "infra"], "probe VPN cluster": [True, "tun0 connected", "monitor"],
     "training-api": [False, "no ready pod", "asset", {"person": "Dariush", "value": "Critical"}]}}))
 col.run_round()
 [gi] = inc(symptom="infra", state="open")
+[gc] = inc(symptom="capacity", state="open")
+assert gc["owner"] == "capacity" and "nothing is down" in gc["cause"], gc
 [ta] = inc(symptom="endpoint", state="open")
 assert gi["owner"] == "infra" and ta["owner"] == "us" and ta["ns"] == NS and "Dariush" in ta["fix"], (gi, ta)
 assert json.loads(ta["evidence"])["pods"] and "OPEN" not in sent_text(), sent_text()
 col.run_round()                                                             # same probe report again: no change
-assert len(inc(state="open")) == 2
+assert len(inc(state="open")) == 3
 
 # 7. log signatures: first hour learns, then a new error opens one incident; numbers do not make a new signature
 assert ops.signature("ERROR db timeout after 30 s id=4f3a2b1c9d8e7f60") == ops.signature("ERROR db timeout after 31 s id=0a1b2c3d4e5f6071")
@@ -823,3 +826,100 @@ assert [e["text"] for e in logins if e["bad"] and e["ts"] == NOW - 7200] == ["Wr
 assert any(e["kind"] == "llm" and e["bad"] for e in a["events"]) and any(e["kind"] == "pod" and "waited 2 h" in e["text"] for e in a["events"]), a["events"]
 assert ops.dur(3 * 86400 + 4 * 3600) == "3 d 4 h" and ops.dur(600) == "10 min"
 print("ok (activity)")
+
+# --- alerts that were wrong or sent many times (audit 2026-11): a fresh collector, one case per false alarm
+for k in list(K):
+    K[k] = empty()
+LOGS.clear()
+Path(os.environ["PROBE_RESULTS"]).unlink(missing_ok=True)
+ops.DOWN_GRACE, ops.kget = 0, fake_kget
+c2 = ops.Collector(tmp / "alerts.db")
+q2 = lambda sql, a=(): c2.rows(sql, a)
+inc2 = lambda **w: [r for r in q2("SELECT * FROM incidents") if all(r[k] == v for k, v in w.items())]
+K[NS].update(deploy=[deploy("api", "api:1")], pods=[pod("api-abc-1", "api")], models=[model("mz", ready=0)])
+K[NS]["models"][0]["spec"]["minReplicas"] = 0
+c2.run_round()                                                              # baseline
+c2.set_meta("logs_since:" + NS, str(time.time() - 7200))
+# one traceback is many ERROR lines: one incident and one alert for the workload, not one per line
+LOGS["api-abc-1"] = ('ERROR [serving.py:1261]   File "/x/sampling_params.py", line 636, in verify\n'
+                     "ERROR [serving.py:1261]     raise ValueError(\nERROR [serving.py:1261] ValueError: Grammar error: Unimplemented keys")
+c2.run_round()
+[tb] = inc2(symptom="new-error")
+assert "Grammar error" in tb["detail"] and "+2 more" in tb["detail"] and "raise ValueError" in json.loads(tb["evidence"])["sample"], tb
+assert "\n".join(r["text"] for r in q2("SELECT text FROM outbox")).count("OPEN") == 1
+c2.run_round()
+assert len(inc2(symptom="new-error")) == 1
+# logs that cannot be read (VPN path down) are not "the error went quiet": no CLOSED alert after an outage
+NOW2 = time.time()
+
+
+def no_logs(path, raw=False):
+    if path.split("?")[0].endswith("/log"):
+        raise ops.KubeError("TimeoutError: timed out", None)
+    return fake_kget(path, raw)
+
+
+ops.kget = no_logs
+c2.scan_logs(NOW2 + 3600)
+assert inc2(symptom="new-error", state="open"), inc2(symptom="new-error")
+ops.kget, LOGS["api-abc-1"] = fake_kget, "INFO fine"
+c2.scan_logs(NOW2 + 3700)
+assert inc2(symptom="new-error", state="open"), inc2(symptom="new-error")   # quiet time counts from when the log was readable again
+c2.scan_logs(NOW2 + 3600 + ops.ERROR_QUIET_CLOSE + 1)
+assert inc2(symptom="new-error", state="closed")
+# a model scaled up from zero loads for minutes: its failing startup probe is not "probe-failing", and it is not "model-down" yet
+K[NS]["models"][0]["spec"]["minReplicas"] = 1
+K[NS]["pods"].append(pod("model-mz-1", "mz", ready=False, labels={"model": "mz"}, owner="mz"))
+K[NS]["events"] = [event("model-mz-1", "Unhealthy", 'Startup probe failed: Get "http://10.0.4.126:8000/health": connection refused')]
+c2.run_round()
+c2.run_round()
+assert not inc2(obj="mz"), inc2(obj="mz")
+K[NS]["events"] = [event("model-mz-1", "Unhealthy", "Readiness probe failed: HTTP probe failed with statuscode: 503")]
+c2.run_round()
+assert inc2(obj="mz", symptom="probe-failing"), inc2(obj="mz")              # a started container that fails its probe still alerts
+K[NS]["pods"].pop()
+K[NS]["events"] = []
+c2.exec("UPDATE changes SET ts = ts - ? WHERE name='mz'", (ops.MODEL_GRACE + 60,))
+c2.run_round()
+assert inc2(obj="mz", symptom="model-down"), inc2(obj="mz")                 # after the grace time it does
+
+
+# a release is "bad" for an incident that lasts, not for the 2 min its pod restarts, and not for an infra incident
+def judged(*incidents):
+    cid = c2.add_change(NOW2 - 1200, NS, "Deployment", "api", "release", "api:1", "api:2", {})
+    c2.exec("DELETE FROM incidents")
+    for state, owner, secs in incidents:
+        c2.exec("INSERT INTO incidents (key, scope, state, ns, obj, symptom, owner, opened, closed, clean, alerted) "
+                "VALUES ('k', 'probe', ?, ?, 'api', 'endpoint', ?, ?, ?, 0, 0)", (state, NS, owner, NOW2 - 1000, NOW2 - 1000 + secs))
+    c2.alerts = []
+    c2.judge_changes(NOW2)
+    return q2("SELECT verdict FROM changes WHERE id=?", (cid,))[0]["verdict"], c2.alerts
+
+
+assert judged(("closed", "us", 120), ("open", "infra", 0)) == ("healthy", [])
+verdict, bad = judged(("closed", "us", 600))
+assert verdict == "bad" and "BAD RELEASE" in bad[0], (verdict, bad)
+assert judged(("open", "us", 0))[0] == "bad"
+# model test calls while Kubernetes itself cannot be read (VPN path down): no "model-test" incident
+os.environ.update(LITELLM_URL="https://l/v1", LITELLM_KEY="k", LITELLM_MODEL="x")
+c2.litellm_models = lambda: ["mz"]
+saved_http = ops.http_json
+
+
+def timed_out(*a, **k):
+    raise TimeoutError("timed out")
+
+
+ops.http_json = timed_out
+c2.blind = True
+c2.test_models(NOW2)
+c2.test_models(NOW2)
+assert not inc2(symptom="model-test")
+c2.blind = False
+c2.test_models(NOW2)
+c2.test_models(NOW2)
+assert inc2(symptom="model-test")
+ops.http_json = saved_http
+for k in ("LITELLM_URL", "LITELLM_KEY", "LITELLM_MODEL"):
+    os.environ.pop(k)
+print("ok (false alarms)")

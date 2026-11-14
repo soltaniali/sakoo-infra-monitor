@@ -317,7 +317,7 @@ def analyze(col, d, ai=None):
         if rel:
             incs.append(dict(i, when=rel[0], at=rel[1]))
     mine = [i for i in incs if any(i["ns"] == ns and (o is None or i["obj"] == o or o in i["obj"]) for ns, o in objs)]
-    platform = [i for i in incs if i["owner"] in ("infra", "us") and i not in mine and not i["ns"].startswith("user-")]
+    platform = [i for i in incs if i["owner"] in ("infra", "capacity", "us") and i not in mine and not i["ns"].startswith("user-")]
     covered = bool(seen_moments)
     mine_active = [i for i in mine if i["when"] == "active"]
     staff = [m["ts"] for m in d["messages"] if m["from"] == "staff" and m["ts"]]

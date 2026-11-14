@@ -31,7 +31,8 @@ STATE, SUBS, OFFSET = DIR / "state.json", DIR / "subscribers.json", DIR / "tg_of
 FAIL_AFTER = int(os.environ.get("FAIL_AFTER", 2))
 SILENT_AFTER = int(os.environ.get("SILENT_AFTER_S", 180))
 MAX_SKEW = 300  # reject reports older/newer than 5 min (replays)
-LABEL = {"infra": "🔴 INFRA DOWN", "us": "🟠 MLOPS ISSUE", "asset": "🟠 MLOPS ASSET DOWN", "monitor": "⚠️ PROBE CANNOT SEE AIP"}
+LABEL = {"infra": "🔴 INFRA DOWN", "us": "🟠 MLOPS ISSUE", "asset": "🟠 MLOPS ASSET DOWN", "monitor": "⚠️ PROBE CANNOT SEE AIP",
+         "capacity": "🟡 CAPACITY FULL (nothing is down, new pods wait)"}
 MAX_TRIES, BLOCK_S = 5, 900  # wrong /login passwords per chat before a 15 min block
 lock, sub_lock = threading.Lock(), threading.Lock()
 login_fails = {}
@@ -104,7 +105,7 @@ def status_text():
 
 HELP = ("AIP infra monitor.\n/login <password>: get alerts\n/logout: stop alerts\n/status: what is failing now\n/dashboard: history of ups and downs\n"
         "/channel @name: also post every alert in a channel (bot must be its admin) · /unchannel @name: stop\n"
-        "Alert types: 🔴 infra team, 🟠 ours (MLOps endpoints and assets), ⚠️ the probe itself.")
+        "Alert types: 🔴 infra team, 🟠 ours (MLOps endpoints and assets), 🟡 cluster capacity full, ⚠️ the probe itself.")
 
 
 def handle(update):
@@ -248,15 +249,16 @@ def apply(results):
 
 
 def watchdog_tick():
-    """No report for SILENT_AFTER seconds: the cluster, its outbound network, or the probe is down."""
+    """No report for SILENT_AFTER seconds: the probe's machine is down or cannot reach this server. Says nothing about AIP:
+    the probe reports here over the internet, not through AIP."""
     with lock:
         state = load()
         quiet = time.time() - state["last_report"]
         if quiet > SILENT_AFTER and not state["silent"]:
             state["silent"] = True
             dashboard.record("probe reports", "monitor", False, "no report for %d min" % (quiet // 60))
-            send(["🔴 PROBE SILENT: no report for %d min. Either the probe (its machine, VPN or internet) is down, "
-                  "or AIP is unreachable from it. Check the probe first." % (quiet // 60)], state)
+            send(["⚠️ PROBE SILENT: no report for %d min. The probe (its machine, or its internet to this server) is down. "
+                  "This is not an AIP alarm: AIP is not watched until the probe is back." % (quiet // 60)], state)
 
 
 class Handler(BaseHTTPRequestHandler):

@@ -48,6 +48,7 @@ OPS_URL = os.environ.get("OPS_URL", "")  # dashboard link in alerts
 ROUND_S, SLOW_EVERY, WORKERS = 60, 5, 8
 CHANGE_WINDOW = 1800   # a symptom within 30 min after a change in the same object is linked to it
 RELEASE_WATCH = 900    # a release is judged healthy/bad 15 min after it
+ROLLOUT_BLIP = 300     # an incident shorter than this after a release is its pod restarting, not a bad release
 DOWN_GRACE, PENDING_GRACE, MODEL_GRACE = 180, 300, 1800
 FLAP_RESTARTS, FLAP_WINDOW = 3, 900
 CLEAN_TO_CLOSE, ERROR_QUIET_CLOSE = 2, 1800
@@ -102,6 +103,8 @@ RULES = {
     "model-test": ("a test call to the model through litellm fails twice in a row",
                    "check the model pod and its log, then the litellm route for this model", "Pipeline B: service is up but broken"),
     "infra": ("an infra check fails", "send the message below to the infra team", "Infra or us? Decide the owner first"),
+    "capacity": ("the cluster is full: no free GPU/CPU/RAM for new pods (nothing is down)",
+                 "free resources (scale down idle models) or ask the infra team for more capacity", "Infra or us? Decide the owner first"),
 }
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
@@ -394,6 +397,7 @@ class Collector:
     def rows(self, sql, args=()):
         with self.lock:
             return [dict(r) for r in self.conn.execute(sql, args)]
+        self.blind = False  # this round could not read our namespace: the path to AIP is down
 
     def one(self, sql, args=()):
         r = self.rows(sql, args)
@@ -1185,6 +1189,7 @@ class Collector:
         # tried, not only synced: while the site is down, one login every SYNC_S and not one per round
         if tickets.enabled() and not self.tickets_busy and t - max(float(self.meta("tickets_synced") or 0), self.tickets_tried) > tickets.SYNC_S:
             self.tickets_busy, self.tickets_tried = True, t
+        self.blind = isinstance(snaps[0], str)
             self.bg.put(("tickets", None))
         self.flush_alerts()
         if t - float(self.meta("pruned") or 0) > 86400:
@@ -1301,7 +1306,9 @@ class Collector:
                 m = self.inv.get(c["ns"], {}).get("Model/%s/%s" % (c["ns"], c["name"]))
                 verdict = "ready" if m and m["ready"] else ("not ready" if t - c["ts"] > MODEL_GRACE else None)
             elif t - c["ts"] >= RELEASE_WATCH:
-                bad = self.one("SELECT id FROM incidents WHERE ns=? AND obj=? AND opened>=? ORDER BY id LIMIT 1", (c["ns"], c["name"], c["ts"]))
+                # not the minutes its pod restarts during the rollout, and not what infra owns (no free GPU)
+                bad = self.one("SELECT id FROM incidents WHERE ns=? AND obj=? AND opened>=? AND owner NOT IN ('infra', 'capacity') "
+                               "AND (state='open' OR closed-opened>=?) ORDER BY id LIMIT 1", (c["ns"], c["name"], c["ts"], ROLLOUT_BLIP))
                 verdict = "bad" if bad else "healthy"
                 if bad and alertable(c["ns"], owner_of(c["ns"], c["name"])):
                     what = "%s → %s" % (c["before"], c["after"]) if c["before"] else c["after"]
@@ -1348,10 +1355,12 @@ class Collector:
                     pod=p["name"], event=e["msg"] if e else "", reason=e["reason"] if e else "")
             elif hist[-1][1] - hist[0][1] >= FLAP_RESTARTS:
                 add("flapping", wl, "pod %s restarted %d times in %d min" % (p["name"], hist[-1][1] - hist[0][1], FLAP_WINDOW // 60), pod=p["name"])
-            elif (p["phase"] == "Running" and not p["ready"] and t - (p["started"] or t) > DOWN_GRACE
-                  and hist[-1][1] == hist[0][1] and any(e["reason"] == "Unhealthy" for e in pev)):
-                msg = next(e["msg"] for e in reversed(pev) if e["reason"] == "Unhealthy")
-                add("probe-failing", wl, "pod %s not ready: %s" % (p["name"], msg), pod=p["name"], event=msg)
+            elif p["phase"] == "Running" and not p["ready"] and t - (p["started"] or t) > DOWN_GRACE and hist[-1][1] == hist[0][1]:
+                # a failing startup probe is a container still starting (a model loading); if it never starts,
+                # the kubelet restarts it and "flapping" or "down" says so
+                msg = next((e["msg"] for e in reversed(pev) if e["reason"] == "Unhealthy" and not e["msg"].startswith("Startup probe")), None)
+                if msg:
+                    add("probe-failing", wl, "pod %s not ready: %s" % (p["name"], msg), pod=p["name"], event=msg)
         for k in [k for k in self.restart_hist if k[0] == ns and k[1] not in live]:
             del self.restart_hist[k]
         has = {s[2] for s in sym.values()}
@@ -1361,8 +1370,10 @@ class Collector:
                 short, grace = "down", DOWN_GRACE
                 detail = "%d/%d replicas ready" % (o["ready"], o["desired"])
             elif o["kind"] == "Model" and o["min"] and o["ready"] < o["min"]:
-                short = "model-down"
-                grace = MODEL_GRACE if t - (o["created"] or 0) < MODEL_GRACE else DOWN_GRACE
+                short = "model-down"  # a new model, or one just scaled up or changed, loads its weights first
+                fresh = t - (o["created"] or 0) < MODEL_GRACE or self.one(
+                    "SELECT 1 FROM changes WHERE ns=? AND kind='Model' AND name=? AND ts>?", (ns, o["name"], t - MODEL_GRACE))
+                grace = MODEL_GRACE if fresh else DOWN_GRACE
                 detail = "%d/%d replicas ready (minReplicas %d)" % (o["ready"], o["min"], o["min"])
             if not short:
                 self.since.pop(key, None)
@@ -1387,7 +1398,7 @@ class Collector:
             self.mark("probe:" + name, "up" if ok else "down", data["ts"])
             if ok or owner == "monitor":
                 continue
-            symptom = "infra" if owner == "infra" else "endpoint"
+            symptom = owner if owner in ("infra", "capacity") else "endpoint"
             ns, obj = "-", name
             if name in {o["name"] for o in self.inv.get(OUR_NS, {}).values()}:
                 ns = OUR_NS
@@ -1413,9 +1424,9 @@ class Collector:
             try:
                 return job, kget("/api/v1/namespaces/%s/pods/%s/log?container=%s&sinceSeconds=%d&tailLines=%d&timestamps=true"
                                  % (ns, p["name"], c, ROUND_S * SLOW_EVERY + 30, LOG_TAIL), raw=True)
-            except Exception:
-                return job, ""
-        seen = {}  # (ns, sig) -> [workload, pod, sample line, count]
+            except Exception as e:
+                return job, None if isinstance(e, KubeError) and e.code is None else ""  # None: the API gave no answer
+        seen, unread = {}, set()  # (ns, sig) -> [workload, pod, sample line, count]; (ns, workload) whose log could not be read
         with concurrent.futures.ThreadPoolExecutor(WORKERS) as ex:
             for (ns, p, c), text in ex.map(read, jobs):
                 mark, fresh, newest = (ns, p["name"], c), [], None
@@ -1435,11 +1446,14 @@ class Collector:
         with self.lock:
             self.conn.executemany("INSERT INTO signatures VALUES (?,?,?,?,?,?,?) ON CONFLICT(sig) DO UPDATE SET last=?, count=count+?",
                                   [(s, ns, wl, t, t, n, line, t, n) for (ns, s), (wl, _, line, n) in seen.items()])
+                if text is None:
+                    unread.add((ns, p["workload"]))
+                    continue
             self.conn.commit()
-        sym = {}
+        sym, new = {}, {}  # new: (ns, workload) -> this round's new error lines, in log order
         for (ns, sig), (wl, pod, line, n) in seen.items():
             key = "logs|new-error|%s|%s|%s" % (ns, wl, sig)
-            if (sig not in known and not learning.get(ns, True)) or key in open_keys:
+            if key in open_keys:
                 sym[key] = ("new-error", ns, wl, "%s (%d× in the last %d min)" % (line[:300], n, ROUND_S * SLOW_EVERY // 60),
                             {"pod": pod, "sample": line})
         self.observe("logs", sym, t)
@@ -1459,6 +1473,15 @@ class Collector:
         days = sorted(p for p in LOG_DIR.iterdir() if p.is_dir())
         size = {d: sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) for d in days}
         keep_from = time.strftime("%Y-%m-%d", time.gmtime(t - RETENTION))
+            elif sig not in known and not learning.get(ns, True):
+                new.setdefault((ns, wl), []).append((key, pod, line, n))
+        for (ns, wl), lines in new.items():  # one traceback is many new lines: one incident per workload, not one per line
+            key, pod, line, n = lines[-1]  # the last line of a traceback is the error itself
+            more = " (+%d more new error lines)" % (len(lines) - 1) if len(lines) > 1 else ""
+            sym[key] = ("new-error", ns, wl, "%s (%d× in the last %d min)%s" % (line[:300], n, ROUND_S * SLOW_EVERY // 60, more),
+                        {"pod": pod, "sample": "\n".join(x[2] for x in lines)})
+        for ns, wl in unread:  # no log, no verdict: "quiet for 30 min" counts only the time the log could be read
+            self.exec("UPDATE incidents SET last_seen=? WHERE state='open' AND scope='logs' AND ns=? AND obj=?", (t, ns, wl))
         for d in days:
             if d.name < keep_from or sum(size.values()) > LOG_CAP_BYTES:
                 shutil.rmtree(d, ignore_errors=True)
@@ -1502,7 +1525,7 @@ class Collector:
 
     def test_models(self, t):
         """Every 5 min: a 1-token chat call (or a tiny embedding) to each KubeAI model litellm knows. Needs the litellm key."""
-        if not self.integrations()["litellm"]:
+        if not self.integrations()["litellm"] or self.blind:  # blind: a failed call would be the path, not the model
             return
         names = self.litellm_models() or []
         base, auth = os.environ["LITELLM_URL"].rstrip("/"), {"Authorization": "Bearer " + os.environ["LITELLM_KEY"]}
@@ -1557,13 +1580,14 @@ class Collector:
 
     def diagnose(self, symptom, ns, obj, detail, ctx, t):
         cause, fix, book = RULES[symptom]
-        owner = "infra" if symptom == "infra" else "us" if symptom == "endpoint" and ns in ("-", OUR_NS) else owner_of(ns, obj)
+        owner = symptom if symptom in ("infra", "capacity") else "us" if symptom == "endpoint" and ns in ("-", OUR_NS) else owner_of(ns, obj)
         low = (ctx.get("event") or detail).lower()
         if symptom == "pending":
             if "insufficient" in low:
                 cause = "no free %s in the cluster" % "/".join(sorted(set(re.findall(r"insufficient ([\w./-]+)", low))))
-                owner, book = "infra", "Infra or us? Decide the owner first"
-                fix = "ask the infra team for capacity, or lower the request (smaller resourceProfile or fewer replicas)"
+                owner, book = "capacity", "Infra or us? Decide the owner first"  # the cluster is full, nothing is down
+                fix = "free resources (scale down idle models), ask the infra team for more capacity, or lower the request " \
+                      "(smaller resourceProfile or fewer replicas)"
             elif "persistentvolumeclaim" in low:
                 cause, fix = "the volume claim is missing or not bound", "create the PVC or fix its StorageClass"
             elif ctx.get("reason") == "Init":

@@ -17,10 +17,10 @@ from pathlib import Path
 DB = Path(__file__).resolve().parent / "history.db"
 TZ = 3.5 * 3600  # Tehran (UTC+03:30, no DST since 2022)
 RANGES = {"1h": 3600, "6h": 6 * 3600, "24h": 86400, "3d": 3 * 86400, "7d": 7 * 86400}
-SECTIONS = [("infra", "🛠 Infra (infra team)"), ("us", "🧩 Ours: endpoints"), ("asset", "📦 Ours: MLOps assets"),
-            ("monitor", "📡 Probe (the monitor itself)")]
+SECTIONS = [("infra", "🛠 Infra (infra team)"), ("capacity", "📊 Capacity (cluster full, nothing down)"), ("us", "🧩 Ours: endpoints"),
+            ("asset", "📦 Ours: MLOps assets"), ("monitor", "📡 Probe (the monitor itself)")]
 LINK_TTL = 24 * 3600
-OWNER = {"infra": "Infra team", "us": "Ours", "asset": "Ours (asset)", "monitor": "Probe"}
+OWNER = {"infra": "Infra team", "capacity": "Capacity", "us": "Ours", "asset": "Ours (asset)", "monitor": "Probe"}
 
 
 @contextlib.contextmanager
@@ -139,7 +139,7 @@ def grouped(rows, meta):
             if any(meta.get(r[0], {}).get("value", "?") == i for r in rows)]
 
 
-STATUS_SECTIONS = [("infra", "🛠 INFRA (infra team)"), ("us", "🧩 OURS (MLOps endpoints)"),
+STATUS_SECTIONS = [("infra", "🛠 INFRA (infra team)"), ("capacity", "📊 CAPACITY (cluster full, nothing down)"), ("us", "🧩 OURS (MLOps endpoints)"),
                    ("asset", "📦 MLOPS ASSETS"), ("monitor", "📡 PROBE (the monitor itself)")]
 
 
