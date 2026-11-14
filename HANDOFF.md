@@ -5,7 +5,7 @@ Read `AGENTS.md` first (layout, commands, rules).
 ## Current state (2026-11-14)
 
 - Station (AIP-IRAN `~/station`, container `sakoo-probe-station`) runs the local `station/ops.py` (deployed 2026-11-14; backup `~/station/ops.py.bak-20261111`).
-- All work committed and pushed (`2e8342d`).
+- All work committed and pushed (`2a5705a`).
 
 ## Recent changes
 

@@ -27,7 +27,7 @@ Iran probe station 85.198.48.95 (AIP-IRAN, user mlops, ~/station, Docker)
 
 ## 2. Status snapshot (2026-11-14)
 
-- Remote `github.com/soltaniali/sakoo-infra-monitor`, branch `main`, last pushed commit `2e8342d` (2026-11-14, Assignees line). Working tree clean.
+- Remote `github.com/soltaniali/sakoo-infra-monitor`, branch `main`, last pushed commit `2a5705a` (2026-11-14, shared namespaces → MLOps). Working tree clean.
 - Automation level **L1: diagnose only.** The station kubeconfig can write in
   `aip-mlops-service`; code uses a single GET helper (`ops.kget`). A read-only ServiceAccount was requested from the admins.
 
