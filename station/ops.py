@@ -296,6 +296,14 @@ def workload_of(p):
     return name[:-len(h) - 1] if h and name.endswith("-" + h) else name
 
 
+def pod_workload(ns, pod):
+    """Holder name from a pod name alone (history has no pod objects): KubeAI model, or the pod name without its hash."""
+    if pod.startswith("model-"):
+        return pod[len("model-"):].rsplit("-", 2)[0]
+    # ponytail: name-pattern guess (Deployment, Job/DaemonSet, StatefulSet); use kube_pod_owner if names come out wrong
+    return re.sub(r"(-[a-z0-9]{8,10}-[a-z0-9]{5}|-[a-z0-9]{5}|-\d+)$", "", pod)
+
+
 def qty(v):
     """Kubernetes quantity -> number (CPU in cores, memory in bytes). '500m' -> 0.5, '1Gi' -> 1073741824."""
     if v in (None, ""):
@@ -822,6 +830,7 @@ class Collector:
         for s in q('avg by (pod) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{pod=~"model-.*"}[%s]))' % span):
             busy[s["metric"]["pod"][len("model-"):].rsplit("-", 2)[0]] = float(s["value"][1])
         out += [("model", name, "gpu_avg", v) for name, v in busy.items()]
+        out += self.gpu_day_rows(span, at)
         running = '* on (namespace,pod) group_left () (kube_pod_status_phase{phase="Running"} == 1)'
         util = [float(s["value"][1]) for s in q("avg by (UUID) (avg_over_time(DCGM_FI_DEV_GPU_UTIL[%s]))" % span)]
         for metric, value in (("gpu_total", one('sum(kube_node_status_allocatable{resource="nvidia_com_gpu"})')),
@@ -834,6 +843,25 @@ class Collector:
                               ("mem_used", one('avg_over_time((sum(container_memory_working_set_bytes{container!=""}))[%s:15m])' % span) / 1024 ** 3),
                               ("mem_reserved", one('avg_over_time((sum(kube_pod_container_resource_requests{resource="memory"} %s))[%s:15m])' % (running, span)) / 1024 ** 3)):
             out.append(("cluster", "all", metric, value))
+        return out
+
+    def gpu_day_rows(self, span, at):
+        """Who held each physical GPU: [("gpu", "node#idx\\tns\\tworkload", "held_h"|"busy", value)]. DCGM labels a GPU with
+        the pod that holds it; counted in 5-min steps, so hours do not depend on the scrape interval."""
+        out, by = [], "Hostname, kubernetes_node, gpu, namespace, pod"
+        key = lambda m: "%s#%s\t%s\t%s" % (m.get("Hostname") or m.get("kubernetes_node"), m.get("gpu"), m["namespace"], pod_workload(m["namespace"], m["pod"]))
+        held, busy = {}, {}
+        for s in self.prom('sum by (%s) (count_over_time((DCGM_FI_DEV_GPU_UTIL{pod!=""} >= 0)[%s:5m]))' % (by, span), at):
+            if s["metric"].get("pod") and s["metric"].get("namespace"):
+                k = key(s["metric"])
+                held[k] = held.get(k, 0) + float(s["value"][1]) / 12
+        for s in self.prom('avg by (%s) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{pod!=""}[%s]))' % (by, span), at):
+            if s["metric"].get("pod") and s["metric"].get("namespace"):
+                busy.setdefault(key(s["metric"]), []).append(float(s["value"][1]))
+        for k, h in held.items():
+            out.append(("gpu", k, "held_h", h))
+            if busy.get(k):
+                out.append(("gpu", k, "busy", sum(busy[k]) / len(busy[k])))
         return out
 
     def save_daily(self, t):
@@ -853,6 +881,15 @@ class Collector:
                     self.conn.executemany("INSERT OR REPLACE INTO daily VALUES (?, ?, ?, ?, ?)", [(day,) + r for r in rows])
                     self.conn.commit()
                 self.set_meta("daily:" + day, str(t))
+                self.set_meta("dailygpu:" + day, str(t))
+                done += 1
+            elif not self.meta("dailygpu:" + day):  # days saved before GPU holders were kept: add them while Prometheus has them
+                begin = tday_start(day)
+                rows = self.gpu_day_rows("86400s", int(begin + 86400))
+                with self.lock:
+                    self.conn.executemany("INSERT OR REPLACE INTO daily VALUES (?, ?, ?, ?, ?)", [(day,) + r for r in rows])
+                    self.conn.commit()
+                self.set_meta("dailygpu:" + day, str(t))
                 done += 1
             day = tday(tday_start(day) + 86400 + 3600)
 
@@ -2150,6 +2187,43 @@ class Collector:
             raise KeyError("no ticket %s" % tid)
         d, ai = json.loads(r["data"]), json.loads(r["ai"]) if r["ai"] else None
         return dict(d, fetched=r["fetched"], seen=r["seen"], ai=ai, answers=tickets.analyze(self, d, ai))
+
+    def gpu_holders(self, frm=None, to=None):
+        """Per physical GPU over the range: who held it, how many hours, what share of the range, how busy; and one main
+        holder per day (to see it pass from one person to another). Range hours = the days we have data for."""
+        d = self.daily("gpu", frm, to)
+        people = self.people()
+        label = lambda ns, wl: next((p["name"] for p in people if ns.startswith("user-") and ns[5:] in p["users"]), None) or             (ns[5:] if ns.startswith("user-") else "%s (%s)" % (wl, ns))
+        now, gpus, holders = time.time(), {}, {}
+        day_h = {day: min(24.0, (now - tday_start(day)) / 3600) for day in d["days"]}
+        total_h = sum(day_h.values())
+        for day in d["days"]:
+            for name, v in d["rows"][day].items():
+                g, ns, wl = name.split("\t")
+                who, h = label(ns, wl), v.get("held_h", 0)
+                x = gpus.setdefault(g, {"gpu": g, "holders": {}, "days": {}})
+                y = x["holders"].setdefault(who, {"name": who, "ns": ns, "hours": 0, "busy_h": 0})
+                y["hours"] += h
+                y["busy_h"] += v.get("busy", 0) * h
+                x["days"].setdefault(day, {})
+                x["days"][day][who] = x["days"][day].get(who, 0) + h
+                z = holders.setdefault(who, {"name": who, "ns": ns, "hours": 0, "gpus": set()})
+                z["hours"] += h
+                z["gpus"].add(g)
+        out = []
+        for x in gpus.values():
+            hs = sorted(x["holders"].values(), key=lambda y: -y["hours"])
+            for y in hs:
+                y["pct"] = round(100 * y["hours"] / total_h, 1) if total_h else None
+                y["busy"] = round(y.pop("busy_h") / y["hours"], 1) if y["hours"] else None
+                y["hours"] = round(y["hours"], 1)
+            held = sum(y["hours"] for y in hs)
+            out.append({"gpu": x["gpu"], "holders": hs, "free_pct": round(max(0, 100 - 100 * held / total_h), 1) if total_h else None,
+                        "days": {day: max(c, key=c.get) for day, c in x["days"].items() if c}})
+        return {"days": d["days"], "partial": d["partial"], "range_h": round(total_h, 1),
+                "gpus": sorted(out, key=lambda x: (x["gpu"].split("#")[0], int(x["gpu"].split("#")[1]) if x["gpu"].split("#")[1].isdigit() else 0)),
+                "holders": sorted(({"name": z["name"], "ns": z["ns"], "hours": round(z["hours"], 1), "gpus": len(z["gpus"]),
+                                    "gpu_days": round(z["hours"] / 24, 1)} for z in holders.values()), key=lambda z: -z["hours"])}
 
     def capacity(self, frm=None, to=None):
         """Per namespace: CPU/RAM used vs requested, GPUs held. Pods near their memory limit, idle pods that hold resources."""

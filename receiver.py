@@ -216,6 +216,11 @@ def send(msgs, state):
     STATE.write_text(json.dumps(state, indent=1))
 
 
+def assignee(owner, meta):
+    """Same rule as ops.assignee on the station: infra/capacity → Infra, else the asset's person, else MLOps."""
+    return "Infra" if owner in ("infra", "capacity") else (meta or {}).get("person") or "MLOps"
+
+
 def apply(results):
     """Update per-check state from one report; return the messages to send."""
     with lock:
@@ -235,13 +240,14 @@ def apply(results):
                 s["last_ok"] = bool(ok)
             if ok:
                 if s["alerted"]:
-                    msgs.append("✅ RECOVERED [%s] %s: %s" % (owner, name, detail))
+                    msgs.append("✅ RECOVERED [%s] %s: %s\nAssignees: %s" % (owner, name, detail, assignee(owner, meta)))
                 s.update(fails=0, alerted=False)
             else:
                 s["fails"] += 1
                 if s["fails"] >= FAIL_AFTER and not s["alerted"]:
                     who = " (%s, %s)" % (meta.get("person", "?"), meta.get("value", "?")) if meta else ""
-                    msgs.append("%s %s%s: %s (%d reports in a row)" % (LABEL.get(owner, owner), name, who, detail, s["fails"]))
+                    msgs.append("%s %s%s: %s (%d reports in a row)\nAssignees: %s" % (LABEL.get(owner, owner), name, who, detail, s["fails"],
+                                                                                    assignee(owner, meta)))
                     s["alerted"] = True
         dashboard.record_many(changes)
         send(msgs, state)

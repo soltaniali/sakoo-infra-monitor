@@ -948,3 +948,19 @@ col.pods, col.cache = {"user-uni": [{"name": "w", "workload": "w-trainer"}]}, {}
 col.prom = res_prom
 assert col.resources(T3 - 86400, T3)["gpus"][0]["service"] == "w-trainer"
 print("ok (new user, GPU holder)")
+
+# --- who held each GPU: per day, per holder, share of the range; pod names become holders
+assert ops.pod_workload("x", "trainer-7d9f8b6c5d-x2k4q") == "trainer" and ops.pod_workload("x", "db-0") == "db" and ops.pod_workload("x", "job-ab3k9") == "job"
+c3 = ops.Collector(tmp / "gpu.db")
+d1, d2 = ops.tday(time.time() - 3 * 86400), ops.tday(time.time() - 2 * 86400)
+c3.conn.executemany("INSERT INTO daily VALUES (?, ?, ?, ?, ?)", [
+    (d1, "gpu", "n1#0\tuser-moh\tagent", "held_h", 24), (d1, "gpu", "n1#0\tuser-moh\tagent", "busy", 50),
+    (d2, "gpu", "n1#0\tuser-ali\tagent", "held_h", 12), (d2, "gpu", "n1#1\taip-mlops-service\tqwen", "held_h", 24)])
+(ops.DATA / "people.json").write_text(json.dumps([{"name": "Mohammad", "account": "moh", "users": ["moh"], "keys": []}]), encoding="utf-8")
+g = c3.gpu_holders(time.time() - 4 * 86400, ops.tday_start(d2) + 86399)
+(ops.DATA / "people.json").unlink()
+g0 = g["gpus"][0]
+assert g["range_h"] == 48 and g0["gpu"] == "n1#0" and [(y["name"], y["hours"], y["pct"]) for y in g0["holders"]] == [("Mohammad", 24, 50.0), ("ali", 12, 25.0)], g
+assert g0["free_pct"] == 25.0 and g0["days"] == {d1: "Mohammad", d2: "ali"} and g0["holders"][0]["busy"] == 50.0, g0
+assert g["gpus"][1]["holders"][0]["name"] == "qwen (aip-mlops-service)" and g["holders"][0]["gpu_days"] == 1.0, g["holders"]
+print("ok (GPU holders)")

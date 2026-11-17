@@ -35,6 +35,7 @@ report(False)
 assert sent == [], sent                                   # 1st failure: quiet
 report(False)
 assert len(sent) == 1 and "INFRA DOWN" in sent[0], sent
+assert "\nAssignees: Infra\n" in sent[0], sent
 probe.report({"k8s GPU capacity": [False, "1 events", "capacity"]})
 probe.report({"k8s GPU capacity": [False, "1 events", "capacity"]})
 assert "CAPACITY FULL" in sent[-1] and "INFRA DOWN" not in sent[-1], sent

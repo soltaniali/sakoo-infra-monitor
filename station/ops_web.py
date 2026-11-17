@@ -135,7 +135,7 @@ PAGE_KEYS = ops.DATA / "page-keys.json"  # which pages were opened: kept over re
 WEEK = {"_len": str(7 * 86400)}  # the page's default range
 DEFAULT_PAGES = [("users", WEEK), ("daily", dict(WEEK, scope="key")), ("logins", WEEK), ("tickets", {}), ("capacity", WEEK),
                  ("daily", dict(WEEK, scope="cluster")), ("models", WEEK), ("daily", dict(WEEK, scope="model")), ("keys", {}),
-                 ("tasks", WEEK), ("trends", WEEK), ("changes", WEEK), ("namespaces", {})]
+                 ("tasks", WEEK), ("trends", WEEK), ("gpu_holders", WEEK), ("changes", WEEK), ("namespaces", {})]
 
 
 def page_warmer():
@@ -293,6 +293,8 @@ class Handler(BaseHTTPRequestHandler):
             return COL.ticket(int(q["id"]))
         if what == "capacity":
             return COL.capacity(frm, to)
+        if what == "gpu_holders":
+            return COL.gpu_holders(frm, to)
         if what == "trends":
             return COL.trends(14, frm, to)
         if what == "infra":

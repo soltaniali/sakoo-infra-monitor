@@ -5,7 +5,7 @@ Claude Code, …). Read next: [README.md](README.md) (probe → receiver →
 Telegram), [station/README.md](station/README.md) (probe station, ops
 dashboard), `docs/2026-10-21-ops-dashboard-design.md` (decisions).
 
-**Last updated:** 2026-11-14
+**Last updated:** 2026-11-17
 
 ## 1. What it is
 
@@ -51,7 +51,7 @@ No Docker Hub from Iran: build elsewhere, `docker save | gzip`, scp, `docker loa
 - Only short alert texts leave Iran (to London/Telegram); logs and inventory stay on the station.
 - Visible text says "AIP", not "Sakoo". Times shown in Tehran time.
 - Owner of every failure is explicit (infra / us / capacity / monitor) — keep that mapping when adding checks.
-- Every alert ends with `Assignees:` (`ops.assignee`): Infra for infra/capacity, else the person from `assets` in `probe-station.json` (name, Service or prefix match; KubeAI models → the `kubeai` person), else MLOps — also for shared namespaces like gitlab, casdoor (Ali, 2026-11-14).
+- Every alert ends with `Assignees:` (`ops.assignee` on the station, `receiver.assignee` for probe alerts in London): Infra for infra/capacity, else the person from `assets` in `probe-station.json` (name, Service or prefix match; KubeAI models → the `kubeai` person), else MLOps — also for shared namespaces like gitlab, casdoor (Ali, 2026-11-14).
 - Commits: plain imperative sentence, often prefixed by area (`Ops: …`, `Station: …`, `Dashboard: …`).
 
 ## 5. Traps
@@ -66,6 +66,7 @@ No Docker Hub from Iran: build elsewhere, `docker save | gzip`, scp, `docker loa
 
 ## 6. Change log
 
+- 2026-11-17 — receiver probe alerts carry `Assignees:` (infra → Infra); per-GPU holder history (`daily` scope `gpu`) + Capacity "Who held each GPU" report (7 d / 30 d). Deployed to London + station.
 - 2026-11-14 — tickets StopIteration fixed (Prometheus 3 drops `__name__` after `increase()`); page cache warms at start. Deployed.
 - 2026-11-14 — page data cached 15 min with background refresh + gzip (`ops_web.page_data`); alerts unchanged (60 s rounds). `38666e2`, deployed and pushed.
 - 2026-11-14 — new `user-*` namespace = `new-user` change: Telegram alert + overview tile 9; Capacity GPU list names the holder workload/model. `233ef77`, deployed.

@@ -968,14 +968,32 @@ const checksView = c => !c || !c.rows.length ? '' : [h('h2', {}, 'Data check · 
   h('div', {class: 'card'}, h('p', {class: 'small mut'}, 'The same figure from two systems, last 7 days, read ', T(c.at), '. Agreed = within ' + 2 + ' %.'),
     table([['Figure', x => h('span', {dir: 'auto'}, x.what)], ['First', x => x.a_name + ': ' + big(x.a)], ['Second', x => x.b_name + ': ' + big(x.b)], ['Difference', x => x.diff_pct + ' %'],
       ['Result', x => h('span', {class: 'chip ' + (x.ok ? 'ok' : 'bad')}, x.ok ? 'agrees' : 'differs')]], c.rows))];
+// who held each physical GPU over the range: hours, share of the range, and the main holder of each day
+function gpuHoldersView(g) {
+  if (!g || !g.gpus || !g.gpus.length) return '';
+  const color = {}, top = g.holders.map(x => x.name);
+  top.forEach((n, i) => { color[n] = i < 7 ? COL(i + 1) : 'var(--series-other)'; });
+  const hrs = x => x >= 48 ? (x / 24).toFixed(1) + ' d' : x.toFixed(1) + ' h';
+  const strip = x => h('span', {style: 'display:inline-flex;gap:2px'}, g.days.map(d => h('span', {
+    title: d + ': ' + (x.days[d] || 'free'), style: 'display:inline-block;width:12px;height:14px;border-radius:2px;background:' + (x.days[d] ? color[x.days[d]] : 'var(--chip)')})));
+  return [h('h2', {}, 'Who held each GPU · ' + g.days.length + ' days'),
+    h('p', {class: 'small mut'}, 'Per physical GPU over the date range (pick 7 d or 30 d for weekly / monthly). Share = hours held out of the ' + hrs(g.range_h) + ' we have data for. Days: the main holder of each day (hover for the name), grey = free. From the GPU exporter, counted every 5 min; days before ' + (g.days[0] || '–') + ' are not kept.'),
+    h('div', {class: 'card tablewrap'}, table([['GPU', x => x.gpu], ['Holders', x => h('div', {}, x.holders.map(y => h('div', {},
+        h('span', {style: 'display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;background:' + color[y.name]}), y.name + ' · ' + hrs(y.hours) + ' · ' + y.pct + ' %' + (y.busy == null ? '' : ' · ' + Math.round(y.busy) + ' % busy'))))],
+      ['Free', x => x.free_pct == null ? '–' : x.free_pct + ' %'], ['Days', strip]], g.gpus)),
+    h('h2', {}, 'GPU time per holder'),
+    h('div', {class: 'card'}, table([['Holder', x => h('span', {dir: 'auto'}, x.name)], ['GPU-days', x => x.gpu_days], ['GPU hours', x => x.hours], ['GPUs used', x => x.gpus],
+      ['Share of all GPU time', x => g.range_h && g.gpus.length ? (100 * x.hours / (g.range_h * g.gpus.length)).toFixed(1) + ' %' : '–']], g.holders))];
+}
 VIEWS.capacity = async () => {
   const c = await api('/api/capacity?' + Rq()), cd = me.integrations.grafana ? await api('/api/daily?' + Rq({scope: 'cluster'})) : null;
+  const gh = me.integrations.grafana ? await api('/api/gpu_holders?' + Rq()).catch(() => null) : null;
   const maxCpu = Math.max(...c.namespaces.map(r => r.cpu_use), 1);
   const noMetrics = !c.namespaces.some(r => r.metrics);
   return h('div', {}, h('h1', {}, 'Capacity'),
     h('p', {class: 'mut'}, 'Live use from metrics.k8s.io against what pods requested. Not one of the 8 events: a view to spot waste and pods about to run out of memory.'),
     noMetrics ? h('div', {class: 'card err small'}, 'No usage numbers: metrics.k8s.io answered nothing.') : '',
-    clusterView(c.resources, cd), checksView(c.checks),
+    clusterView(c.resources, cd), gpuHoldersView(gh), checksView(c.checks),
     h('h2', {}, 'Pods near their memory limit (85% or more) · ' + c.near_limit.length),
     h('div', {class: 'card'}, table([['Namespace', r => r.ns], ['Pod', r => r.pod], ['Used', r => r.used_gib + ' GiB'], ['Limit', r => r.limit_gib + ' GiB'],
       ['%', r => h('span', {class: r.pct >= 95 ? 'err' : ''}, r.pct + ' %')]], c.near_limit)),
