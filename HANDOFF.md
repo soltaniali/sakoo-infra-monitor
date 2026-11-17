@@ -6,7 +6,7 @@ Read `AGENTS.md` first (layout, commands, rules).
 
 - Station (AIP-IRAN `~/station`, container `sakoo-probe-station`) runs the local `station/ops.py`, `ops_web.py`, `ops.js`, `tickets.py` (deployed 2026-11-17; backups `~/station/*.bak-20261117`).
 - London (`ssh mlops`, `~/infra-monitor`) runs the local `receiver.py` (deployed 2026-11-17; backup `receiver.py.bak-20261117`).
-- `37bb7ca` committed, not pushed. GPU holder backfill runs on the station (3 days per round, from 2026-11-07).
+- `37bb7ca` pushed. GPU holder backfill runs on the station (3 days per round, from 2026-11-07).
 
 ## Recent changes
 
@@ -21,5 +21,4 @@ Read `AGENTS.md` first (layout, commands, rules).
 - `llm-proxy` (LiteLLM) alerts say `MLOps` on purpose (Ali, 2026-11-14): no single owner.
 - Deploy a code change: `scp station/ops.py AIP-IRAN:~/station/ops.py`, then `ssh AIP-IRAN docker exec sakoo-probe-station pkill -f ops_web.py` (restarts in 10 s).
 - Deploy the receiver: `scp receiver.py mlops:~/infra-monitor/`, then `ssh mlops pkill -f '^python3 receiver.py$'` (cron restarts it within 1 min).
-- Push `37bb7ca` when Ali says so.
 - Check the Capacity "Who held each GPU" section in the browser; if holder names from pod names look wrong, switch `ops.pod_workload` to `kube_pod_owner`.

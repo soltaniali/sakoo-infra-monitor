@@ -27,7 +27,7 @@ Iran probe station 85.198.48.95 (AIP-IRAN, user mlops, ~/station, Docker)
 
 ## 2. Status snapshot (2026-11-17)
 
-- Remote `github.com/soltaniali/sakoo-infra-monitor`, branch `main`. Local commit `37bb7ca` (GPU holder report, receiver `Assignees:`) is deployed to the station and London but not pushed.
+- Remote `github.com/soltaniali/sakoo-infra-monitor`, branch `main`. `37bb7ca` (GPU holder report, receiver `Assignees:`) deployed to the station and London, pushed.
 - Automation level **L1: diagnose only.** The station kubeconfig can write in
   `aip-mlops-service`; code uses a single GET helper (`ops.kget`). A read-only ServiceAccount was requested from the admins.
 
