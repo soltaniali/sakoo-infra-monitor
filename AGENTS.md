@@ -25,9 +25,9 @@ Iran probe station 85.198.48.95 (AIP-IRAN, user mlops, ~/station, Docker)
 - `station/` — container (OpenVPN ×2 + probe + ops), `ops.py` collector (8 maintenance events: bug, down, feature, new service, new model, model info, logs, infra-or-us), `ops_web.py` (scrypt users, `adduser`), `tickets.py` (support tickets vs monitoring data), integrations: GitLab, Grafana, Langfuse, LiteLLM keys, Casdoor logins, mlops-core trainings. `set-*.sh` scripts write secrets interactively.
 - Public HTTPS for the ops page: `85.198.48.95:8443` (`OPS_ALLOW_CIDRS`).
 
-## 2. Status snapshot (2026-11-14)
+## 2. Status snapshot (2026-11-17)
 
-- Remote `github.com/soltaniali/sakoo-infra-monitor`, branch `main`, last pushed commit `2a5705a` (2026-11-14, shared namespaces → MLOps). Local commit `233ef77` (new-user alert/tile, GPU holder names) deployed and pushed.
+- Remote `github.com/soltaniali/sakoo-infra-monitor`, branch `main`. Local commit `37bb7ca` (GPU holder report, receiver `Assignees:`) is deployed to the station and London but not pushed.
 - Automation level **L1: diagnose only.** The station kubeconfig can write in
   `aip-mlops-service`; code uses a single GET helper (`ops.kget`). A read-only ServiceAccount was requested from the admins.
 
